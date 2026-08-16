@@ -1,0 +1,86 @@
+name: VS Code State Integration
+
+on:
+  push:
+    branches: [main, 'agent/**']
+  pull_request:
+
+jobs:
+  vscode-state-to-capsule:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure isolated runtime paths
+        shell: pwsh
+        run: |
+          "CONTEXT_CAPSULE_VSCODE_STATE_PATH=$(Join-Path $env:RUNNER_TEMP 'context-capsule-vscode-state.json')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CONTEXT_CAPSULE_DB=$(Join-Path $env:RUNNER_TEMP 'context-capsule-vscode.db')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build and test VS Code state parser
+        run: |
+          cargo build
+          cargo test vscode
+      - name: Write a producer-compatible live VS Code snapshot
+        shell: pwsh
+        run: |
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $payload = @{
+            updatedAtUnixMs = $now
+            snapshot = @{
+              schemaVersion = 1
+              capturedAtUnixMs = $now
+              appName = 'Visual Studio Code'
+              appHost = 'desktop'
+              remoteName = 'wsl'
+              workspaceTrusted = $true
+              workspaceFile = $null
+              workspaceFolders = @(@{
+                uri = 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule'
+                name = 'context-capsule'
+                index = 0
+              })
+              tabGroups = @(@{
+                viewColumn = 1
+                active = $true
+                tabs = @(@{
+                  label = 'main.rs'
+                  inputKind = 'text'
+                  uri = 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs'
+                  active = $true
+                  dirty = $false
+                  pinned = $true
+                  preview = $false
+                  restorable = $true
+                })
+              })
+              visibleEditorSelections = @(@{
+                uri = 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs'
+                viewColumn = 1
+                selections = @(@{ anchor = @(4, 2); active = @(4, 8) })
+              })
+              activeEditorUri = 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs'
+            }
+          }
+          $payload | ConvertTo-Json -Depth 12 -Compress | Set-Content -Encoding utf8 $env:CONTEXT_CAPSULE_VSCODE_STATE_PATH
+      - name: Save runtime state into the SQLite capsule and verify semantics
+        shell: pwsh
+        run: |
+          cargo run --quiet -- save vscode-contract
+          if ($LASTEXITCODE -ne 0) { throw 'capsule save failed' }
+          $storedPath = Join-Path $env:RUNNER_TEMP 'stored-vscode.json'
+          cargo run --quiet -- show vscode-contract --json | Set-Content -Encoding utf8 $storedPath
+          if ($LASTEXITCODE -ne 0) { throw 'capsule show failed' }
+          $stored = Get-Content $storedPath -Raw | ConvertFrom-Json
+          $vscode = $stored.snapshot.editors.vscode
+          if ($null -eq $vscode) { throw 'saved capsule did not contain editors.vscode' }
+          if ($vscode.schemaVersion -ne 1) { throw 'unexpected VS Code schema version' }
+          if ($vscode.remoteName -ne 'wsl') { throw 'remote WSL context was not preserved' }
+          if ($vscode.workspaceFolders[0].uri -ne 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule') { throw 'workspace URI changed' }
+          if ($vscode.tabGroups[0].tabs[0].uri -ne 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs') { throw 'editor URI changed' }
+          if (-not $vscode.tabGroups[0].tabs[0].pinned) { throw 'pinned editor state was not preserved' }
+          if ($vscode.visibleEditorSelections[0].selections[0].active[1] -ne 8) { throw 'selection state was not preserved' }
+          Write-Host 'VS Code producer schema -> Rust parser -> SQLite capsule contract passed.'
