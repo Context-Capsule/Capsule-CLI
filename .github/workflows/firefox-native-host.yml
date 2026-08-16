@@ -1,0 +1,81 @@
+name: Firefox Native Host
+
+on:
+  push:
+    branches: [main, 'agent/**']
+  pull_request:
+
+jobs:
+  native-host:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo check --all-targets
+      - run: cargo test
+      - run: cargo build --bin capsule-firefox-host
+
+  protocol-integration:
+    runs-on: ubuntu-latest
+    env:
+      HOME: /tmp/context-capsule-firefox-home
+      CONTEXT_CAPSULE_DB: /tmp/context-capsule-firefox.db
+      CONTEXT_CAPSULE_FIREFOX_STATE_PATH: /tmp/context-capsule-firefox-state.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --bins
+      - name: Install native host manifest
+        run: |
+          mkdir -p "$HOME"
+          ./target/debug/capsule-firefox-host --install
+          test -f "$HOME/.mozilla/native-messaging-hosts/com.contextcapsule.host.json"
+          grep -F 'firefox@contextcapsule.app' "$HOME/.mozilla/native-messaging-hosts/com.contextcapsule.host.json"
+      - name: Exercise framed ping and live-state update
+        shell: python
+        run: |
+          import json, struct, subprocess
+          host = './target/debug/capsule-firefox-host'
+          snapshot = {
+              'schema_version': 1,
+              'browser': 'firefox',
+              'extension_version': 'ci',
+              'captured_at_unix_ms': 1,
+              'skipped_private_windows': 0,
+              'windows': [{
+                  'key': 'window-0', 'focused': True, 'state': 'normal',
+                  'left': 0, 'top': 0, 'width': 1200, 'height': 800,
+                  'tabs': [{
+                      'index': 0, 'url': 'https://example.com', 'title': 'Example',
+                      'pinned': False, 'active': True, 'discarded': False,
+                      'muted': False, 'restorable': True
+                  }],
+                  'groups': []
+              }]
+          }
+          requests = [
+              {'protocol_version': 1, 'request_id': 'ping', 'type': 'ping'},
+              {'protocol_version': 1, 'request_id': 'state', 'type': 'browser.state.update', 'snapshot': snapshot},
+          ]
+          payload = b''.join(struct.pack('<I', len(raw)) + raw for raw in [json.dumps(r).encode() for r in requests])
+          proc = subprocess.run([host], input=payload, stdout=subprocess.PIPE, check=True)
+          data = proc.stdout
+          responses = []
+          while data:
+              size = struct.unpack('<I', data[:4])[0]
+              responses.append(json.loads(data[4:4+size]))
+              data = data[4+size:]
+          assert responses[0]['type'] == 'pong' and responses[0]['ok']
+          assert responses[1]['type'] == 'browser.state.updated' and responses[1]['ok']
+      - name: Save live Firefox state into SQLite capsule
+        run: |
+          ./target/debug/capsule save firefox-ci
+          ./target/debug/capsule show firefox-ci --json > /tmp/firefox-capsule.json
+          grep -F '"firefox"' /tmp/firefox-capsule.json
+          grep -F 'https://example.com' /tmp/firefox-capsule.json

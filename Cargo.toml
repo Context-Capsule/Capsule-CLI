@@ -7,6 +7,10 @@ edition = "2024"
 name = "capsule"
 path = "src/main.rs"
 
+[[bin]]
+name = "capsule-firefox-host"
+path = "src/bin/firefox_host.rs"
+
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
