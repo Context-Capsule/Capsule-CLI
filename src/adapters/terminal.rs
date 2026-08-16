@@ -1089,8 +1089,9 @@ fn parse_wsl_sessions(text: &str) -> Vec<RawWslSession> {
         .iter()
         .map(|session| (session.pid, session.parent_pid))
         .collect::<HashMap<_, _>>();
+    let all_sessions = sessions.clone();
     sessions.retain(|candidate| {
-        !sessions.iter().any(|other| {
+        !all_sessions.iter().any(|other| {
             other.pid != candidate.pid
                 && other.tty == candidate.tty
                 && is_descendant_of(other.pid, candidate.pid, &shells_by_pid)
