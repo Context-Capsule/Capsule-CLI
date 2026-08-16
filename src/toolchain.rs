@@ -36,6 +36,12 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec { name: "Go", command: "go", args: &["version"] },
     ToolSpec { name: ".NET SDK", command: "dotnet", args: &["--version"] },
     ToolSpec { name: "Java", command: "java", args: &["-version"] },
+    ToolSpec { name: "Maven", command: "mvn", args: &["--version"] },
+    ToolSpec { name: "Gradle", command: "gradle", args: &["--version"] },
+    ToolSpec { name: "PHP", command: "php", args: &["--version"] },
+    ToolSpec { name: "Composer", command: "composer", args: &["--version"] },
+    ToolSpec { name: "Ruby", command: "ruby", args: &["--version"] },
+    ToolSpec { name: "Bundler", command: "bundle", args: &["--version"] },
     ToolSpec { name: "Docker", command: "docker", args: &["--version"] },
     ToolSpec { name: "Docker Compose", command: "docker", args: &["compose", "version", "--short"] },
     ToolSpec { name: "Podman", command: "podman", args: &["--version"] },
@@ -44,6 +50,10 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec { name: "GCC", command: "gcc", args: &["--version"] },
     ToolSpec { name: "Clang", command: "clang", args: &["--version"] },
     ToolSpec { name: "PowerShell", command: "pwsh", args: &["--version"] },
+    ToolSpec { name: "WSL", command: "wsl", args: &["--version"] },
+    ToolSpec { name: "kubectl", command: "kubectl", args: &["version", "--client"] },
+    ToolSpec { name: "Terraform", command: "terraform", args: &["version"] },
+    ToolSpec { name: "GitHub CLI", command: "gh", args: &["--version"] },
     ToolSpec { name: "fnm", command: "fnm", args: &["--version"] },
     ToolSpec { name: "Volta", command: "volta", args: &["--version"] },
 ];
@@ -71,7 +81,8 @@ pub fn discover_tools() -> Vec<ToolVersion> {
 }
 
 fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
-    let output = Command::new(spec.command).args(spec.args).output().ok()?;
+    let executable_path = resolve_executable(spec.command)?;
+    let output = run_version_command(spec.command, spec.args)?;
     let version = first_non_empty_line(&output.stdout)
         .or_else(|| first_non_empty_line(&output.stderr))?;
 
@@ -79,8 +90,44 @@ fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
         name: spec.name.to_owned(),
         command: spec.command.to_owned(),
         version,
-        executable_path: resolve_executable(spec.command),
+        executable_path: Some(executable_path),
     })
+}
+
+#[cfg(windows)]
+fn run_version_command(command: &str, args: &[&str]) -> Option<std::process::Output> {
+    if let Ok(output) = Command::new(command).args(args).output() {
+        return Some(output);
+    }
+
+    let command_line = std::iter::once(command)
+        .chain(args.iter().copied())
+        .map(quote_cmd_argument)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Command::new("cmd.exe")
+        .args(["/D", "/S", "/C"])
+        .arg(command_line)
+        .output()
+        .ok()
+}
+
+#[cfg(not(windows))]
+fn run_version_command(command: &str, args: &[&str]) -> Option<std::process::Output> {
+    Command::new(command).args(args).output().ok()
+}
+
+#[cfg(windows)]
+fn quote_cmd_argument(argument: &str) -> String {
+    if argument
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_.:/".contains(character))
+    {
+        argument.to_owned()
+    } else {
+        format!("\"{}\"", argument.replace('"', "\"\""))
+    }
 }
 
 fn first_non_empty_line(bytes: &[u8]) -> Option<String> {
@@ -134,5 +181,12 @@ mod tests {
                 "{command} should be discovered"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_arguments_only_quote_when_needed() {
+        assert_eq!(quote_cmd_argument("--version"), "--version");
+        assert_eq!(quote_cmd_argument("hello world"), "\"hello world\"");
     }
 }
