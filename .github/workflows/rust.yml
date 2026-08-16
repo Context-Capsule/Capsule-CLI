@@ -94,6 +94,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             throw 'deleted capsule was still loadable'
           }
+          $LASTEXITCODE = 0
 
       - name: Installed Node tools must be discovered
         if: runner.os == 'Windows'
