@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn recognizes_firefox_browser_invocation_arguments() {
         let arguments = vec![
-            format!(r"C:\temp\{}.json", browser::NATIVE_HOST_NAME),
+            format!("{}.json", browser::NATIVE_HOST_NAME),
             browser::FIREFOX_EXTENSION_ID.to_owned(),
         ];
         assert!(is_native_messaging_invocation(&arguments));
@@ -340,13 +340,13 @@ mod tests {
     #[test]
     fn rejects_wrong_extension_or_manifest_name() {
         let wrong_extension = vec![
-            format!(r"C:\temp\{}.json", browser::NATIVE_HOST_NAME),
+            format!("{}.json", browser::NATIVE_HOST_NAME),
             "other@example.test".to_owned(),
         ];
         assert!(!is_native_messaging_invocation(&wrong_extension));
 
         let wrong_manifest = vec![
-            r"C:\temp\other-host.json".to_owned(),
+            "other-host.json".to_owned(),
             browser::FIREFOX_EXTENSION_ID.to_owned(),
         ];
         assert!(!is_native_messaging_invocation(&wrong_manifest));
