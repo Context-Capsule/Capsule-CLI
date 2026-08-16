@@ -274,7 +274,8 @@ pub fn discover_tools() -> Vec<ToolVersion> {
     for (spec, result) in first_pass {
         match result {
             Some(tool) => discovered.push(tool),
-            None => retry.push(spec),
+            None if should_retry_sequentially(spec) => retry.push(spec),
+            None => {}
         }
     }
 
@@ -316,6 +317,21 @@ pub fn discover_version_hints(project_root: &Path) -> Vec<VersionHint> {
             })
         })
         .collect()
+}
+
+#[cfg(windows)]
+fn should_retry_sequentially(spec: ToolSpec) -> bool {
+    resolve_executable(spec.command)
+        .map(|path| {
+            let path = path.to_ascii_lowercase();
+            path.ends_with(".cmd") || path.ends_with(".bat")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn should_retry_sequentially(_spec: ToolSpec) -> bool {
+    false
 }
 
 fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
