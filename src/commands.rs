@@ -1,0 +1,364 @@
+use crate::{
+    adapters::docker::{self, DockerSnapshot, DockerStatus},
+    discovery,
+    persistence::{CapsuleStore, StoredCapsuleSnapshot},
+    snapshot,
+};
+use serde_json::Value;
+use std::process::ExitCode;
+
+pub fn save(arguments: Vec<String>) -> ExitCode {
+    let (name, force) = match parse_save_arguments(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => return usage_error(error),
+    };
+
+    println!("Discovering workspace for capsule '{name}'...");
+    let discovery = match discovery::discover(true, true, true) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return command_error(format!("discovery failed: {error}")),
+    };
+    let stored = match snapshot::capture_snapshot(&discovery) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return command_error(error.to_string()),
+    };
+    let mut store = match CapsuleStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return command_error(error.to_string()),
+    };
+    let database_path = store.path().display().to_string();
+
+    if let Err(error) = store.save(&name, &stored, force) {
+        return command_error(error.to_string());
+    }
+
+    let applications = discovery
+        .desktop
+        .as_ref()
+        .map(|desktop| desktop.applications.len())
+        .unwrap_or(0);
+    println!("Saved capsule '{name}'.");
+    println!("  applications: {applications}");
+    println!("  developer tools: {}", discovery.tools.len());
+    println!(
+        "  running containers: {}",
+        discovery.docker.running_container_count()
+    );
+    println!("  database: {database_path}");
+
+    if matches!(discovery.docker.status, DockerStatus::Unavailable) {
+        println!(
+            "  Docker: {}",
+            discovery
+                .docker
+                .message
+                .as_deref()
+                .unwrap_or("unavailable")
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+pub fn list(arguments: Vec<String>) -> ExitCode {
+    if !arguments.is_empty() {
+        return usage_error("'list' does not accept arguments".to_owned());
+    }
+
+    let store = match CapsuleStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return command_error(error.to_string()),
+    };
+    let capsules = match store.list() {
+        Ok(capsules) => capsules,
+        Err(error) => return command_error(error.to_string()),
+    };
+
+    if capsules.is_empty() {
+        println!("No capsules saved.");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("Saved capsules: {}", capsules.len());
+    for capsule in capsules {
+        println!(
+            "  {}  [schema {}, updated {}]",
+            capsule.name, capsule.schema_version, capsule.updated_at_unix_ms
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+pub fn show(arguments: Vec<String>) -> ExitCode {
+    let (name, json) = match parse_show_arguments(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => return usage_error(error),
+    };
+
+    let store = match CapsuleStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return command_error(error.to_string()),
+    };
+    let stored = match store.load(&name) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return command_error(error.to_string()),
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&stored) {
+            Ok(output) => println!("{output}"),
+            Err(error) => return command_error(format!("failed to render snapshot: {error}")),
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    print_capsule_summary(&name, &stored);
+    ExitCode::SUCCESS
+}
+
+pub fn delete(arguments: Vec<String>) -> ExitCode {
+    if arguments.len() != 1 {
+        return usage_error("usage: capsule delete <name>".to_owned());
+    }
+
+    let name = &arguments[0];
+    let mut store = match CapsuleStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return command_error(error.to_string()),
+    };
+    match store.delete(name) {
+        Ok(()) => {
+            println!("Deleted capsule '{name}'.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => command_error(error.to_string()),
+    }
+}
+
+pub fn docker(arguments: Vec<String>) -> ExitCode {
+    match arguments.as_slice() {
+        [command] if command == "inspect" => {
+            let snapshot = docker::discover();
+            print_docker_snapshot(&snapshot, true);
+            ExitCode::SUCCESS
+        }
+        [command, name] if command == "restore" => restore_docker(name),
+        _ => usage_error(
+            "usage: capsule docker inspect | capsule docker restore <capsule-name>".to_owned(),
+        ),
+    }
+}
+
+pub fn print_docker_snapshot(snapshot: &DockerSnapshot, verbose: bool) {
+    match snapshot.status {
+        DockerStatus::NotRequested => println!("Docker: not inspected"),
+        DockerStatus::Unavailable => println!(
+            "Docker: unavailable ({})",
+            snapshot.message.as_deref().unwrap_or("unknown reason")
+        ),
+        DockerStatus::Available => {
+            println!(
+                "Docker: {} running container(s)",
+                snapshot.running_container_count()
+            );
+            if let Some(context) = snapshot.context.as_ref() {
+                println!("  context: {context}");
+            }
+            if let Some(message) = snapshot.message.as_ref() {
+                println!("  warning: {message}");
+            }
+
+            for project in &snapshot.compose_projects {
+                println!(
+                    "  Compose project '{}' — {} container(s), services: {}",
+                    project.name,
+                    project.containers.len(),
+                    if project.services.is_empty() {
+                        "(unknown)".to_owned()
+                    } else {
+                        project.services.join(", ")
+                    }
+                );
+                if verbose {
+                    if let Some(directory) = project.working_directory.as_ref() {
+                        println!("    directory: {directory}");
+                    }
+                    for config in &project.config_files {
+                        println!("    compose:   {config}");
+                    }
+                    for container in &project.containers {
+                        print_container(container, "    ");
+                    }
+                }
+            }
+
+            for container in &snapshot.standalone_containers {
+                println!("  Standalone container '{}':", container.name);
+                if verbose {
+                    print_container(container, "    ");
+                }
+            }
+        }
+    }
+}
+
+fn restore_docker(name: &str) -> ExitCode {
+    let store = match CapsuleStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return command_error(error.to_string()),
+    };
+    let stored = match store.load(name) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return command_error(error.to_string()),
+    };
+    let snapshot = match stored.docker() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return command_error(error.to_string()),
+    };
+
+    println!("Restoring Docker resources from capsule '{name}'...");
+    let report = docker::restore(&snapshot);
+    println!(
+        "  restored: {}/{} resource group(s)",
+        report.restored_resources, report.attempted_resources
+    );
+    for warning in &report.warnings {
+        println!("  warning: {warning}");
+    }
+    for failure in &report.failures {
+        eprintln!("  failed: {failure}");
+    }
+
+    if report.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn print_container(container: &crate::adapters::docker::ContainerResource, indent: &str) {
+    println!("{indent}name: {}", container.name);
+    if let Some(image) = container.image.as_ref() {
+        println!("{indent}image: {image}");
+    }
+    if !container.ports.is_empty() {
+        println!("{indent}ports: {}", container.ports.len());
+    }
+    if !container.mounts.is_empty() {
+        println!("{indent}mounts: {}", container.mounts.len());
+    }
+    if !container.networks.is_empty() {
+        println!("{indent}networks: {}", container.networks.join(", "));
+    }
+}
+
+fn print_capsule_summary(name: &str, stored: &StoredCapsuleSnapshot) {
+    println!("Capsule: {name}");
+    println!("  schema: {}", stored.schema_version);
+    println!("  captured: {}", stored.captured_at_unix_ms);
+
+    if let Some(directory) = stored
+        .snapshot
+        .get("current_directory")
+        .and_then(Value::as_str)
+    {
+        println!("  directory: {directory}");
+    }
+
+    let tool_count = stored
+        .snapshot
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let app_count = stored
+        .snapshot
+        .pointer("/desktop/applications")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    println!("  developer tools: {tool_count}");
+    println!("  applications: {app_count}");
+
+    match stored.docker() {
+        Ok(docker) => {
+            println!("  running containers: {}", docker.running_container_count());
+            println!("  compose projects: {}", docker.compose_projects.len());
+        }
+        Err(error) => println!("  Docker metadata: {error}"),
+    }
+
+    println!("  use 'capsule show {name} --json' for the complete stored snapshot");
+}
+
+fn parse_save_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
+    let mut name = None;
+    let mut force = false;
+
+    for argument in arguments {
+        match argument.as_str() {
+            "--force" | "-f" => force = true,
+            value if value.starts_with('-') => {
+                return Err(format!("unknown save option '{value}'"));
+            }
+            value if name.is_none() => name = Some(value.to_owned()),
+            value => return Err(format!("unexpected save argument '{value}'")),
+        }
+    }
+
+    name.map(|name| (name, force))
+        .ok_or_else(|| "usage: capsule save <name> [--force]".to_owned())
+}
+
+fn parse_show_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
+    let mut name = None;
+    let mut json = false;
+
+    for argument in arguments {
+        match argument.as_str() {
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err(format!("unknown show option '{value}'"));
+            }
+            value if name.is_none() => name = Some(value.to_owned()),
+            value => return Err(format!("unexpected show argument '{value}'")),
+        }
+    }
+
+    name.map(|name| (name, json))
+        .ok_or_else(|| "usage: capsule show <name> [--json]".to_owned())
+}
+
+fn usage_error(error: String) -> ExitCode {
+    eprintln!("error: {error}");
+    ExitCode::from(2)
+}
+
+fn command_error(error: String) -> ExitCode {
+    eprintln!("error: {error}");
+    ExitCode::from(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_parser_requires_one_name_and_supports_force() {
+        assert_eq!(
+            parse_save_arguments(vec!["demo".to_owned(), "--force".to_owned()]).unwrap(),
+            ("demo".to_owned(), true)
+        );
+        assert!(parse_save_arguments(Vec::new()).is_err());
+        assert!(parse_save_arguments(vec!["a".to_owned(), "b".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn show_parser_supports_json() {
+        assert_eq!(
+            parse_show_arguments(vec!["demo".to_owned(), "--json".to_owned()]).unwrap(),
+            ("demo".to_owned(), true)
+        );
+        assert!(parse_show_arguments(vec!["--bad".to_owned()]).is_err());
+    }
+}
