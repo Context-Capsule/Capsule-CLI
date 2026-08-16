@@ -12,12 +12,14 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      CONTEXT_CAPSULE_VSCODE_STATE_PATH: ${{ runner.temp }}/context-capsule-vscode-state.json
-      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-vscode.db
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Configure isolated runtime paths
+        shell: pwsh
+        run: |
+          "CONTEXT_CAPSULE_VSCODE_STATE_PATH=$(Join-Path $env:RUNNER_TEMP 'context-capsule-vscode-state.json')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CONTEXT_CAPSULE_DB=$(Join-Path $env:RUNNER_TEMP 'context-capsule-vscode.db')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build and test VS Code state parser
         run: |
           cargo build
@@ -69,9 +71,10 @@ jobs:
         run: |
           cargo run --quiet -- save vscode-contract
           if ($LASTEXITCODE -ne 0) { throw 'capsule save failed' }
-          cargo run --quiet -- show vscode-contract --json | Set-Content -Encoding utf8 "$env:RUNNER_TEMP/stored-vscode.json"
+          $storedPath = Join-Path $env:RUNNER_TEMP 'stored-vscode.json'
+          cargo run --quiet -- show vscode-contract --json | Set-Content -Encoding utf8 $storedPath
           if ($LASTEXITCODE -ne 0) { throw 'capsule show failed' }
-          $stored = Get-Content "$env:RUNNER_TEMP/stored-vscode.json" -Raw | ConvertFrom-Json
+          $stored = Get-Content $storedPath -Raw | ConvertFrom-Json
           $vscode = $stored.snapshot.editors.vscode
           if ($null -eq $vscode) { throw 'saved capsule did not contain editors.vscode' }
           if ($vscode.schemaVersion -ne 1) { throw 'unexpected VS Code schema version' }
