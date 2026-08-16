@@ -154,7 +154,7 @@ impl CapsuleStore {
             .optional()?;
 
         let created_at = match existing {
-            Some(created_at) if !replace => {
+            Some(_) if !replace => {
                 return Err(PersistenceError::AlreadyExists(name.to_owned()));
             }
             Some(created_at) => {
