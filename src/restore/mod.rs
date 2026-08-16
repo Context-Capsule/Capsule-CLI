@@ -1,6 +1,7 @@
 mod model;
 
 #[cfg(windows)]
+#[path = "windows_core.rs"]
 mod windows;
 
 use serde_json::Value;
