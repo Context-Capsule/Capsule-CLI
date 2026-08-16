@@ -1,0 +1,219 @@
+name: Restore Engine Patch Once
+
+on:
+  push:
+    branches: [agent/restore-engine]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: "!contains(github.event.head_commit.message, '[restore-patched]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/restore-engine
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Wire command, clean implementation and format
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          commands = Path('src/commands.rs')
+          text = commands.read_text()
+          marker = 'use serde_json::Value;\n'
+          addition = 'use context_capsule::restore::{self, RestoreOptions};\n'
+          if addition not in text:
+              text = text.replace(marker, addition + marker, 1)
+
+          save_marker = 'pub fn list(arguments: Vec<String>) -> ExitCode {'
+          restore_fn = r'''pub fn restore(arguments: Vec<String>) -> ExitCode {
+              let (name, dry_run) = match parse_restore_arguments(arguments) {
+                  Ok(parsed) => parsed,
+                  Err(error) => return usage_error(error),
+              };
+
+              let store = match CapsuleStore::open_default() {
+                  Ok(store) => store,
+                  Err(error) => return command_error(error.to_string()),
+              };
+              let stored = match store.load(&name) {
+                  Ok(snapshot) => snapshot,
+                  Err(error) => return command_error(error.to_string()),
+              };
+
+              if dry_run {
+                  println!("Planning restore for capsule '{name}' (dry run)...");
+              } else {
+                  println!("Restoring capsule '{name}'...");
+              }
+
+              let report = restore::restore_snapshot(&stored.snapshot, RestoreOptions { dry_run });
+              let desktop = &report.desktop;
+              println!("Desktop:");
+              println!("  applications in capsule: {}", desktop.applications_total);
+              println!("  already running:         {}", desktop.applications_already_running);
+              if dry_run {
+                  println!("  would launch:            {}", desktop.applications_planned_to_launch);
+                  println!("  windows already placed: {}", desktop.windows_already_placed);
+                  println!("  windows to reposition:  {}", desktop.windows_planned_to_move);
+              } else {
+                  println!("  launched:                {}", desktop.applications_launched);
+                  println!("  windows already placed: {}", desktop.windows_already_placed);
+                  println!("  windows repositioned:   {}", desktop.windows_moved);
+              }
+              if desktop.applications_unlaunchable > 0 {
+                  println!("  apps without launch identity: {}", desktop.applications_unlaunchable);
+              }
+              if desktop.windows_missing > 0 {
+                  println!("  saved windows not observed: {}", desktop.windows_missing);
+              }
+
+              for warning in report.warnings.iter().chain(desktop.warnings.iter()) {
+                  println!("  warning: {warning}");
+              }
+              for failure in report.failures.iter().chain(desktop.failures.iter()) {
+                  eprintln!("  failed: {failure}");
+              }
+
+              if report.success() {
+                  if dry_run {
+                      println!("Dry run complete; no applications or windows were changed.");
+                  } else {
+                      println!("Restore pass complete.");
+                  }
+                  ExitCode::SUCCESS
+              } else {
+                  ExitCode::from(1)
+              }
+          }
+
+          '''
+          if 'pub fn restore(arguments: Vec<String>) -> ExitCode {' not in text:
+              text = text.replace(save_marker, restore_fn + save_marker, 1)
+
+          parse_marker = 'fn parse_show_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {'
+          parse_fn = r'''fn parse_restore_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
+              let mut name = None;
+              let mut dry_run = false;
+
+              for argument in arguments {
+                  match argument.as_str() {
+                      "--dry-run" => dry_run = true,
+                      value if value.starts_with('-') => {
+                          return Err(format!("unknown restore option '{value}'"));
+                      }
+                      value if name.is_none() => name = Some(value.to_owned()),
+                      value => return Err(format!("unexpected restore argument '{value}'")),
+                  }
+              }
+
+              name.map(|name| (name, dry_run))
+                  .ok_or_else(|| "usage: capsule restore <name> [--dry-run]".to_owned())
+          }
+
+          '''
+          if 'fn parse_restore_arguments(' not in text:
+              text = text.replace(parse_marker, parse_fn + parse_marker, 1)
+
+          test_marker = '    #[test]\n    fn show_parser_supports_json() {'
+          test_fn = r'''    #[test]
+              fn restore_parser_supports_dry_run() {
+                  assert_eq!(
+                      parse_restore_arguments(vec!["demo".to_owned(), "--dry-run".to_owned()]).unwrap(),
+                      ("demo".to_owned(), true)
+                  );
+                  assert_eq!(
+                      parse_restore_arguments(vec!["demo".to_owned()]).unwrap(),
+                      ("demo".to_owned(), false)
+                  );
+                  assert!(parse_restore_arguments(Vec::new()).is_err());
+                  assert!(parse_restore_arguments(vec!["demo".to_owned(), "--bad".to_owned()]).is_err());
+                  assert!(parse_restore_arguments(vec!["one".to_owned(), "two".to_owned()]).is_err());
+              }
+
+          '''
+          if 'fn restore_parser_supports_dry_run()' not in text:
+              text = text.replace(test_marker, test_fn + test_marker, 1)
+          commands.write_text(text)
+
+          main = Path('src/main.rs')
+          text = main.read_text()
+          if 'Some("restore") => commands::restore(args.collect()),' not in text:
+              text = text.replace(
+                  '        Some("save") => commands::save(args.collect()),\n',
+                  '        Some("save") => commands::save(args.collect()),\n        Some("restore") => commands::restore(args.collect()),\n',
+                  1,
+              )
+          if 'capsule restore <name> [--dry-run]' not in text:
+              text = text.replace(
+                  '    println!("  capsule save <name> [--force]");\n',
+                  '    println!("  capsule save <name> [--force]");\n    println!("  capsule restore <name> [--dry-run]");\n',
+                  1,
+              )
+          if 'Restore missing applications and reconcile saved window placement' not in text:
+              text = text.replace(
+                  '    println!("  save       Capture the current semantic workspace into SQLite");\n',
+                  '    println!("  save       Capture the current semantic workspace into SQLite");\n    println!("  restore    Restore missing applications and reconcile saved window placement");\n',
+                  1,
+              )
+          main.write_text(text)
+
+          windows = Path('src/restore/windows.rs')
+          text = windows.read_text()
+          text = text.replace('    collections::{HashMap, HashSet},\n    ffi::{OsStr, c_void},', '    collections::HashSet,\n    ffi::c_void,')
+          text = text.replace('    os::windows::ffi::OsStrExt,\n', '')
+          text = text.replace(
+              "fn match_windows<'a>(\n    app: &'a SavedApplication,\n    current: &[&'a CurrentWindow],\n    displays: &[TargetDisplay],\n) -> Vec<(&'a SavedWindow, &'a CurrentWindow)> {",
+              "fn match_windows<'saved, 'current>(\n    app: &'saved SavedApplication,\n    current: &[&'current CurrentWindow],\n    displays: &[TargetDisplay],\n) -> Vec<(&'saved SavedWindow, &'current CurrentWindow)> {",
+          )
+          old_minimized = '''        WindowStateSpec::Minimized => {
+              current.minimized
+                  && current
+                      .restore_bounds
+                      .is_some_and(|bounds| rect_close(bounds, target, GEOMETRY_TOLERANCE))
+          }'''
+          new_minimized = '''        WindowStateSpec::Minimized => {
+              current.minimized
+                  && current
+                      .display_device
+                      .as_deref()
+                      .is_some_and(|device| device.eq_ignore_ascii_case(&display.device_name))
+          }'''
+          text = text.replace(old_minimized, new_minimized)
+          start = text.find('\n#[allow(dead_code)]\nfn to_wide(')
+          if start != -1:
+              end = text.find('\n\n#[cfg(test)]', start)
+              if end != -1:
+                  text = text[:start] + text[end:]
+          windows.write_text(text)
+
+          rust = Path('.github/workflows/rust.yml')
+          text = rust.read_text()
+          linux_needle = '          cargo run --quiet -- save ci-persistence\n          cargo run --quiet -- list | grep -F \'ci-persistence\'\n'
+          linux_repl = '          cargo run --quiet -- save ci-persistence\n          cargo run --quiet -- restore ci-persistence --dry-run\n          cargo run --quiet -- list | grep -F \'ci-persistence\'\n'
+          if 'restore ci-persistence --dry-run' not in text:
+              text = text.replace(linux_needle, linux_repl, 1)
+              win_needle = '          cargo run --quiet -- save ci-persistence\n\n          $list = cargo run --quiet -- list | Out-String\n'
+              win_repl = '          cargo run --quiet -- save ci-persistence\n          cargo run --quiet -- restore ci-persistence --dry-run\n          if ($LASTEXITCODE -ne 0) { throw \'restore dry run failed\' }\n\n          $list = cargo run --quiet -- list | Out-String\n'
+              text = text.replace(win_needle, win_repl, 1)
+          rust.write_text(text)
+          PY
+
+          cargo fmt --all
+          git config user.name 'GPT Slave'
+          git config user.email 'unknown.entiti911@gmail.com'
+          git add src/commands.rs src/main.rs src/restore .github/workflows/rust.yml
+          if git diff --cached --quiet; then
+            echo 'Patch already applied.'
+            exit 0
+          fi
+          git commit -m 'wire convergent restore command [restore-patched]'
+          git push origin HEAD:agent/restore-engine
