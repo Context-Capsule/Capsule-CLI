@@ -1,0 +1,35 @@
+name: VS Code Rustfmt Once
+
+on:
+  push:
+    branches: [agent/vscode-workspace-adapter]
+
+permissions:
+  contents: write
+
+jobs:
+  rustfmt:
+    if: "!contains(github.event.head_commit.message, '[vscode-rustfmt]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/vscode-workspace-adapter
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format Rust sources and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          if git diff --quiet; then
+            echo 'Already formatted.'
+            exit 0
+          fi
+          git config user.name 'GPT Slave'
+          git config user.email 'unknown.entiti911@gmail.com'
+          git add src/lib.rs src/vscode.rs src/snapshot.rs
+          git commit -m 'format VS Code adapter [vscode-rustfmt]'
+          git push origin HEAD:agent/vscode-workspace-adapter
