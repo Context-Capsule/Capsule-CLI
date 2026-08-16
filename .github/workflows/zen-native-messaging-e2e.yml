@@ -8,15 +8,20 @@ on:
 jobs:
   zen-native-messaging:
     runs-on: windows-latest
-    env:
-      CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH: ${{ runner.temp }}\com.contextcapsule.host.json
-      CONTEXT_CAPSULE_FIREFOX_STATE_PATH: ${{ runner.temp }}\zen-firefox-state.json
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+
+      - name: Configure test paths
+        shell: pwsh
+        run: |
+          $manifest = Join-Path $env:RUNNER_TEMP 'com.contextcapsule.host.json'
+          $state = Join-Path $env:RUNNER_TEMP 'zen-firefox-state.json'
+          "CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH=$manifest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CONTEXT_CAPSULE_FIREFOX_STATE_PATH=$state" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build, install, and diagnose the Rust native host
         shell: pwsh
