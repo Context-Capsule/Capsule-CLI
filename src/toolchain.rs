@@ -192,8 +192,8 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Output> 
     // inherits stdout/stderr. This matters for Windows .cmd shims such as npm and pnpm.
     let capture = CaptureFiles::create()?;
     command
-        .stdout(Stdio::from(capture.stdout_writer.try_clone().ok()?))
-        .stderr(Stdio::from(capture.stderr_writer.try_clone().ok()?));
+        .stdout(Stdio::from(capture.stdout_writer.as_ref()?.try_clone().ok()?))
+        .stderr(Stdio::from(capture.stderr_writer.as_ref()?.try_clone().ok()?));
 
     let mut child = command.spawn().ok()?;
     let started = Instant::now();
@@ -215,8 +215,8 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Output> 
 struct CaptureFiles {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    stdout_writer: File,
-    stderr_writer: File,
+    stdout_writer: Option<File>,
+    stderr_writer: Option<File>,
 }
 
 impl CaptureFiles {
@@ -242,14 +242,18 @@ impl CaptureFiles {
         Some(Self {
             stdout_path,
             stderr_path,
-            stdout_writer,
-            stderr_writer,
+            stdout_writer: Some(stdout_writer),
+            stderr_writer: Some(stderr_writer),
         })
     }
 
-    fn finish(self, status: ExitStatus) -> Option<Output> {
-        drop(self.stdout_writer);
-        drop(self.stderr_writer);
+    fn close_writers(&mut self) {
+        drop(self.stdout_writer.take());
+        drop(self.stderr_writer.take());
+    }
+
+    fn finish(mut self, status: ExitStatus) -> Option<Output> {
+        self.close_writers();
 
         let stdout = fs::read(&self.stdout_path).unwrap_or_default();
         let stderr = fs::read(&self.stderr_path).unwrap_or_default();
@@ -266,6 +270,7 @@ impl CaptureFiles {
 
 impl Drop for CaptureFiles {
     fn drop(&mut self) {
+        self.close_writers();
         let _ = fs::remove_file(&self.stdout_path);
         let _ = fs::remove_file(&self.stderr_path);
     }
@@ -313,9 +318,14 @@ fn looks_like_utf16_le(bytes: &[u8]) -> bool {
         return false;
     }
 
-    let odd_bytes = bytes.iter().skip(1).step_by(2).collect::<Vec<_>>();
-    let zero_count = odd_bytes.iter().filter(|byte| ***byte == 0).count();
-    zero_count * 2 >= odd_bytes.len()
+    let odd_count = bytes.iter().skip(1).step_by(2).count();
+    let zero_count = bytes
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .filter(|byte| **byte == 0)
+        .count();
+    zero_count * 2 >= odd_count
 }
 
 #[cfg(windows)]
