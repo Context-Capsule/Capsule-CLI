@@ -35,7 +35,6 @@ const WS_EX_APPWINDOW: isize = 0x0004_0000;
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const MONITORINFOF_PRIMARY: u32 = 1;
 const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
-const DWMWA_CLOAKED: u32 = 14;
 const MDT_EFFECTIVE_DPI: i32 = 0;
 const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 const CLSCTX_ALL: u32 = 0x17;
@@ -609,7 +608,9 @@ fn enumerate_windows() -> Result<Vec<RawWindow>, String> {
 }
 
 unsafe extern "system" fn enum_window(hwnd: Hwnd, data: isize) -> Bool {
-    if unsafe { IsWindowVisible(hwnd) } == 0 || is_cloaked(hwnd) {
+    // Windows commonly DWM-cloaks windows that live on another virtual desktop.
+    // Keep visible-style windows here and let IVirtualDesktopManager identify their desktop.
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
         return 1;
     }
     let title = window_title(hwnd);
@@ -663,19 +664,6 @@ fn window_title(hwnd: Hwnd) -> String {
     String::from_utf16_lossy(&buffer[..copied as usize])
         .trim()
         .to_owned()
-}
-
-fn is_cloaked(hwnd: Hwnd) -> bool {
-    let mut cloaked = 0_u32;
-    let result = unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            (&mut cloaked as *mut u32).cast(),
-            size_of::<u32>() as u32,
-        )
-    };
-    result >= 0 && cloaked != 0
 }
 
 fn window_bounds(hwnd: Hwnd) -> Option<Rect> {
