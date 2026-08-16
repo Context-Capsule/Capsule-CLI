@@ -23,3 +23,9 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Run inspect
+        run: cargo run -- inspect
+
+      - name: Run apps
+        run: cargo run -- apps
