@@ -18,7 +18,7 @@ pub fn list_open_apps() -> Result<Vec<OpenApp>, String> {
 #[cfg(windows)]
 mod windows {
     use super::OpenApp;
-    use std::{ffi::c_void, io, path::Path, ptr};
+    use std::{ffi::c_void, io, path::Path};
 
     type Hwnd = *mut c_void;
     type Handle = *mut c_void;
@@ -142,10 +142,5 @@ mod windows {
                     Some(full_path)
                 }
             })
-    }
-
-    #[allow(dead_code)]
-    fn _null_handle() -> Handle {
-        ptr::null_mut()
     }
 }
