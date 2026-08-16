@@ -35,6 +35,66 @@ jobs:
       - name: Toolchain discovery smoke test
         run: cargo run -- inspect --tools
 
+      - name: Persistence CLI lifecycle (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-persistence.db
+        run: |
+          set -euo pipefail
+          cargo run --quiet -- save ci-persistence
+          cargo run --quiet -- list | grep -F 'ci-persistence'
+          cargo run --quiet -- show ci-persistence --json > "$RUNNER_TEMP/capsule.json"
+          grep -F '"schema_version": 1' "$RUNNER_TEMP/capsule.json"
+          grep -F '"docker"' "$RUNNER_TEMP/capsule.json"
+
+          if cargo run --quiet -- save CI-PERSISTENCE; then
+            echo 'duplicate save unexpectedly succeeded without --force' >&2
+            exit 1
+          fi
+
+          cargo run --quiet -- save ci-persistence --force
+          cargo run --quiet -- delete CI-PERSISTENCE
+          if cargo run --quiet -- show ci-persistence; then
+            echo 'deleted capsule was still loadable' >&2
+            exit 1
+          fi
+
+      - name: Persistence CLI lifecycle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-persistence.db
+        run: |
+          cargo run --quiet -- save ci-persistence
+
+          $list = cargo run --quiet -- list | Out-String
+          if ($list -notmatch 'ci-persistence') {
+            throw 'saved capsule was not listed'
+          }
+
+          $json = cargo run --quiet -- show ci-persistence --json | Out-String
+          if ($json -notmatch '"schema_version"\s*:\s*1') {
+            throw 'stored capsule schema version was not present'
+          }
+          if ($json -notmatch '"docker"') {
+            throw 'stored capsule did not contain Docker metadata'
+          }
+
+          cargo run --quiet -- save CI-PERSISTENCE
+          if ($LASTEXITCODE -eq 0) {
+            throw 'duplicate save unexpectedly succeeded without --force'
+          }
+
+          cargo run --quiet -- save ci-persistence --force
+          if ($LASTEXITCODE -ne 0) { throw 'forced replacement failed' }
+          cargo run --quiet -- delete CI-PERSISTENCE
+          if ($LASTEXITCODE -ne 0) { throw 'delete failed' }
+          cargo run --quiet -- show ci-persistence
+          if ($LASTEXITCODE -eq 0) {
+            throw 'deleted capsule was still loadable'
+          }
+
       - name: Installed Node tools must be discovered
         if: runner.os == 'Windows'
         shell: pwsh
@@ -90,5 +150,80 @@ jobs:
       - name: Ignored-candidate diagnostics
         run: cargo run -- inspect --ignored
 
+      - name: Docker discovery
+        run: cargo run -- inspect --docker
+
       - name: Compatibility apps command
         run: cargo run -- apps
+
+  docker-integration:
+    runs-on: ubuntu-latest
+    env:
+      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-docker.db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build
+
+      - name: Verify Docker engine and Compose
+        run: |
+          docker version
+          docker compose version
+
+      - name: Restore an existing standalone container
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker rm -f capsule-standalone-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          cleanup
+
+          docker run -d --name capsule-standalone-ci alpine:3.20 sleep 300
+          cargo run --quiet -- save standalone-ci
+          cargo run --quiet -- show standalone-ci --json | grep -F 'capsule-standalone-ci'
+
+          docker stop capsule-standalone-ci
+          test "$(docker inspect --format '{{.State.Running}}' capsule-standalone-ci)" = 'false'
+
+          cargo run --quiet -- docker restore standalone-ci
+          test "$(docker inspect --format '{{.State.Running}}' capsule-standalone-ci)" = 'true'
+
+      - name: Recreate a Compose project from saved intent
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_dir="$RUNNER_TEMP/context-capsule-compose-ci"
+          mkdir -p "$project_dir"
+          cat > "$project_dir/compose.yml" <<'YAML'
+          services:
+            worker:
+              image: alpine:3.20
+              command: ["sleep", "300"]
+          YAML
+
+          cleanup() {
+            docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci down --remove-orphans >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          cleanup
+
+          docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci up -d
+          cargo run --quiet -- save compose-ci
+          cargo run --quiet -- show compose-ci --json | grep -F 'capsule-compose-ci'
+
+          docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci down
+          if docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q | grep -q .; then
+            echo 'Compose project was still running after docker compose down' >&2
+            exit 1
+          fi
+
+          cargo run --quiet -- docker restore compose-ci
+          docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q | grep -q .
