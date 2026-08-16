@@ -1,4 +1,10 @@
-use std::{fs, path::Path, process::Command, thread};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolVersion {
@@ -21,207 +27,50 @@ struct ToolSpec {
     args: &'static [&'static str],
 }
 
+const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(8);
+const TOOL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 const TOOLS: &[ToolSpec] = &[
-    ToolSpec {
-        name: "Git",
-        command: "git",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Node.js",
-        command: "node",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "npm",
-        command: "npm",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "pnpm",
-        command: "pnpm",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "npx",
-        command: "npx",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Corepack",
-        command: "corepack",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Yarn",
-        command: "yarn",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Bun",
-        command: "bun",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Deno",
-        command: "deno",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Rust",
-        command: "rustc",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Cargo",
-        command: "cargo",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "rustup",
-        command: "rustup",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Python",
-        command: "python",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Python 3",
-        command: "python3",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "pip",
-        command: "pip",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "uv",
-        command: "uv",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Poetry",
-        command: "poetry",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Go",
-        command: "go",
-        args: &["version"],
-    },
-    ToolSpec {
-        name: ".NET SDK",
-        command: "dotnet",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Java",
-        command: "java",
-        args: &["-version"],
-    },
-    ToolSpec {
-        name: "Maven",
-        command: "mvn",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Gradle",
-        command: "gradle",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "PHP",
-        command: "php",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Composer",
-        command: "composer",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Ruby",
-        command: "ruby",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Bundler",
-        command: "bundle",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Docker",
-        command: "docker",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Docker Compose",
-        command: "docker",
-        args: &["compose", "version", "--short"],
-    },
-    ToolSpec {
-        name: "Podman",
-        command: "podman",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "CMake",
-        command: "cmake",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Ninja",
-        command: "ninja",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "GCC",
-        command: "gcc",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Clang",
-        command: "clang",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "PowerShell",
-        command: "pwsh",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "WSL",
-        command: "wsl",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "kubectl",
-        command: "kubectl",
-        args: &["version", "--client"],
-    },
-    ToolSpec {
-        name: "Terraform",
-        command: "terraform",
-        args: &["version"],
-    },
-    ToolSpec {
-        name: "GitHub CLI",
-        command: "gh",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "fnm",
-        command: "fnm",
-        args: &["--version"],
-    },
-    ToolSpec {
-        name: "Volta",
-        command: "volta",
-        args: &["--version"],
-    },
+    ToolSpec { name: "Git", command: "git", args: &["--version"] },
+    ToolSpec { name: "Node.js", command: "node", args: &["--version"] },
+    ToolSpec { name: "npm", command: "npm", args: &["--version"] },
+    ToolSpec { name: "pnpm", command: "pnpm", args: &["--version"] },
+    ToolSpec { name: "npx", command: "npx", args: &["--version"] },
+    ToolSpec { name: "Corepack", command: "corepack", args: &["--version"] },
+    ToolSpec { name: "Yarn", command: "yarn", args: &["--version"] },
+    ToolSpec { name: "Bun", command: "bun", args: &["--version"] },
+    ToolSpec { name: "Deno", command: "deno", args: &["--version"] },
+    ToolSpec { name: "Rust", command: "rustc", args: &["--version"] },
+    ToolSpec { name: "Cargo", command: "cargo", args: &["--version"] },
+    ToolSpec { name: "rustup", command: "rustup", args: &["--version"] },
+    ToolSpec { name: "Python", command: "python", args: &["--version"] },
+    ToolSpec { name: "Python 3", command: "python3", args: &["--version"] },
+    ToolSpec { name: "pip", command: "pip", args: &["--version"] },
+    ToolSpec { name: "uv", command: "uv", args: &["--version"] },
+    ToolSpec { name: "Poetry", command: "poetry", args: &["--version"] },
+    ToolSpec { name: "Go", command: "go", args: &["version"] },
+    ToolSpec { name: ".NET SDK", command: "dotnet", args: &["--version"] },
+    ToolSpec { name: "Java", command: "java", args: &["-version"] },
+    ToolSpec { name: "Maven", command: "mvn", args: &["--version"] },
+    ToolSpec { name: "Gradle", command: "gradle", args: &["--version"] },
+    ToolSpec { name: "PHP", command: "php", args: &["--version"] },
+    ToolSpec { name: "Composer", command: "composer", args: &["--version"] },
+    ToolSpec { name: "Ruby", command: "ruby", args: &["--version"] },
+    ToolSpec { name: "Bundler", command: "bundle", args: &["--version"] },
+    ToolSpec { name: "Docker", command: "docker", args: &["--version"] },
+    ToolSpec { name: "Docker Compose", command: "docker", args: &["compose", "version", "--short"] },
+    ToolSpec { name: "Podman", command: "podman", args: &["--version"] },
+    ToolSpec { name: "CMake", command: "cmake", args: &["--version"] },
+    ToolSpec { name: "Ninja", command: "ninja", args: &["--version"] },
+    ToolSpec { name: "GCC", command: "gcc", args: &["--version"] },
+    ToolSpec { name: "Clang", command: "clang", args: &["--version"] },
+    ToolSpec { name: "PowerShell", command: "pwsh", args: &["--version"] },
+    ToolSpec { name: "WSL", command: "wsl", args: &["--version"] },
+    ToolSpec { name: "kubectl", command: "kubectl", args: &["version", "--client"] },
+    ToolSpec { name: "Terraform", command: "terraform", args: &["version"] },
+    ToolSpec { name: "GitHub CLI", command: "gh", args: &["--version"] },
+    ToolSpec { name: "fnm", command: "fnm", args: &["--version"] },
+    ToolSpec { name: "Volta", command: "volta", args: &["--version"] },
 ];
 
 const VERSION_HINT_FILES: &[&str] = &[
@@ -289,9 +138,9 @@ pub fn discover_version_hints(project_root: &Path) -> Vec<VersionHint> {
 
 fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
     let executable_path = resolve_executable(spec.command)?;
-    let output = run_version_command(spec.command, spec.args)?;
-    let version =
-        first_non_empty_line(&output.stdout).or_else(|| first_non_empty_line(&output.stderr))?;
+    let output = run_version_command(spec.command, spec.args, &executable_path)?;
+    let version = first_non_empty_line(&output.stdout)
+        .or_else(|| first_non_empty_line(&output.stderr))?;
 
     Some(ToolVersion {
         name: spec.name.to_owned(),
@@ -302,11 +151,19 @@ fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
 }
 
 #[cfg(windows)]
-fn run_version_command(command: &str, args: &[&str]) -> Option<std::process::Output> {
-    if let Ok(output) = Command::new(command).args(args).output() {
-        return Some(output);
+fn run_version_command(command: &str, args: &[&str], executable_path: &str) -> Option<Output> {
+    let path = executable_path.to_ascii_lowercase();
+    if path.ends_with(".cmd") || path.ends_with(".bat") {
+        return run_windows_command_shim(command, args);
     }
 
+    let mut direct = Command::new(executable_path);
+    direct.args(args);
+    run_with_timeout(&mut direct, TOOL_VERSION_TIMEOUT)
+}
+
+#[cfg(windows)]
+fn run_windows_command_shim(command: &str, args: &[&str]) -> Option<Output> {
     // npm, pnpm, npx, Corepack and similar Windows tools are frequently .cmd shims.
     let command_line = std::iter::once(command)
         .chain(args.iter().copied())
@@ -314,16 +171,34 @@ fn run_version_command(command: &str, args: &[&str]) -> Option<std::process::Out
         .collect::<Vec<_>>()
         .join(" ");
 
-    Command::new("cmd.exe")
-        .args(["/D", "/S", "/C"])
-        .arg(command_line)
-        .output()
-        .ok()
+    let mut shell = Command::new("cmd.exe");
+    shell.args(["/D", "/S", "/C"]).arg(command_line);
+    run_with_timeout(&mut shell, TOOL_VERSION_TIMEOUT)
 }
 
 #[cfg(not(windows))]
-fn run_version_command(command: &str, args: &[&str]) -> Option<std::process::Output> {
-    Command::new(command).args(args).output().ok()
+fn run_version_command(_command: &str, args: &[&str], executable_path: &str) -> Option<Output> {
+    let mut direct = Command::new(executable_path);
+    direct.args(args);
+    run_with_timeout(&mut direct, TOOL_VERSION_TIMEOUT)
+}
+
+fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let started = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() < timeout => thread::sleep(TOOL_POLL_INTERVAL),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -441,6 +316,19 @@ mod tests {
                 value: "22.14.0".to_owned(),
             }]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_timeout_stops_a_hanging_command() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2; printf late"]);
+
+        let started = Instant::now();
+        let output = run_with_timeout(&mut command, Duration::from_millis(100));
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(windows)]
