@@ -18,14 +18,19 @@ pub fn discover() -> Result<DesktopSnapshot, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::model::{ApplicationClassification, Rect, WindowState};
+    use super::*;
 
     #[test]
     fn virtual_desktops_are_grouped_from_application_windows() {
         let window = WindowInfo {
             title: "Editor".to_owned(),
-            bounds: Rect { left: 0, top: 0, right: 100, bottom: 100 },
+            bounds: Rect {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
             restore_bounds: None,
             normalized_bounds: None,
             state: WindowState::Normal,
@@ -59,6 +64,9 @@ mod tests {
             ignored: vec![],
         };
 
-        assert_eq!(snapshot.virtual_desktops(), vec![("desktop-a".to_owned(), Some(true), 1)]);
+        assert_eq!(
+            snapshot.virtual_desktops(),
+            vec![("desktop-a".to_owned(), Some(true), 1)]
+        );
     }
 }

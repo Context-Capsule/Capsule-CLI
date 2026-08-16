@@ -14,7 +14,9 @@ pub fn classify_candidate(
     known_background_app: bool,
 ) -> ClassificationDecision {
     let executable_lower = executable.to_ascii_lowercase();
-    let stem = executable_lower.strip_suffix(".exe").unwrap_or(&executable_lower);
+    let stem = executable_lower
+        .strip_suffix(".exe")
+        .unwrap_or(&executable_lower);
 
     if known_background_app {
         return ClassificationDecision {
@@ -201,38 +203,66 @@ mod tests {
 
     #[test]
     fn program_manager_is_shell_not_app() {
-        let decision = classify_candidate("explorer.exe", &["Program Manager".to_owned()], true, false);
-        assert_eq!(decision.classification, ApplicationClassification::ShellComponent);
+        let decision =
+            classify_candidate("explorer.exe", &["Program Manager".to_owned()], true, false);
+        assert_eq!(
+            decision.classification,
+            ApplicationClassification::ShellComponent
+        );
     }
 
     #[test]
     fn explorer_folder_window_is_a_user_app() {
         let decision = classify_candidate("explorer.exe", &["Downloads".to_owned()], true, false);
-        assert_eq!(decision.classification, ApplicationClassification::UserApplication);
+        assert_eq!(
+            decision.classification,
+            ApplicationClassification::UserApplication
+        );
     }
 
     #[test]
     fn generic_broker_self_titled_window_is_helper() {
-        let decision = classify_candidate("OmApSvcBroker.exe", &["OmApSvcBroker".to_owned()], true, false);
-        assert_eq!(decision.classification, ApplicationClassification::ApplicationHelper);
+        let decision = classify_candidate(
+            "OmApSvcBroker.exe",
+            &["OmApSvcBroker".to_owned()],
+            true,
+            false,
+        );
+        assert_eq!(
+            decision.classification,
+            ApplicationClassification::ApplicationHelper
+        );
         assert!(decision.reason.contains("broker/helper/service"));
     }
 
     #[test]
     fn docker_desktop_can_be_discovered_without_window() {
         let decision = classify_candidate("Docker Desktop.exe", &[], false, true);
-        assert_eq!(decision.classification, ApplicationClassification::UserApplication);
+        assert_eq!(
+            decision.classification,
+            ApplicationClassification::UserApplication
+        );
         assert_eq!(decision.confidence, 100);
     }
 
     #[test]
     fn detects_common_snap_layouts() {
         assert_eq!(
-            detect_snap(NormalizedRect { x: 0.0, y: 0.0, width: 0.5, height: 1.0 }),
+            detect_snap(NormalizedRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0
+            }),
             Some(SnapPosition::LeftHalf)
         );
         assert_eq!(
-            detect_snap(NormalizedRect { x: 0.334, y: 0.0, width: 0.666, height: 1.0 }),
+            detect_snap(NormalizedRect {
+                x: 0.334,
+                y: 0.0,
+                width: 0.666,
+                height: 1.0
+            }),
             Some(SnapPosition::RightTwoThirds)
         );
     }
@@ -240,15 +270,33 @@ mod tests {
     #[test]
     fn custom_geometry_is_not_forced_into_a_snap_slot() {
         assert_eq!(
-            detect_snap(NormalizedRect { x: 0.12, y: 0.11, width: 0.71, height: 0.77 }),
+            detect_snap(NormalizedRect {
+                x: 0.12,
+                y: 0.11,
+                width: 0.71,
+                height: 0.77
+            }),
             None
         );
     }
 
     #[test]
     fn display_relation_handles_diagonal_layout() {
-        let primary = Rect { left: 0, top: 0, right: 1920, bottom: 1080 };
-        let display = Rect { left: 1920, top: -2500, right: 4480, bottom: -1060 };
-        assert_eq!(display_relation(display, primary, false), "above-right-of-primary");
+        let primary = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let display = Rect {
+            left: 1920,
+            top: -2500,
+            right: 4480,
+            bottom: -1060,
+        };
+        assert_eq!(
+            display_relation(display, primary, false),
+            "above-right-of-primary"
+        );
     }
 }

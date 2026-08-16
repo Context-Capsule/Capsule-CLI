@@ -31,7 +31,10 @@ fn main() -> ExitCode {
     match args.next().as_deref() {
         Some("inspect") => {
             let remaining = args.collect::<Vec<_>>();
-            if remaining.iter().any(|arg| matches!(arg.as_str(), "-h" | "--help")) {
+            if remaining
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+            {
                 print_inspect_usage();
                 return ExitCode::SUCCESS;
             }
@@ -83,9 +86,17 @@ where
         match argument.as_str() {
             "--verbose" | "-v" => options.verbose = true,
             "--apps" => set_section(&mut options, &mut selected_section, InspectSection::Apps)?,
-            "--windows" => set_section(&mut options, &mut selected_section, InspectSection::Windows)?,
-            "--processes" => set_section(&mut options, &mut selected_section, InspectSection::Processes)?,
-            "--ignored" => set_section(&mut options, &mut selected_section, InspectSection::Ignored)?,
+            "--windows" => {
+                set_section(&mut options, &mut selected_section, InspectSection::Windows)?
+            }
+            "--processes" => set_section(
+                &mut options,
+                &mut selected_section,
+                InspectSection::Processes,
+            )?,
+            "--ignored" => {
+                set_section(&mut options, &mut selected_section, InspectSection::Ignored)?
+            }
             "--tools" => set_section(&mut options, &mut selected_section, InspectSection::Tools)?,
             other => return Err(format!("unknown inspect option '{other}'")),
         }
@@ -172,7 +183,10 @@ fn print_full_snapshot(snapshot: &DiscoverySnapshot, verbose: bool) {
 
 fn print_working_context(snapshot: &DiscoverySnapshot, verbose: bool) {
     println!("Working context");
-    println!("  Current directory: {}", snapshot.current_directory.display());
+    println!(
+        "  Current directory: {}",
+        snapshot.current_directory.display()
+    );
 
     match &snapshot.git {
         GitState::Context(context) => {
@@ -203,7 +217,9 @@ fn print_working_context(snapshot: &DiscoverySnapshot, verbose: bool) {
             }
         }
         GitState::NotRepository => println!("  Git repository:    not detected"),
-        GitState::GitUnavailable => println!("  Git repository:    unavailable (git not installed)"),
+        GitState::GitUnavailable => {
+            println!("  Git repository:    unavailable (git not installed)")
+        }
     }
 }
 
@@ -263,7 +279,11 @@ fn print_application(application: &ApplicationInfo, verbose: bool) {
     }
 
     if let Some(launch) = application.launch.as_ref() {
-        println!("    launch:  {} -> {}", launch.strategy.as_str(), launch.target);
+        println!(
+            "    launch:  {} -> {}",
+            launch.strategy.as_str(),
+            launch.target
+        );
     } else {
         println!("    launch:  unavailable");
     }
@@ -289,7 +309,11 @@ fn print_application(application: &ApplicationInfo, verbose: bool) {
 }
 
 fn print_window(window: &WindowInfo, verbose: bool) {
-    let foreground = if window.is_foreground { " [foreground]" } else { "" };
+    let foreground = if window.is_foreground {
+        " [foreground]"
+    } else {
+        ""
+    };
     println!("    window:  {}{}", window.title, foreground);
     println!(
         "      placement: {} on {} ({}, {}% scale)",
@@ -329,7 +353,11 @@ fn print_window(window: &WindowInfo, verbose: bool) {
         println!("      z-order:   {}", window.z_order);
         println!(
             "      taskbar:   {}",
-            if window.taskbar_candidate { "candidate" } else { "no" }
+            if window.taskbar_candidate {
+                "candidate"
+            } else {
+                "no"
+            }
         );
     }
 }
@@ -355,7 +383,10 @@ fn print_displays(desktop: &DesktopSnapshot, verbose: bool) {
         if verbose {
             println!(
                 "    desktop bounds: ({}, {}) -> ({}, {})",
-                display.bounds.left, display.bounds.top, display.bounds.right, display.bounds.bottom
+                display.bounds.left,
+                display.bounds.top,
+                display.bounds.right,
+                display.bounds.bottom
             );
             println!(
                 "    work area:      ({}, {}) -> ({}, {})",
@@ -486,7 +517,10 @@ mod tests {
     fn inspect_defaults_to_all_sections() {
         assert_eq!(
             parse(&[]).expect("options"),
-            InspectOptions { section: InspectSection::All, verbose: false }
+            InspectOptions {
+                section: InspectSection::All,
+                verbose: false
+            }
         );
     }
 
@@ -494,7 +528,10 @@ mod tests {
     fn verbose_can_be_combined_with_one_section() {
         assert_eq!(
             parse(&["--windows", "--verbose"]).expect("options"),
-            InspectOptions { section: InspectSection::Windows, verbose: true }
+            InspectOptions {
+                section: InspectSection::Windows,
+                verbose: true
+            }
         );
     }
 

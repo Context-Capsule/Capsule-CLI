@@ -25,7 +25,12 @@ pub fn discover_current() -> Result<GitContext, GitDiscoveryError> {
     let status = git_optional(&["status", "--porcelain=v1"]).unwrap_or_default();
     let changed_files = parse_changed_files(&status);
     let stash_count = git_optional(&["stash", "list"])
-        .map(|output| output.lines().filter(|line| !line.trim().is_empty()).count())
+        .map(|output| {
+            output
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
         .unwrap_or(0);
 
     Ok(GitContext {
@@ -85,9 +90,8 @@ mod tests {
 
     #[test]
     fn parses_modified_untracked_and_renamed_files() {
-        let changed = parse_changed_files(
-            " M src/main.rs\n?? notes.txt\nR  old-name.rs -> new-name.rs\n",
-        );
+        let changed =
+            parse_changed_files(" M src/main.rs\n?? notes.txt\nR  old-name.rs -> new-name.rs\n");
 
         assert_eq!(
             changed,
