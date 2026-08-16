@@ -20,20 +20,21 @@ jobs:
       - run: cargo check --all-targets
       - run: cargo test
       - run: cargo build --bin capsule-firefox-host
-      - name: Register and unregister Firefox host on Windows
+      - name: Register, diagnose, and unregister host on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH: ${{ runner.temp }}\com.contextcapsule.host.json
         run: |
           .\target\debug\capsule-firefox-host.exe --install
+          .\target\debug\capsule-firefox-host.exe --doctor
           if (-not (Test-Path $env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH)) {
             throw 'native messaging manifest was not created'
           }
 
           $registryPath = 'Registry::HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts\com.contextcapsule.host'
           if (-not (Test-Path $registryPath)) {
-            throw 'Firefox native messaging registry key was not created'
+            throw 'native messaging registry key was not created'
           }
           $registeredManifest = (Get-Item $registryPath).GetValue('')
           if ($registeredManifest -ne $env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH) {
@@ -42,7 +43,7 @@ jobs:
 
           .\target\debug\capsule-firefox-host.exe --uninstall
           if (Test-Path $registryPath) {
-            throw 'Firefox native messaging registry key remained after uninstall'
+            throw 'native messaging registry key remained after uninstall'
           }
 
   protocol-integration:
@@ -55,10 +56,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --bins
-      - name: Install native host manifest
+      - name: Install and diagnose native host manifest
         run: |
           mkdir -p "$HOME"
           ./target/debug/capsule-firefox-host --install
+          ./target/debug/capsule-firefox-host --doctor
           test -f "$HOME/.mozilla/native-messaging-hosts/com.contextcapsule.host.json"
           grep -F 'firefox@contextcapsule.app' "$HOME/.mozilla/native-messaging-hosts/com.contextcapsule.host.json"
       - name: Exercise framed ping and live-state update
@@ -103,3 +105,164 @@ jobs:
           ./target/debug/capsule show firefox-ci --json > /tmp/firefox-capsule.json
           grep -F '"firefox"' /tmp/firefox-capsule.json
           grep -F 'https://example.com' /tmp/firefox-capsule.json
+
+  zen-native-messaging-e2e:
+    runs-on: windows-latest
+    env:
+      CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH: ${{ runner.temp }}\com.contextcapsule.host.json
+      CONTEXT_CAPSULE_FIREFOX_STATE_PATH: ${{ runner.temp }}\zen-firefox-state.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build and install the real Rust native host
+        shell: pwsh
+        run: |
+          cargo build --bin capsule-firefox-host
+          .\target\debug\capsule-firefox-host.exe --install
+          .\target\debug\capsule-firefox-host.exe --doctor
+      - name: Install latest official Zen Browser
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/zen-browser/desktop/releases/latest" `
+            -Headers @{ "User-Agent" = "Context-Capsule-CI" }
+          $asset = $release.assets | Where-Object { $_.name -eq 'zen.installer.exe' } | Select-Object -First 1
+          if (-not $asset) { throw 'latest Zen release has no zen.installer.exe' }
+          $installer = Join-Path $env:RUNNER_TEMP 'zen.installer.exe'
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer
+          $install = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010, 1641)) {
+            throw "Zen installer failed with exit code $($install.ExitCode)"
+          }
+          $zen = @(
+            "$env:ProgramW6432\Zen Browser\zen.exe",
+            "$env:ProgramFiles\Zen Browser\zen.exe",
+            "${env:ProgramFiles(x86)}\Zen Browser\zen.exe",
+            "$env:LOCALAPPDATA\Zen Browser\zen.exe",
+            "$env:LOCALAPPDATA\Programs\Zen Browser\zen.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $zen) { throw 'Zen installed but zen.exe was not found' }
+          Write-Host "Using Zen: $zen"
+          (Get-Item $zen).VersionInfo | Format-List FileVersion,ProductVersion
+          "ZEN_EXE=$zen" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Create native-messaging WebExtension probe
+        shell: pwsh
+        run: |
+          $extension = Join-Path $env:RUNNER_TEMP 'context-capsule-native-probe'
+          New-Item -ItemType Directory -Path $extension -Force | Out-Null
+          Set-Content -Path (Join-Path $extension 'manifest.json') -Encoding utf8 -Value @'
+          {
+            "manifest_version": 3,
+            "name": "Context Capsule Native Probe",
+            "version": "1.0.0",
+            "browser_specific_settings": {
+              "gecko": {
+                "id": "firefox@contextcapsule.app",
+                "strict_min_version": "142.0",
+                "data_collection_permissions": { "required": ["none"] }
+              }
+            },
+            "permissions": ["nativeMessaging"],
+            "background": { "scripts": ["background.js"] }
+          }
+          '@
+          Set-Content -Path (Join-Path $extension 'background.js') -Encoding utf8 -Value @'
+          const snapshot = {
+            schema_version: 1,
+            browser: "firefox",
+            extension_version: "zen-ci",
+            captured_at_unix_ms: Date.now(),
+            skipped_private_windows: 0,
+            windows: [{
+              key: "zen-ci-window",
+              focused: true,
+              state: "normal",
+              left: 0,
+              top: 0,
+              width: 1000,
+              height: 700,
+              tabs: [{
+                index: 0,
+                url: "https://zen-native-host-ci.example/",
+                title: "Zen native messaging CI",
+                pinned: false,
+                active: true,
+                discarded: false,
+                muted: false,
+                restorable: true
+              }],
+              groups: []
+            }]
+          };
+
+          function connect() {
+            try {
+              const port = browser.runtime.connectNative("com.contextcapsule.host");
+              port.onDisconnect.addListener(() => setTimeout(connect, 1000));
+              port.postMessage({
+                protocol_version: 1,
+                request_id: "zen-ci-state",
+                type: "browser.state.update",
+                snapshot
+              });
+            } catch (_) {
+              setTimeout(connect, 1000);
+            }
+          }
+          connect();
+          '@
+          "PROBE_EXTENSION=$extension" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prove Zen can discover and communicate with the registered Rust host
+        shell: pwsh
+        run: |
+          Remove-Item $env:CONTEXT_CAPSULE_FIREFOX_STATE_PATH -Force -ErrorAction SilentlyContinue
+          $stdout = Join-Path $env:RUNNER_TEMP 'zen-native-probe.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'zen-native-probe.stderr.log'
+          $command = "npx --yes web-ext@10.6.0 run --source-dir `"$env:PROBE_EXTENSION`" --firefox `"$env:ZEN_EXE`" --no-input"
+          $process = Start-Process `
+            -FilePath $env:ComSpec `
+            -ArgumentList '/d','/s','/c',$command `
+            -WorkingDirectory $PWD `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru `
+            -WindowStyle Hidden
+
+          $deadline = (Get-Date).AddSeconds(90)
+          $passed = $false
+          try {
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Milliseconds 500
+              if (Test-Path $env:CONTEXT_CAPSULE_FIREFOX_STATE_PATH) {
+                $state = Get-Content $env:CONTEXT_CAPSULE_FIREFOX_STATE_PATH -Raw
+                if ($state -match [regex]::Escape('https://zen-native-host-ci.example/')) {
+                  $passed = $true
+                  break
+                }
+              }
+              if ($process.HasExited) { break }
+            }
+          }
+          finally {
+            if (-not $process.HasExited) {
+              & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null
+              $global:LASTEXITCODE = 0
+            }
+          }
+
+          Write-Host '----- web-ext stdout -----'
+          if (Test-Path $stdout) { Get-Content $stdout -Raw | Write-Host }
+          Write-Host '----- web-ext stderr -----'
+          if (Test-Path $stderr) { Get-Content $stderr -Raw | Write-Host }
+          if (-not $passed) {
+            throw 'Zen never delivered the WebExtension native message to the Context Capsule Rust host'
+          }
+
+          .\target\debug\capsule-firefox-host.exe --status | Tee-Object -Variable status
+          if (($status -join "`n") -notmatch 'adapter: live') {
+            throw 'native host received state but --status did not report a live adapter'
+          }
+          Write-Host 'Zen -> WebExtension -> Windows NativeMessagingHosts -> Rust host integration passed.'
