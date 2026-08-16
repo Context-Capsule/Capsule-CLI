@@ -23,6 +23,7 @@ enum InspectSection {
     Ignored,
     Tools,
     Docker,
+    Terminals,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,7 @@ fn main() -> ExitCode {
         Some("show") => commands::show(args.collect()),
         Some("delete") => commands::delete(args.collect()),
         Some("docker") => commands::docker(args.collect()),
+        Some("terminal") => commands::terminal(args.collect()),
         Some("apps") => {
             if args.next().is_some() {
                 eprintln!("error: 'apps' does not accept arguments\n");
@@ -110,6 +112,9 @@ where
             }
             "--tools" => set_section(&mut options, &mut selected_section, InspectSection::Tools)?,
             "--docker" => set_section(&mut options, &mut selected_section, InspectSection::Docker)?,
+            "--terminals" => {
+                set_section(&mut options, &mut selected_section, InspectSection::Terminals)?
+            }
             other => return Err(format!("unknown inspect option '{other}'")),
         }
     }
@@ -124,7 +129,7 @@ fn set_section(
 ) -> Result<(), String> {
     if *selected {
         return Err(
-            "choose at most one of --apps, --windows, --processes, --ignored, --tools, or --docker"
+            "choose at most one of --apps, --windows, --processes, --ignored, --tools, --docker, or --terminals"
                 .to_owned(),
         );
     }
@@ -136,16 +141,29 @@ fn set_section(
 
 fn inspect(options: InspectOptions) -> ExitCode {
     let include_tools = matches!(options.section, InspectSection::All | InspectSection::Tools);
-    let include_desktop = !matches!(
+    let include_desktop = matches!(
         options.section,
-        InspectSection::Tools | InspectSection::Docker
+        InspectSection::All
+            | InspectSection::Apps
+            | InspectSection::Windows
+            | InspectSection::Processes
+            | InspectSection::Ignored
     );
     let include_docker = matches!(
         options.section,
         InspectSection::All | InspectSection::Docker
     );
+    let include_terminals = matches!(
+        options.section,
+        InspectSection::All | InspectSection::Terminals
+    );
 
-    let snapshot = match discovery::discover(include_tools, include_desktop, include_docker) {
+    let snapshot = match discovery::discover(
+        include_tools,
+        include_desktop,
+        include_docker,
+        include_terminals,
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!("Discovery failed: {error}");
@@ -161,6 +179,7 @@ fn inspect(options: InspectOptions) -> ExitCode {
         InspectSection::Processes => print_process_candidates(&snapshot),
         InspectSection::Ignored => print_ignored(&snapshot),
         InspectSection::Docker => commands::print_docker_snapshot(&snapshot.docker, true),
+        InspectSection::Terminals => commands::print_terminal_snapshot(&snapshot.terminals, true),
     }
 
     ExitCode::SUCCESS
@@ -171,6 +190,8 @@ fn print_full_snapshot(snapshot: &DiscoverySnapshot, verbose: bool) {
     print_working_context(snapshot, verbose);
     println!();
     print_tools(snapshot, verbose);
+    println!();
+    commands::print_terminal_snapshot(&snapshot.terminals, verbose);
     println!();
 
     match snapshot.desktop.as_ref() {
@@ -545,16 +566,18 @@ fn print_usage() {
     println!("  capsule delete <name>");
     println!("  capsule docker inspect");
     println!("  capsule docker restore <capsule-name>");
+    println!("  capsule terminal inspect [--json]");
     println!("  capsule apps\n");
     println!("Commands:");
     println!(
-        "  inspect    Discover current workspace, tools, applications, windows, displays and Docker"
+        "  inspect    Discover current workspace, tools, terminals, applications, windows, displays and Docker"
     );
     println!("  save       Capture the current semantic workspace into SQLite");
     println!("  list       List saved capsules");
     println!("  show       Show a saved capsule; --json prints the complete stored payload");
     println!("  delete     Delete a saved capsule");
     println!("  docker     Inspect Docker or restore Docker resources from a saved capsule");
+    println!("  terminal   Inspect semantic terminal and WSL session metadata");
     println!("  apps       Compatibility alias for 'capsule inspect --apps'");
     println!();
     print_inspect_usage();
@@ -569,6 +592,7 @@ fn print_inspect_usage() {
     println!("      --ignored     Show helper, shell and uncertain candidates that are not stored");
     println!("      --tools       Show detected developer runtimes and project version pins");
     println!("      --docker      Show running Docker/Compose resources and restore metadata");
+    println!("      --terminals   Show open Windows terminal sessions and running WSL shell state");
 }
 
 #[cfg(test)]
@@ -613,9 +637,21 @@ mod tests {
     }
 
     #[test]
+    fn terminals_can_be_selected_as_an_inspect_section() {
+        assert_eq!(
+            parse(&["--terminals"]).expect("options"),
+            InspectOptions {
+                section: InspectSection::Terminals,
+                verbose: false
+            }
+        );
+    }
+
+    #[test]
     fn multiple_section_filters_are_rejected() {
         assert!(parse(&["--apps", "--tools"]).is_err());
         assert!(parse(&["--docker", "--windows"]).is_err());
+        assert!(parse(&["--terminals", "--docker"]).is_err());
     }
 
     #[test]
