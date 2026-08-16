@@ -22,45 +22,23 @@ jobs:
 
           path = Path('src/toolchain.rs')
           text = path.read_text()
-          old = '''            for (spec, result) in first_pass {
-                match result {
-                    Some(tool) => discovered.push(tool),
-                    None => retry.push(spec),
-                }
-            }
 
-            // Cold package-manager shims can contend when the parallel pass starts several
-            // Node-family commands at once. Retry only failed probes sequentially so one cold
-            // launcher does not disappear from the snapshot while the common path stays fast.
-            for spec in retry {
-                if let Some(tool) = discover_one(spec) {
-                    discovered.push(tool);
-                }
-            }
-          '''
-          new = '''            for (spec, result) in first_pass {
-                match result {
-                    Some(tool) => discovered.push(tool),
-                    None if should_retry_sequentially(spec) => retry.push(spec),
-                    None => {}
-                }
-            }
+          text = text.replace(
+              '            None => retry.push(spec),\n',
+              '            None if should_retry_sequentially(spec) => retry.push(spec),\n            None => {}\n',
+              1,
+          )
+          text = text.replace(
+              '// Cold package-manager shims can contend when the parallel pass starts several\n'
+              '// Node-family commands at once. Retry only failed probes sequentially so one cold\n'
+              '// launcher does not disappear from the snapshot while the common path stays fast.\n',
+              '// Windows package-manager shims can contend when several runtimes start at once.\n'
+              '// Give only those launchers one clean sequential retry; unrelated broken SDKs must\n'
+              '// never turn discovery into a chain of timeout delays.\n',
+              1,
+          )
 
-            // Windows package-manager shims can contend when several runtimes start at once.
-            // Give only those launchers one clean sequential retry; unrelated broken SDKs must
-            // never turn discovery into a chain of timeout delays.
-            for spec in retry {
-                if let Some(tool) = discover_one(spec) {
-                    discovered.push(tool);
-                }
-            }
-          '''
-          if old not in text:
-              raise SystemExit('retry block did not match expected source')
-          text = text.replace(old, new, 1)
-
-          marker = '''fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
-          '''
+          marker = 'fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {'
           helper = '''#[cfg(windows)]
           fn should_retry_sequentially(spec: ToolSpec) -> bool {
               resolve_executable(spec.command)
@@ -76,11 +54,16 @@ jobs:
               false
           }
 
-          fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
-          '''
-          if marker not in text:
-              raise SystemExit('discover_one marker not found')
-          text = text.replace(marker, helper, 1)
+          fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {'''
+
+          if 'fn should_retry_sequentially' not in text:
+              if marker not in text:
+                  raise SystemExit('discover_one marker not found')
+              text = text.replace(marker, helper, 1)
+
+          if 'None if should_retry_sequentially(spec)' not in text:
+              raise SystemExit('retry condition was not inserted')
+
           path.write_text(text)
           PY
 
