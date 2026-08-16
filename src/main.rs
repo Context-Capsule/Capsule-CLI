@@ -1,6 +1,7 @@
 mod desktop;
 mod discovery;
 mod git;
+mod system;
 mod toolchain;
 
 use crate::{
@@ -184,6 +185,12 @@ fn print_full_snapshot(snapshot: &DiscoverySnapshot, verbose: bool) {
 fn print_working_context(snapshot: &DiscoverySnapshot, verbose: bool) {
     println!("Working context");
     println!(
+        "  System:            {} {} ({})",
+        snapshot.system.platform,
+        snapshot.system.version.as_deref().unwrap_or("version unknown"),
+        snapshot.system.architecture
+    );
+    println!(
         "  Current directory: {}",
         snapshot.current_directory.display()
     );
@@ -226,19 +233,38 @@ fn print_working_context(snapshot: &DiscoverySnapshot, verbose: bool) {
 fn print_tools(snapshot: &DiscoverySnapshot, verbose: bool) {
     if snapshot.tools.is_empty() {
         println!("Developer tools: none detected");
-        return;
-    }
-
-    println!("Developer tools: {}", snapshot.tools.len());
-    for tool in &snapshot.tools {
-        println!("  {:<16} {}", tool.name, tool.version);
-        if verbose {
-            println!("    command: {}", tool.command);
-            if let Some(path) = tool.executable_path.as_ref() {
-                println!("    path:    {path}");
+    } else {
+        println!("Developer tools: {}", snapshot.tools.len());
+        for tool in &snapshot.tools {
+            println!("  {:<16} {}", tool.name, tool.version);
+            if verbose {
+                println!("    command: {}", tool.command);
+                if let Some(path) = tool.executable_path.as_ref() {
+                    println!("    path:    {path}");
+                }
             }
         }
     }
+
+    if !snapshot.version_hints.is_empty() {
+        println!("\nProject version pins: {}", snapshot.version_hints.len());
+        for hint in &snapshot.version_hints {
+            println!("  {}: {}", hint.source, compact_hint(&hint.value));
+        }
+    }
+}
+
+fn compact_hint(value: &str) -> String {
+    const MAX_CHARS: usize = 200;
+
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        return compact;
+    }
+
+    let mut truncated = compact.chars().take(MAX_CHARS).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn print_desktop_apps(snapshot: &DiscoverySnapshot, verbose: bool) {
@@ -502,7 +528,7 @@ fn print_inspect_usage() {
     println!("      --windows     Show captured application windows and placement metadata");
     println!("      --processes   Show classification decisions for process/window candidates");
     println!("      --ignored     Show helper, shell and uncertain candidates that are not stored");
-    println!("      --tools       Show detected developer runtimes and package-manager versions");
+    println!("      --tools       Show detected developer runtimes and project version pins");
 }
 
 #[cfg(test)]
@@ -543,5 +569,16 @@ mod tests {
     #[test]
     fn unknown_option_is_rejected() {
         assert!(parse(&["--definitely-not-real"]).is_err());
+    }
+
+    #[test]
+    fn compact_hint_collapses_whitespace_and_limits_output() {
+        assert_eq!(compact_hint("22.14.0\n"), "22.14.0");
+        assert_eq!(compact_hint("a\n b\t c"), "a b c");
+
+        let long = "x".repeat(250);
+        let result = compact_hint(&long);
+        assert_eq!(result.chars().count(), 201);
+        assert!(result.ends_with('…'));
     }
 }
