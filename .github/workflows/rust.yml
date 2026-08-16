@@ -8,7 +8,64 @@ on:
   pull_request:
 
 jobs:
-  check-windows:
+  check:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --all-targets
+
+      - name: Test
+        run: cargo test
+
+      - name: Toolchain discovery smoke test
+        run: cargo run -- inspect --tools
+
+      - name: Installed Node tools must be discovered
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = cargo run --quiet -- inspect --tools | Out-String
+          $tools = @(
+            @{ Command = 'node'; Label = 'Node.js' },
+            @{ Command = 'npm'; Label = 'npm' },
+            @{ Command = 'npx'; Label = 'npx' },
+            @{ Command = 'pnpm'; Label = 'pnpm' }
+          )
+
+          foreach ($tool in $tools) {
+            $installed = Get-Command $tool.Command -ErrorAction SilentlyContinue
+            if (-not $installed) {
+              Write-Host "$($tool.Command) is not installed on this runner; skipping assertion."
+              continue
+            }
+
+            Write-Host "$($tool.Command) is installed at $($installed.Source)"
+            & $tool.Command --version
+
+            $pattern = "(?m)^\s+$([regex]::Escape($tool.Label))\s+"
+            if ($output -notmatch $pattern) {
+              Write-Host "Context Capsule tool output:"
+              Write-Host $output
+              throw "$($tool.Command) is installed but was not reported by capsule inspect --tools"
+            }
+          }
+
+  windows-discovery:
     runs-on: windows-latest
 
     steps:
@@ -18,14 +75,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check
-        run: cargo check --all-targets
+      - name: Full discovery
+        run: cargo run -- inspect --verbose
 
-      - name: Test
-        run: cargo test
+      - name: Application discovery
+        run: cargo run -- inspect --apps
 
-      - name: Run inspect
-        run: cargo run -- inspect
+      - name: Window discovery
+        run: cargo run -- inspect --windows
 
-      - name: Run apps
+      - name: Classification diagnostics
+        run: cargo run -- inspect --processes
+
+      - name: Ignored-candidate diagnostics
+        run: cargo run -- inspect --ignored
+
+      - name: Compatibility apps command
         run: cargo run -- apps
