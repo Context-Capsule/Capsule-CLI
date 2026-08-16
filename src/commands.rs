@@ -43,8 +43,14 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     println!("Saved capsule '{name}'.");
     println!("  applications: {applications}");
     println!("  developer tools: {}", discovery.tools.len());
-    println!("  terminal sessions: {}", discovery.terminals.session_count());
-    println!("  WSL terminal sessions: {}", discovery.terminals.wsl_session_count());
+    println!(
+        "  terminal sessions: {}",
+        discovery.terminals.session_count()
+    );
+    println!(
+        "  WSL terminal sessions: {}",
+        discovery.terminals.wsl_session_count()
+    );
     println!(
         "  running containers: {}",
         discovery.docker.running_container_count()
@@ -232,7 +238,10 @@ pub fn print_terminal_snapshot(snapshot: &TerminalSnapshot, verbose: bool) {
         TerminalStatus::NotRequested => println!("Terminals: not inspected"),
         TerminalStatus::Unsupported => println!(
             "Terminals: unsupported ({})",
-            snapshot.message.as_deref().unwrap_or("unsupported platform")
+            snapshot
+                .message
+                .as_deref()
+                .unwrap_or("unsupported platform")
         ),
         TerminalStatus::Available | TerminalStatus::Degraded => {
             let qualifier = if snapshot.status == TerminalStatus::Degraded {
@@ -490,7 +499,11 @@ mod tests {
     fn restart_plan_rendering_quotes_arguments_for_display() {
         let plan = RestartPlan {
             executable: "wt.exe".to_owned(),
-            args: vec!["new-tab".to_owned(), "-d".to_owned(), "C:\\Work Space".to_owned()],
+            args: vec![
+                "new-tab".to_owned(),
+                "-d".to_owned(),
+                "C:\\Work Space".to_owned(),
+            ],
             working_directory: None,
             note: None,
         };

@@ -395,11 +395,14 @@ fn host_rank(host: &TerminalHost) -> u8 {
 fn parse_windows_terminal_state(
     text: &str,
     source_path: &str,
-) -> Result<(
-    Vec<WindowsTerminalLayout>,
-    Vec<TerminalSession>,
-    Vec<String>,
-), String> {
+) -> Result<
+    (
+        Vec<WindowsTerminalLayout>,
+        Vec<TerminalSession>,
+        Vec<String>,
+    ),
+    String,
+> {
     let root: Value = serde_json::from_str(text)
         .map_err(|error| format!("invalid Windows Terminal state JSON: {error}"))?;
     let Some(windows) = root.get("persistedWindowLayouts").and_then(Value::as_array) else {
@@ -510,7 +513,11 @@ fn session_from_layout_action(action: &TerminalLayoutAction) -> TerminalSession 
         working_directory_source,
         startup_command: action.commandline.clone(),
         foreground_command: None,
-        restart: restart_from_layout(action.profile.as_deref(), action.starting_directory.as_deref(), &environment),
+        restart: restart_from_layout(
+            action.profile.as_deref(),
+            action.starting_directory.as_deref(),
+            &environment,
+        ),
     }
 }
 
@@ -684,7 +691,9 @@ fn sanitize_commandline(input: &str) -> Option<String> {
         "private_key",
         "secret_key",
     ];
-    if sensitive_markers.iter().any(|marker| lower.contains(marker))
+    if sensitive_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
         || contains_credential_url(&lower)
     {
         return None;
@@ -698,10 +707,7 @@ fn contains_credential_url(commandline: &str) -> bool {
         return false;
     };
     let authority = &commandline[scheme_index + 3..];
-    let authority = authority
-        .split(['/', ' ', '\t'])
-        .next()
-        .unwrap_or_default();
+    let authority = authority.split(['/', ' ', '\t']).next().unwrap_or_default();
     let Some(at_index) = authority.find('@') else {
         return false;
     };
@@ -844,7 +850,10 @@ fn is_interactive_windows_shell(process: &RawWindowsProcess) -> bool {
     if commandline.contains("-noninteractive") {
         return false;
     }
-    if name == "cmd.exe" && contains_switch(&commandline, "/c") && !contains_switch(&commandline, "/k") {
+    if name == "cmd.exe"
+        && contains_switch(&commandline, "/c")
+        && !contains_switch(&commandline, "/k")
+    {
         return false;
     }
     if matches!(name.as_str(), "pwsh.exe" | "powershell.exe")
@@ -877,7 +886,12 @@ fn foreground_child_command(shell_pid: u32, processes: &[RawWindowsProcess]) -> 
     children.sort_by_key(|process| process.process_id);
     children
         .into_iter()
-        .filter_map(|process| process.command_line.as_deref().and_then(sanitize_commandline))
+        .filter_map(|process| {
+            process
+                .command_line
+                .as_deref()
+                .and_then(sanitize_commandline)
+        })
         .next()
 }
 
@@ -1085,11 +1099,7 @@ fn parse_wsl_sessions(text: &str) -> Vec<RawWslSession> {
     sessions
 }
 
-fn is_descendant_of(
-    mut pid: u32,
-    ancestor: u32,
-    parents: &HashMap<u32, u32>,
-) -> bool {
+fn is_descendant_of(mut pid: u32, ancestor: u32, parents: &HashMap<u32, u32>) -> bool {
     let mut seen = HashSet::new();
     for _ in 0..24 {
         if !seen.insert(pid) {
@@ -1112,7 +1122,8 @@ fn is_descendant_of(
 fn wsl_session(distro: &str, raw: RawWslSession) -> TerminalSession {
     let shell = infer_shell_from_executable(&raw.shell);
     let startup_command = sanitize_commandline(&raw.commandline);
-    let working_directory = (!raw.working_directory.is_empty()).then(|| raw.working_directory.clone());
+    let working_directory =
+        (!raw.working_directory.is_empty()).then(|| raw.working_directory.clone());
 
     TerminalSession {
         sources: vec![TerminalSource::WslProc],
@@ -1150,7 +1161,11 @@ fn query_windows_processes() -> Result<Vec<RawWindowsProcess>, String> {
         "-Command",
         script,
     ]);
-    let output = run_bounded(command, "Windows process inventory", WINDOWS_PROCESS_TIMEOUT)?;
+    let output = run_bounded(
+        command,
+        "Windows process inventory",
+        WINDOWS_PROCESS_TIMEOUT,
+    )?;
     if !output.status.success() {
         return Err(format!(
             "Windows process inventory failed: {}",
@@ -1437,12 +1452,12 @@ mod tests {
             Some(r"C:\work\capsule")
         );
         assert_eq!(sessions[1].shell, ShellKind::Wsl);
+        assert_eq!(wsl_distro(&sessions[1].environment), Some("Ubuntu"));
         assert_eq!(
-            wsl_distro(&sessions[1].environment),
-            Some("Ubuntu")
-        );
-        assert_eq!(
-            sessions[0].restart.as_ref().map(|plan| plan.executable.as_str()),
+            sessions[0]
+                .restart
+                .as_ref()
+                .map(|plan| plan.executable.as_str()),
             Some("wt.exe")
         );
     }
@@ -1481,7 +1496,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].host, TerminalHost::WindowsTerminal);
         assert_eq!(sessions[0].shell, ShellKind::PowerShell);
-        assert_eq!(sessions[0].foreground_command.as_deref(), Some("node.exe server.js"));
+        assert_eq!(
+            sessions[0].foreground_command.as_deref(),
+            Some("node.exe server.js")
+        );
     }
 
     #[test]
@@ -1509,7 +1527,12 @@ mod tests {
             plan.args,
             vec!["-d", "Ubuntu", "--cd", "/home/dhia/project"]
         );
-        assert!(plan.note.as_deref().unwrap_or_default().contains("default shell"));
+        assert!(
+            plan.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("default shell")
+        );
     }
 
     #[test]

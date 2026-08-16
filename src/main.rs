@@ -112,9 +112,11 @@ where
             }
             "--tools" => set_section(&mut options, &mut selected_section, InspectSection::Tools)?,
             "--docker" => set_section(&mut options, &mut selected_section, InspectSection::Docker)?,
-            "--terminals" => {
-                set_section(&mut options, &mut selected_section, InspectSection::Terminals)?
-            }
+            "--terminals" => set_section(
+                &mut options,
+                &mut selected_section,
+                InspectSection::Terminals,
+            )?,
             other => return Err(format!("unknown inspect option '{other}'")),
         }
     }
