@@ -15,6 +15,17 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install pinned web-ext test runner
+        shell: pwsh
+        run: |
+          npm install --no-save --no-package-lock web-ext@10.6.0
+          $webExt = Join-Path $PWD 'node_modules\.bin\web-ext.cmd'
+          if (-not (Test-Path $webExt)) {
+            throw 'web-ext.cmd was not installed'
+          }
+          & $webExt --version
+          "WEB_EXT_BIN=$webExt" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Configure test paths
         shell: pwsh
         run: |
@@ -70,10 +81,10 @@ jobs:
           $stderr = Join-Path $env:RUNNER_TEMP 'zen-native-probe.stderr.log'
           Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
 
-          $command = "npx --yes web-ext@10.6.0 run --source-dir `"$PWD\tests\native_probe`" --firefox `"$env:ZEN_EXE`" --no-input"
+          $arguments = "run --source-dir `"$PWD\tests\native_probe`" --firefox `"$env:ZEN_EXE`" --no-input"
           $process = Start-Process `
-            -FilePath $env:ComSpec `
-            -ArgumentList '/d','/s','/c',$command `
+            -FilePath $env:WEB_EXT_BIN `
+            -ArgumentList $arguments `
             -WorkingDirectory $PWD `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr `
@@ -110,6 +121,9 @@ jobs:
           if (Test-Path $stderr) { Get-Content $stderr -Raw | Write-Host }
 
           if (-not $passed) {
+            if ($process.HasExited) {
+              throw "web-ext/Zen exited before native state arrived. Exit code: $($process.ExitCode)"
+            }
             throw 'Zen never delivered the WebExtension native message to the Context Capsule Rust host'
           }
 
