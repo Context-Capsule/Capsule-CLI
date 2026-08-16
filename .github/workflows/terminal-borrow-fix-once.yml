@@ -1,0 +1,64 @@
+name: Terminal Borrow Fix Once
+
+on:
+  push:
+    branches: [agent/terminal-adapter]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: "!contains(github.event.head_commit.message, '[terminal-borrow-fix]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/terminal-adapter
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply borrow-safe WSL leaf-shell filtering
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/adapters/terminal.rs')
+          text = path.read_text()
+          old = '''    let shells_by_pid = sessions
+              .iter()
+              .map(|session| (session.pid, session.parent_pid))
+              .collect::<HashMap<_, _>>();
+          sessions.retain(|candidate| {
+              !sessions.iter().any(|other| {
+                  other.pid != candidate.pid
+                      && other.tty == candidate.tty
+                      && is_descendant_of(other.pid, candidate.pid, &shells_by_pid)
+              })
+          });
+          '''
+          new = '''    let shells_by_pid = sessions
+              .iter()
+              .map(|session| (session.pid, session.parent_pid))
+              .collect::<HashMap<_, _>>();
+          let all_sessions = sessions.clone();
+          sessions.retain(|candidate| {
+              !all_sessions.iter().any(|other| {
+                  other.pid != candidate.pid
+                      && other.tty == candidate.tty
+                      && is_descendant_of(other.pid, candidate.pid, &shells_by_pid)
+              })
+          });
+          '''
+          if old not in text:
+              raise SystemExit('expected WSL parser block was not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+          git config user.name 'GPT Slave'
+          git config user.email 'unknown.entiti911@gmail.com'
+          git add src/adapters/terminal.rs
+          git commit -m 'fix WSL shell filtering borrow [terminal-borrow-fix]'
+          git push origin HEAD:agent/terminal-adapter
