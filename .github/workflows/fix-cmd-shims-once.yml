@@ -1,0 +1,73 @@
+name: Fix cmd shims once
+
+on:
+  push:
+    branches:
+      - agent/windows-discovery-snapshot
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch Windows batch execution
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          path = Path("src/toolchain.rs")
+          text = path.read_text()
+
+          marker = "};\n\n#[derive(Debug, Clone, PartialEq, Eq)]"
+          replacement = "};\n\n#[cfg(windows)]\nuse std::os::windows::process::CommandExt;\n\n#[derive(Debug, Clone, PartialEq, Eq)]"
+          if marker not in text and "use std::os::windows::process::CommandExt;" not in text:
+              raise SystemExit("could not insert Windows CommandExt import")
+          text = text.replace(marker, replacement, 1)
+
+          old_status = "    let output = run_version_command(spec.command, spec.args, &executable_path)?;\n    let version = first_non_empty_line(&output.stdout)"
+          new_status = "    let output = run_version_command(spec.command, spec.args, &executable_path)?;\n    if !output.status.success() {\n        return None;\n    }\n    let version = first_non_empty_line(&output.stdout)"
+          if old_status not in text:
+              raise SystemExit("could not find tool output status insertion point")
+          text = text.replace(old_status, new_status, 1)
+
+          pattern = re.compile(
+              r'#\[cfg\(windows\)\]\nfn run_windows_command_shim\(.*?\n\}\n\n#\[cfg\(not\(windows\)\)\]',
+              re.S,
+          )
+          new_function = '''#[cfg(windows)]
+fn run_windows_command_shim(executable_path: &str, args: &[&str]) -> Option<Output> {
+    // Batch shims cannot be launched directly through CreateProcess. Build the exact
+    // command line expected by cmd.exe and bypass Rust's second layer of quoting.
+    let command_line = std::iter::once(executable_path)
+        .chain(args.iter().copied())
+        .map(quote_cmd_argument)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut shell = Command::new("cmd.exe");
+    shell.raw_arg(format!(r#"/D /S /C "{command_line}""#));
+    run_with_timeout(&mut shell, TOOL_VERSION_TIMEOUT)
+}
+
+#[cfg(not(windows))]'''
+          text, count = pattern.subn(new_function, text, count=1)
+          if count != 1:
+              raise SystemExit("could not replace Windows batch-shim launcher")
+
+          path.write_text(text)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name "Context Capsule CI"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/toolchain.rs
+          git commit -m "fix Windows command shims"
+          git push origin HEAD:${GITHUB_REF_NAME}
