@@ -1,7 +1,9 @@
 mod classify;
 mod model;
 
-pub use model::{ApplicationInfo, DesktopSnapshot, IgnoredCandidate, WindowInfo};
+pub use model::{
+    ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate, Rect, WindowInfo,
+};
 
 #[cfg(windows)]
 mod windows;
@@ -41,7 +43,7 @@ fn annotate_direct_application_owners(snapshot: &mut DesktopSnapshot) {
 
 #[cfg(test)]
 mod tests {
-    use super::model::{ApplicationClassification, Rect, WindowState};
+    use super::model::{ApplicationClassification, WindowState};
     use super::*;
 
     fn application(pid: u32, name: &str, windows: Vec<WindowInfo>) -> ApplicationInfo {

@@ -1,6 +1,7 @@
+use serde::Serialize;
 use std::process::Command;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitContext {
     pub repository_root: String,
     pub remote_origin: Option<String>,

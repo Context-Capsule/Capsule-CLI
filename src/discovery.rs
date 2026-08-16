@@ -1,4 +1,5 @@
 use crate::{
+    adapters::docker::{self, DockerSnapshot},
     desktop::{self, DesktopSnapshot},
     git::{self, GitContext, GitDiscoveryError},
     system::{self, SystemInfo},
@@ -21,9 +22,14 @@ pub struct DiscoverySnapshot {
     pub tools: Vec<ToolVersion>,
     pub version_hints: Vec<VersionHint>,
     pub desktop: Result<DesktopSnapshot, String>,
+    pub docker: DockerSnapshot,
 }
 
-pub fn discover(include_tools: bool, include_desktop: bool) -> Result<DiscoverySnapshot, String> {
+pub fn discover(
+    include_tools: bool,
+    include_desktop: bool,
+    include_docker: bool,
+) -> Result<DiscoverySnapshot, String> {
     let current_directory = env::current_dir()
         .map_err(|error| format!("failed to determine current directory: {error}"))?;
     let system = system::discover();
@@ -54,6 +60,12 @@ pub fn discover(include_tools: bool, include_desktop: bool) -> Result<DiscoveryS
         Err("desktop discovery was not requested".to_owned())
     };
 
+    let docker = if include_docker {
+        docker::discover()
+    } else {
+        DockerSnapshot::not_requested()
+    };
+
     Ok(DiscoverySnapshot {
         current_directory,
         system,
@@ -61,5 +73,6 @@ pub fn discover(include_tools: bool, include_desktop: bool) -> Result<DiscoveryS
         tools,
         version_hints,
         desktop,
+        docker,
     })
 }
