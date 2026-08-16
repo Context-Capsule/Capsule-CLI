@@ -1,14 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
-    process::Command,
+    fs::{self, File},
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus, Output, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
+const DOCKER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const DOCKER_RESTORE_TIMEOUT: Duration = Duration::from_secs(90);
+const DOCKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+static CAPTURE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -288,10 +296,7 @@ fn docker_server_available() -> Result<String, String> {
 }
 
 fn docker_output(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("docker")
-        .args(args)
-        .output()
-        .map_err(|error| format!("failed to run 'docker {}': {error}", args.join(" ")))?;
+    let output = run_docker_command(args, DOCKER_DISCOVERY_TIMEOUT, None)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -452,20 +457,18 @@ fn restore_compose_project(project: &ComposeProject) -> Result<Option<String>, S
     if usable_config || usable_working_directory {
         let args = build_compose_args(project, usable_config);
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut command = Command::new("docker");
-        command.args(&arg_refs);
-        if usable_working_directory {
-            if let Some(directory) = project.working_directory.as_ref() {
-                command.current_dir(directory);
-            }
-        }
-
-        let output = command.output().map_err(|error| {
-            format!(
-                "Compose project '{}': failed to start Docker Compose: {error}",
-                project.name
-            )
-        })?;
+        let working_directory = if usable_working_directory {
+            project.working_directory.as_deref().map(Path::new)
+        } else {
+            None
+        };
+        let output = run_docker_command(&arg_refs, DOCKER_RESTORE_TIMEOUT, working_directory)
+            .map_err(|error| {
+                format!(
+                    "Compose project '{}': failed to start Docker Compose: {error}",
+                    project.name
+                )
+            })?;
 
         if output.status.success() {
             return Ok(None);
@@ -537,10 +540,16 @@ fn restore_project_containers_individually(project: &ComposeProject) -> Result<(
 }
 
 fn restore_existing_container(container: &ContainerResource) -> Result<(), String> {
-    let inspect = Command::new("docker")
-        .args(["inspect", "--type", "container", &container.name])
-        .output()
-        .map_err(|error| {
+    let inspect_args = [
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        "{{.State.Running}}",
+        container.name.as_str(),
+    ];
+    let inspect =
+        run_docker_command(&inspect_args, DOCKER_DISCOVERY_TIMEOUT, None).map_err(|error| {
             format!(
                 "Container '{}': failed to query Docker: {error}",
                 container.name
@@ -554,9 +563,12 @@ fn restore_existing_container(container: &ContainerResource) -> Result<(), Strin
         ));
     }
 
-    let output = Command::new("docker")
-        .args(["start", &container.name])
-        .output()
+    if String::from_utf8_lossy(&inspect.stdout).trim() == "true" {
+        return Ok(());
+    }
+
+    let start_args = ["start", container.name.as_str()];
+    let output = run_docker_command(&start_args, DOCKER_RESTORE_TIMEOUT, None)
         .map_err(|error| format!("Container '{}': failed to start: {error}", container.name))?;
 
     if output.status.success() {
@@ -572,6 +584,129 @@ fn restore_existing_container(container: &ContainerResource) -> Result<(), Strin
                 format!(": {detail}")
             }
         ))
+    }
+}
+
+fn run_docker_command(
+    args: &[&str],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+) -> Result<Output, String> {
+    let description = format!("docker {}", args.join(" "));
+    let capture = CaptureFiles::create()
+        .ok_or_else(|| format!("failed to create output capture files for '{description}'"))?;
+    let mut command = Command::new("docker");
+    command.args(args);
+    if let Some(directory) = working_directory {
+        command.current_dir(directory);
+    }
+    command
+        .stdout(Stdio::from(
+            capture
+                .stdout_writer
+                .as_ref()
+                .and_then(|file| file.try_clone().ok())
+                .ok_or_else(|| format!("failed to capture stdout for '{description}'"))?,
+        ))
+        .stderr(Stdio::from(
+            capture
+                .stderr_writer
+                .as_ref()
+                .and_then(|file| file.try_clone().ok())
+                .ok_or_else(|| format!("failed to capture stderr for '{description}'"))?,
+        ));
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to run '{description}': {error}"))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => thread::sleep(DOCKER_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "'{description}' timed out after {} second(s)",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed while waiting for '{description}': {error}"));
+            }
+        }
+    };
+
+    capture
+        .finish(status)
+        .ok_or_else(|| format!("failed to read output from '{description}'"))
+}
+
+struct CaptureFiles {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stdout_writer: Option<File>,
+    stderr_writer: Option<File>,
+}
+
+impl CaptureFiles {
+    fn create() -> Option<Self> {
+        let id = CAPTURE_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let prefix = format!(
+            "context-capsule-docker-{}-{timestamp}-{id}",
+            std::process::id()
+        );
+        let directory = std::env::temp_dir();
+        let stdout_path = directory.join(format!("{prefix}.stdout"));
+        let stderr_path = directory.join(format!("{prefix}.stderr"));
+        let stdout_writer = File::create(&stdout_path).ok()?;
+        let stderr_writer = match File::create(&stderr_path) {
+            Ok(file) => file,
+            Err(_) => {
+                let _ = fs::remove_file(&stdout_path);
+                return None;
+            }
+        };
+
+        Some(Self {
+            stdout_path,
+            stderr_path,
+            stdout_writer: Some(stdout_writer),
+            stderr_writer: Some(stderr_writer),
+        })
+    }
+
+    fn close_writers(&mut self) {
+        drop(self.stdout_writer.take());
+        drop(self.stderr_writer.take());
+    }
+
+    fn finish(mut self, status: ExitStatus) -> Option<Output> {
+        self.close_writers();
+        let stdout = fs::read(&self.stdout_path).unwrap_or_default();
+        let stderr = fs::read(&self.stderr_path).unwrap_or_default();
+        let _ = fs::remove_file(&self.stdout_path);
+        let _ = fs::remove_file(&self.stderr_path);
+        Some(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for CaptureFiles {
+    fn drop(&mut self) {
+        self.close_writers();
+        let _ = fs::remove_file(&self.stdout_path);
+        let _ = fs::remove_file(&self.stderr_path);
     }
 }
 
