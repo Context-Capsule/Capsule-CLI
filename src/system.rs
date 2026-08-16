@@ -1,7 +1,8 @@
+use serde::Serialize;
 #[cfg(not(windows))]
 use std::process::Command;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SystemInfo {
     pub platform: String,
     pub version: Option<String>,
