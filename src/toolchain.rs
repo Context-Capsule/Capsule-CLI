@@ -256,18 +256,36 @@ const VERSION_HINT_FILES: &[&str] = &[
 ];
 
 pub fn discover_tools() -> Vec<ToolVersion> {
-    let mut discovered = thread::scope(|scope| {
+    let first_pass = thread::scope(|scope| {
         let handles = TOOLS
             .iter()
             .copied()
-            .map(|spec| scope.spawn(move || discover_one(spec)))
+            .map(|spec| (spec, scope.spawn(move || discover_one(spec))))
             .collect::<Vec<_>>();
 
         handles
             .into_iter()
-            .filter_map(|handle| handle.join().ok().flatten())
+            .map(|(spec, handle)| (spec, handle.join().ok().flatten()))
             .collect::<Vec<_>>()
     });
+
+    let mut discovered = Vec::new();
+    let mut retry = Vec::new();
+    for (spec, result) in first_pass {
+        match result {
+            Some(tool) => discovered.push(tool),
+            None => retry.push(spec),
+        }
+    }
+
+    // Cold package-manager shims can contend when the parallel pass starts several
+    // Node-family commands at once. Retry only failed probes sequentially so one cold
+    // launcher does not disappear from the snapshot while the common path stays fast.
+    for spec in retry {
+        if let Some(tool) = discover_one(spec) {
+            discovered.push(tool);
+        }
+    }
 
     discovered.sort_by(|left, right| {
         left.name
