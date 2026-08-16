@@ -8,7 +8,9 @@ mod windows;
 
 #[cfg(windows)]
 pub fn discover() -> Result<DesktopSnapshot, String> {
-    windows::discover()
+    let mut snapshot = windows::discover()?;
+    annotate_direct_application_owners(&mut snapshot);
+    Ok(snapshot)
 }
 
 #[cfg(not(windows))]
@@ -16,10 +18,49 @@ pub fn discover() -> Result<DesktopSnapshot, String> {
     Err("desktop discovery is currently supported on Windows only".to_owned())
 }
 
+fn annotate_direct_application_owners(snapshot: &mut DesktopSnapshot) {
+    let applications = &snapshot.applications;
+
+    for candidate in &mut snapshot.ignored {
+        let Some(parent_pid) = candidate.parent_pid else {
+            continue;
+        };
+        let Some(owner) = applications
+            .iter()
+            .find(|application| application.pids.contains(&parent_pid))
+        else {
+            continue;
+        };
+
+        candidate.reason = format!(
+            "{}; child of captured application {}",
+            candidate.reason, owner.name
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::model::{ApplicationClassification, Rect, WindowState};
     use super::*;
+
+    fn application(pid: u32, name: &str, windows: Vec<WindowInfo>) -> ApplicationInfo {
+        ApplicationInfo {
+            primary_pid: pid,
+            pids: vec![pid],
+            parent_pid: None,
+            name: name.to_owned(),
+            executable_path: None,
+            app_user_model_id: None,
+            file_version: None,
+            classification: ApplicationClassification::UserApplication,
+            confidence: 100,
+            classification_reason: "test".to_owned(),
+            launch: None,
+            windows,
+            discovered_as_background: false,
+        }
+    }
 
     #[test]
     fn virtual_desktops_are_grouped_from_application_windows() {
@@ -46,21 +87,7 @@ mod tests {
 
         let snapshot = DesktopSnapshot {
             displays: vec![],
-            applications: vec![ApplicationInfo {
-                primary_pid: 1,
-                pids: vec![1],
-                parent_pid: None,
-                name: "Editor".to_owned(),
-                executable_path: None,
-                app_user_model_id: None,
-                file_version: None,
-                classification: ApplicationClassification::UserApplication,
-                confidence: 100,
-                classification_reason: "test".to_owned(),
-                launch: None,
-                windows: vec![window],
-                discovered_as_background: false,
-            }],
+            applications: vec![application(1, "Editor", vec![window])],
             ignored: vec![],
         };
 
@@ -68,5 +95,27 @@ mod tests {
             snapshot.virtual_desktops(),
             vec![("desktop-a".to_owned(), Some(true), 1)]
         );
+    }
+
+    #[test]
+    fn helper_is_annotated_when_parent_is_a_captured_application() {
+        let mut snapshot = DesktopSnapshot {
+            displays: vec![],
+            applications: vec![application(42, "Docker Desktop", vec![])],
+            ignored: vec![IgnoredCandidate {
+                pid: 99,
+                parent_pid: Some(42),
+                executable: "OmApSvcBroker.exe".to_owned(),
+                executable_path: None,
+                window_title: Some("OmApSvcBroker".to_owned()),
+                classification: ApplicationClassification::ApplicationHelper,
+                confidence: 90,
+                reason: "broker/helper/service-style process".to_owned(),
+            }],
+        };
+
+        annotate_direct_application_owners(&mut snapshot);
+
+        assert!(snapshot.ignored[0].reason.contains("Docker Desktop"));
     }
 }
