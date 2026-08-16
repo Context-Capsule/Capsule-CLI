@@ -8,15 +8,14 @@ use std::{
 };
 
 fn main() -> ExitCode {
-    match env::args().nth(1).as_deref() {
-        None => match browser::run_native_host() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Context Capsule Firefox native host failed: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Some("--install") => match browser::install_native_host() {
+    let arguments: Vec<String> = env::args().skip(1).collect();
+
+    if arguments.is_empty() || is_native_messaging_invocation(&arguments) {
+        return run_protocol();
+    }
+
+    match arguments.as_slice() {
+        [option] if option == "--install" => match browser::install_native_host() {
             Ok(path) => match doctor() {
                 Ok(report) => {
                     println!("Installed and verified Firefox/Zen native messaging host.");
@@ -31,7 +30,7 @@ fn main() -> ExitCode {
             },
             Err(error) => fail(error.to_string()),
         },
-        Some("--doctor") => match doctor() {
+        [option] if option == "--doctor" => match doctor() {
             Ok(report) => {
                 println!("Firefox/Zen native messaging host: healthy");
                 print_doctor_report(&report);
@@ -39,7 +38,7 @@ fn main() -> ExitCode {
             }
             Err(error) => fail(format!("native host is not healthy: {error}")),
         },
-        Some("--uninstall") => match browser::uninstall_native_host() {
+        [option] if option == "--uninstall" => match browser::uninstall_native_host() {
             Ok(path) => {
                 println!("Removed Firefox/Zen native messaging host registration.");
                 println!("  manifest: {}", path.display());
@@ -47,7 +46,7 @@ fn main() -> ExitCode {
             }
             Err(error) => fail(error.to_string()),
         },
-        Some("--status") => match browser::load_recent_firefox_state() {
+        [option] if option == "--status" => match browser::load_recent_firefox_state() {
             Ok(Some(snapshot)) => {
                 println!("Firefox/Zen adapter: live");
                 println!("  windows: {}", snapshot.windows.len());
@@ -61,16 +60,37 @@ fn main() -> ExitCode {
             }
             Err(error) => fail(error.to_string()),
         },
-        Some("-h" | "--help") => {
+        [option] if option == "-h" || option == "--help" => {
             print_usage();
             ExitCode::SUCCESS
         }
-        Some(other) => {
-            eprintln!("error: unknown option '{other}'\n");
+        _ => {
+            eprintln!("error: invalid native-host arguments: {arguments:?}\n");
             print_usage();
             ExitCode::from(2)
         }
     }
+}
+
+fn run_protocol() -> ExitCode {
+    match browser::run_native_host() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Context Capsule Firefox/Zen native host failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn is_native_messaging_invocation(arguments: &[String]) -> bool {
+    if arguments.len() != 2 || arguments[1] != browser::FIREFOX_EXTENSION_ID {
+        return false;
+    }
+
+    Path::new(&arguments[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(&format!("{}.json", browser::NATIVE_HOST_NAME)))
 }
 
 #[derive(Debug)]
@@ -102,9 +122,7 @@ fn doctor() -> Result<DoctorReport, String> {
         .get("allowed_extensions")
         .and_then(Value::as_array)
         .ok_or_else(|| "manifest has no allowed_extensions array".to_owned())?;
-    if allowed.len() != 1
-        || allowed[0].as_str() != Some(browser::FIREFOX_EXTENSION_ID)
-    {
+    if allowed.len() != 1 || allowed[0].as_str() != Some(browser::FIREFOX_EXTENSION_ID) {
         return Err(format!(
             "manifest must authorize only '{}'",
             browser::FIREFOX_EXTENSION_ID
@@ -137,7 +155,7 @@ fn doctor() -> Result<DoctorReport, String> {
         registered
     };
 
-    probe_native_host(&executable_path)?;
+    probe_native_host(&executable_path, &manifest_path)?;
 
     Ok(DoctorReport {
         manifest_path,
@@ -157,8 +175,10 @@ fn require_string(manifest: &Value, field: &str, expected: &str) -> Result<(), S
     }
 }
 
-fn probe_native_host(executable: &Path) -> Result<(), String> {
+fn probe_native_host(executable: &Path, manifest_path: &Path) -> Result<(), String> {
     let mut child = Command::new(executable)
+        .arg(manifest_path)
+        .arg(browser::FIREFOX_EXTENSION_ID)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -267,7 +287,7 @@ fn print_doctor_report(report: &DoctorReport) {
         browser::NATIVE_HOST_NAME,
         report.registry_manifest_path.display()
     );
-    println!("  protocol ping: ok");
+    println!("  browser-style protocol ping: ok");
 }
 
 fn fail(message: String) -> ExitCode {
@@ -285,17 +305,41 @@ fn print_usage() {
     println!("  capsule-firefox-host --uninstall");
     println!();
     println!("--install writes the native manifest, registers it, and validates the result.");
-    println!("--doctor verifies the manifest, executable, Windows registration, and protocol ping.");
+    println!("--doctor verifies the manifest, executable, Windows registration, and the exact browser-style protocol launch.");
     println!();
-    println!(
-        "With no arguments the binary runs the Firefox native-messaging protocol on stdin/stdout."
-    );
+    println!("Firefox/Zen also launches this executable internally with the native manifest path and extension ID; those arguments enter protocol mode automatically.");
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
-    use super::parse_registry_default;
+    use super::is_native_messaging_invocation;
+    use context_capsule::browser;
 
+    #[test]
+    fn recognizes_firefox_browser_invocation_arguments() {
+        let arguments = vec![
+            format!(r"C:\temp\{}.json", browser::NATIVE_HOST_NAME),
+            browser::FIREFOX_EXTENSION_ID.to_owned(),
+        ];
+        assert!(is_native_messaging_invocation(&arguments));
+    }
+
+    #[test]
+    fn rejects_wrong_extension_or_manifest_name() {
+        let wrong_extension = vec![
+            format!(r"C:\temp\{}.json", browser::NATIVE_HOST_NAME),
+            "other@example.test".to_owned(),
+        ];
+        assert!(!is_native_messaging_invocation(&wrong_extension));
+
+        let wrong_manifest = vec![
+            r"C:\temp\other-host.json".to_owned(),
+            browser::FIREFOX_EXTENSION_ID.to_owned(),
+        ];
+        assert!(!is_native_messaging_invocation(&wrong_manifest));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn parses_windows_registry_default_value() {
         let output = r#"
@@ -303,7 +347,7 @@ HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts\com.contextcapsule.host
     (Default)    REG_SZ    C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.host.json
 "#;
         assert_eq!(
-            parse_registry_default(output).as_deref(),
+            super::parse_registry_default(output).as_deref(),
             Some(r"C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.host.json")
         );
     }
