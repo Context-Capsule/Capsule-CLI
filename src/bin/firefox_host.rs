@@ -1,5 +1,5 @@
 use context_capsule::browser;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{Read, Write},
@@ -90,7 +90,9 @@ fn is_native_messaging_invocation(arguments: &[String]) -> bool {
     Path::new(&arguments[0])
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(&format!("{}.json", browser::NATIVE_HOST_NAME)))
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case(&format!("{}.json", browser::NATIVE_HOST_NAME))
+        })
 }
 
 #[derive(Debug)]
@@ -183,7 +185,12 @@ fn probe_native_host(executable: &Path, manifest_path: &Path) -> Result<(), Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("cannot start native host '{}': {error}", executable.display()))?;
+        .map_err(|error| {
+            format!(
+                "cannot start native host '{}': {error}",
+                executable.display()
+            )
+        })?;
 
     let request = serde_json::to_vec(&json!({
         "protocol_version": browser::NATIVE_PROTOCOL_VERSION,
@@ -216,7 +223,9 @@ fn probe_native_host(executable: &Path, manifest_path: &Path) -> Result<(), Stri
         .map_err(|error| format!("native host returned no framed response: {error}"))?;
     let length = u32::from_le_bytes(length_bytes) as usize;
     if length == 0 || length > 1024 * 1024 {
-        return Err(format!("native host returned invalid response length {length}"));
+        return Err(format!(
+            "native host returned invalid response length {length}"
+        ));
     }
     let mut payload = vec![0_u8; length];
     stdout
@@ -305,9 +314,13 @@ fn print_usage() {
     println!("  capsule-firefox-host --uninstall");
     println!();
     println!("--install writes the native manifest, registers it, and validates the result.");
-    println!("--doctor verifies the manifest, executable, Windows registration, and the exact browser-style protocol launch.");
+    println!(
+        "--doctor verifies the manifest, executable, Windows registration, and the exact browser-style protocol launch."
+    );
     println!();
-    println!("Firefox/Zen also launches this executable internally with the native manifest path and extension ID; those arguments enter protocol mode automatically.");
+    println!(
+        "Firefox/Zen also launches this executable internally with the native manifest path and extension ID; those arguments enter protocol mode automatically."
+    );
 }
 
 #[cfg(test)]
@@ -348,7 +361,9 @@ HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts\com.contextcapsule.host
 "#;
         assert_eq!(
             super::parse_registry_default(output).as_deref(),
-            Some(r"C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.host.json")
+            Some(
+                r"C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.host.json"
+            )
         );
     }
 }
