@@ -1,6 +1,8 @@
 mod model;
 
 #[cfg(windows)]
+mod dpi;
+#[cfg(windows)]
 mod windows;
 
 use serde_json::Value;
@@ -75,7 +77,14 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
 
     #[cfg(windows)]
     {
+        let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
         report.desktop = windows::restore_desktop(&desktop, options.dry_run);
+        if dpi_guard.is_none() {
+            report.desktop.warnings.push(
+                "could not switch the restore thread to Per-Monitor-V2 DPI awareness; placement may be less accurate on mixed-DPI displays"
+                    .to_owned(),
+            );
+        }
     }
 
     #[cfg(not(windows))]
