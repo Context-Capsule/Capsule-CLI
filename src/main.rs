@@ -56,6 +56,7 @@ fn main() -> ExitCode {
             }
         }
         Some("save") => commands::save(args.collect()),
+        Some("restore") => commands::restore(args.collect()),
         Some("list") => commands::list(args.collect()),
         Some("show") => commands::show(args.collect()),
         Some("delete") => commands::delete(args.collect()),
@@ -563,6 +564,7 @@ fn print_usage() {
     println!("Usage:");
     println!("  capsule inspect [options]");
     println!("  capsule save <name> [--force]");
+    println!("  capsule restore <name> [--dry-run]");
     println!("  capsule list");
     println!("  capsule show <name> [--json]");
     println!("  capsule delete <name>");
@@ -575,6 +577,7 @@ fn print_usage() {
         "  inspect    Discover current workspace, tools, terminals, applications, windows, displays and Docker"
     );
     println!("  save       Capture the current semantic workspace into SQLite");
+    println!("  restore    Restore missing applications and reconcile saved window placement");
     println!("  list       List saved capsules");
     println!("  show       Show a saved capsule; --json prints the complete stored payload");
     println!("  delete     Delete a saved capsule");
