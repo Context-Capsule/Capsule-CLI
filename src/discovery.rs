@@ -1,7 +1,8 @@
 use crate::{
     desktop::{self, DesktopSnapshot},
     git::{self, GitContext, GitDiscoveryError},
-    toolchain::{self, ToolVersion},
+    system::{self, SystemInfo},
+    toolchain::{self, ToolVersion, VersionHint},
 };
 use std::{env, path::PathBuf};
 
@@ -15,14 +16,17 @@ pub enum GitState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscoverySnapshot {
     pub current_directory: PathBuf,
+    pub system: SystemInfo,
     pub git: GitState,
     pub tools: Vec<ToolVersion>,
+    pub version_hints: Vec<VersionHint>,
     pub desktop: Result<DesktopSnapshot, String>,
 }
 
 pub fn discover(include_tools: bool, include_desktop: bool) -> Result<DiscoverySnapshot, String> {
     let current_directory = env::current_dir()
         .map_err(|error| format!("failed to determine current directory: {error}"))?;
+    let system = system::discover();
 
     let git = match git::discover_current() {
         Ok(context) => GitState::Context(context),
@@ -30,10 +34,18 @@ pub fn discover(include_tools: bool, include_desktop: bool) -> Result<DiscoveryS
         Err(GitDiscoveryError::NotRepository) => GitState::NotRepository,
     };
 
-    let tools = if include_tools {
-        toolchain::discover_tools()
+    let project_root = match &git {
+        GitState::Context(context) => PathBuf::from(&context.repository_root),
+        GitState::NotRepository | GitState::GitUnavailable => current_directory.clone(),
+    };
+
+    let (tools, version_hints) = if include_tools {
+        (
+            toolchain::discover_tools(),
+            toolchain::discover_version_hints(&project_root),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     let desktop = if include_desktop {
@@ -44,8 +56,10 @@ pub fn discover(include_tools: bool, include_desktop: bool) -> Result<DiscoveryS
 
     Ok(DiscoverySnapshot {
         current_directory,
+        system,
         git,
         tools,
+        version_hints,
         desktop,
     })
 }
