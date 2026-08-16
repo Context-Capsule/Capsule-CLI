@@ -1,0 +1,100 @@
+name: Narrow tool retry once
+
+on:
+  push:
+    branches:
+      - agent/windows-discovery-snapshot
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restrict sequential retries to Windows shims
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/toolchain.rs')
+          text = path.read_text()
+          old = '''            for (spec, result) in first_pass {
+                match result {
+                    Some(tool) => discovered.push(tool),
+                    None => retry.push(spec),
+                }
+            }
+
+            // Cold package-manager shims can contend when the parallel pass starts several
+            // Node-family commands at once. Retry only failed probes sequentially so one cold
+            // launcher does not disappear from the snapshot while the common path stays fast.
+            for spec in retry {
+                if let Some(tool) = discover_one(spec) {
+                    discovered.push(tool);
+                }
+            }
+          '''
+          new = '''            for (spec, result) in first_pass {
+                match result {
+                    Some(tool) => discovered.push(tool),
+                    None if should_retry_sequentially(spec) => retry.push(spec),
+                    None => {}
+                }
+            }
+
+            // Windows package-manager shims can contend when several runtimes start at once.
+            // Give only those launchers one clean sequential retry; unrelated broken SDKs must
+            // never turn discovery into a chain of timeout delays.
+            for spec in retry {
+                if let Some(tool) = discover_one(spec) {
+                    discovered.push(tool);
+                }
+            }
+          '''
+          if old not in text:
+              raise SystemExit('retry block did not match expected source')
+          text = text.replace(old, new, 1)
+
+          marker = '''fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
+          '''
+          helper = '''#[cfg(windows)]
+          fn should_retry_sequentially(spec: ToolSpec) -> bool {
+              resolve_executable(spec.command)
+                  .map(|path| {
+                      let path = path.to_ascii_lowercase();
+                      path.ends_with(".cmd") || path.ends_with(".bat")
+                  })
+                  .unwrap_or(false)
+          }
+
+          #[cfg(not(windows))]
+          fn should_retry_sequentially(_spec: ToolSpec) -> bool {
+              false
+          }
+
+          fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
+          '''
+          if marker not in text:
+              raise SystemExit('discover_one marker not found')
+          text = text.replace(marker, helper, 1)
+          path.write_text(text)
+          PY
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+
+      - name: Commit optimization
+        shell: bash
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name "Context Capsule CI"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/toolchain.rs
+          git commit -m "bound developer tool retries"
+          git push origin HEAD:${GITHUB_REF_NAME}
