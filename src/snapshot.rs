@@ -126,7 +126,10 @@ fn rect_value(rect: Rect) -> Value {
 mod tests {
     use super::*;
     use crate::{
-        adapters::{docker::{DockerSnapshot, DockerStatus}, terminal::TerminalSnapshot},
+        adapters::{
+            docker::{DockerSnapshot, DockerStatus},
+            terminal::TerminalSnapshot,
+        },
         discovery::GitState,
         system::SystemInfo,
     };
@@ -136,10 +139,22 @@ mod tests {
     fn snapshot_envelope_is_versioned_and_contains_resource_slots() {
         let discovery = DiscoverySnapshot {
             current_directory: PathBuf::from("/workspace"),
-            system: SystemInfo { platform: "test".to_owned(), version: Some("1".to_owned()), architecture: "x86_64".to_owned() },
-            git: GitState::NotRepository, tools: Vec::new(), version_hints: Vec::new(),
+            system: SystemInfo {
+                platform: "test".to_owned(),
+                version: Some("1".to_owned()),
+                architecture: "x86_64".to_owned(),
+            },
+            git: GitState::NotRepository,
+            tools: Vec::new(),
+            version_hints: Vec::new(),
             desktop: Err("not requested".to_owned()),
-            docker: DockerSnapshot { status: DockerStatus::Available, context: Some("test".to_owned()), message: None, compose_projects: Vec::new(), standalone_containers: Vec::new() },
+            docker: DockerSnapshot {
+                status: DockerStatus::Available,
+                context: Some("test".to_owned()),
+                message: None,
+                compose_projects: Vec::new(),
+                standalone_containers: Vec::new(),
+            },
             terminals: TerminalSnapshot::not_requested(),
         };
         let stored = capture_snapshot(&discovery).expect("capture snapshot");

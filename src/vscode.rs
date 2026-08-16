@@ -108,8 +108,16 @@ impl fmt::Display for VsCodeError {
 }
 
 impl Error for VsCodeError {}
-impl From<io::Error> for VsCodeError { fn from(error: io::Error) -> Self { Self::Io(error) } }
-impl From<serde_json::Error> for VsCodeError { fn from(error: serde_json::Error) -> Self { Self::Json(error) } }
+impl From<io::Error> for VsCodeError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl From<serde_json::Error> for VsCodeError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
 
 pub fn load_recent_vscode_state() -> Result<Option<VsCodeSnapshot>, VsCodeError> {
     let path = runtime_state_path()?;
@@ -128,25 +136,48 @@ pub fn load_recent_vscode_state() -> Result<Option<VsCodeSnapshot>, VsCodeError>
 
 pub fn runtime_state_path() -> Result<PathBuf, VsCodeError> {
     if let Some(path) = env::var_os("CONTEXT_CAPSULE_VSCODE_STATE_PATH") {
-        if path.is_empty() { return Err(VsCodeError::Invalid("CONTEXT_CAPSULE_VSCODE_STATE_PATH is empty".to_owned())); }
+        if path.is_empty() {
+            return Err(VsCodeError::Invalid(
+                "CONTEXT_CAPSULE_VSCODE_STATE_PATH is empty".to_owned(),
+            ));
+        }
         return Ok(PathBuf::from(path));
     }
 
     #[cfg(windows)]
     {
-        let base = env::var_os("LOCALAPPDATA").ok_or_else(|| VsCodeError::Invalid("LOCALAPPDATA is not available".to_owned()))?;
-        return Ok(PathBuf::from(base).join("ContextCapsule").join("runtime").join("vscode.json"));
+        let base = env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| VsCodeError::Invalid("LOCALAPPDATA is not available".to_owned()))?;
+        return Ok(PathBuf::from(base)
+            .join("ContextCapsule")
+            .join("runtime")
+            .join("vscode.json"));
     }
     #[cfg(target_os = "macos")]
     {
-        let home = env::var_os("HOME").ok_or_else(|| VsCodeError::Invalid("HOME is not available".to_owned()))?;
-        return Ok(PathBuf::from(home).join("Library").join("Application Support").join("ContextCapsule").join("runtime").join("vscode.json"));
+        let home = env::var_os("HOME")
+            .ok_or_else(|| VsCodeError::Invalid("HOME is not available".to_owned()))?;
+        return Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("ContextCapsule")
+            .join("runtime")
+            .join("vscode.json"));
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
-        if let Some(base) = env::var_os("XDG_STATE_HOME") { return Ok(PathBuf::from(base).join("context-capsule").join("vscode.json")); }
-        let home = env::var_os("HOME").ok_or_else(|| VsCodeError::Invalid("HOME is not available".to_owned()))?;
-        Ok(PathBuf::from(home).join(".local").join("state").join("context-capsule").join("vscode.json"))
+        if let Some(base) = env::var_os("XDG_STATE_HOME") {
+            return Ok(PathBuf::from(base)
+                .join("context-capsule")
+                .join("vscode.json"));
+        }
+        let home = env::var_os("HOME")
+            .ok_or_else(|| VsCodeError::Invalid("HOME is not available".to_owned()))?;
+        Ok(PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("context-capsule")
+            .join("vscode.json"))
     }
 }
 
@@ -156,16 +187,25 @@ fn read_runtime_state_at(path: &Path) -> Result<RuntimeEnvelope, VsCodeError> {
 
 fn validate_snapshot(snapshot: &VsCodeSnapshot) -> Result<(), VsCodeError> {
     if snapshot.schema_version != VSCODE_SNAPSHOT_SCHEMA_VERSION {
-        return Err(VsCodeError::Invalid(format!("unsupported VS Code snapshot schema {}; expected {}", snapshot.schema_version, VSCODE_SNAPSHOT_SCHEMA_VERSION)));
+        return Err(VsCodeError::Invalid(format!(
+            "unsupported VS Code snapshot schema {}; expected {}",
+            snapshot.schema_version, VSCODE_SNAPSHOT_SCHEMA_VERSION
+        )));
     }
     if snapshot.tab_count() > MAX_TABS {
-        return Err(VsCodeError::Invalid("VS Code snapshot contains too many tabs".to_owned()));
+        return Err(VsCodeError::Invalid(
+            "VS Code snapshot contains too many tabs".to_owned(),
+        ));
     }
     Ok(())
 }
 
 fn now_unix_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().min(i64::MAX as u128) as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]
@@ -174,7 +214,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_path() -> PathBuf {
-        env::temp_dir().join(format!("context-capsule-vscode-{}-{}.json", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()))
+        env::temp_dir().join(format!(
+            "context-capsule-vscode-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     fn snapshot() -> VsCodeSnapshot {
@@ -186,8 +233,27 @@ mod tests {
             remote_name: Some("wsl".to_owned()),
             workspace_trusted: true,
             workspace_file: None,
-            workspace_folders: vec![WorkspaceFolderSnapshot { uri: "vscode-remote://wsl+Ubuntu/home/user/project".to_owned(), name: "project".to_owned(), index: 0 }],
-            tab_groups: vec![TabGroupSnapshot { view_column: Some(1), active: true, tabs: vec![TabSnapshot { label: "main.rs".to_owned(), input_kind: "text".to_owned(), uri: Some("vscode-remote://wsl+Ubuntu/home/user/project/src/main.rs".to_owned()), active: true, dirty: false, pinned: true, preview: false, restorable: true }] }],
+            workspace_folders: vec![WorkspaceFolderSnapshot {
+                uri: "vscode-remote://wsl+Ubuntu/home/user/project".to_owned(),
+                name: "project".to_owned(),
+                index: 0,
+            }],
+            tab_groups: vec![TabGroupSnapshot {
+                view_column: Some(1),
+                active: true,
+                tabs: vec![TabSnapshot {
+                    label: "main.rs".to_owned(),
+                    input_kind: "text".to_owned(),
+                    uri: Some(
+                        "vscode-remote://wsl+Ubuntu/home/user/project/src/main.rs".to_owned(),
+                    ),
+                    active: true,
+                    dirty: false,
+                    pinned: true,
+                    preview: false,
+                    restorable: true,
+                }],
+            }],
             visible_editor_selections: Vec::new(),
             active_editor_uri: None,
         }
@@ -196,7 +262,10 @@ mod tests {
     #[test]
     fn reads_recent_state_and_preserves_remote_uris() {
         let path = test_path();
-        let envelope = RuntimeEnvelope { updated_at_unix_ms: now_unix_ms(), snapshot: snapshot() };
+        let envelope = RuntimeEnvelope {
+            updated_at_unix_ms: now_unix_ms(),
+            snapshot: snapshot(),
+        };
         fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
         let loaded = read_runtime_state_at(&path).unwrap();
         validate_snapshot(&loaded.snapshot).unwrap();
