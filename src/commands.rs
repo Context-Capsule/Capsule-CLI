@@ -1,5 +1,8 @@
 use crate::{
-    adapters::docker::{self, DockerSnapshot, DockerStatus},
+    adapters::{
+        docker::{self, DockerSnapshot, DockerStatus},
+        terminal::{self, RestartPlan, TerminalEnvironment, TerminalSnapshot, TerminalStatus},
+    },
     discovery,
     persistence::{CapsuleStore, StoredCapsuleSnapshot},
     snapshot,
@@ -14,7 +17,7 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     };
 
     println!("Discovering workspace for capsule '{name}'...");
-    let discovery = match discovery::discover(true, true, true) {
+    let discovery = match discovery::discover(true, true, true, true) {
         Ok(snapshot) => snapshot,
         Err(error) => return command_error(format!("discovery failed: {error}")),
     };
@@ -40,6 +43,8 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     println!("Saved capsule '{name}'.");
     println!("  applications: {applications}");
     println!("  developer tools: {}", discovery.tools.len());
+    println!("  terminal sessions: {}", discovery.terminals.session_count());
+    println!("  WSL terminal sessions: {}", discovery.terminals.wsl_session_count());
     println!(
         "  running containers: {}",
         discovery.docker.running_container_count()
@@ -51,6 +56,9 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
             "  Docker: {}",
             discovery.docker.message.as_deref().unwrap_or("unavailable")
         );
+    }
+    if matches!(discovery.terminals.status, TerminalStatus::Degraded) {
+        println!("  terminals: captured with warnings; use 'capsule terminal inspect' for details");
     }
 
     ExitCode::SUCCESS
@@ -145,6 +153,27 @@ pub fn docker(arguments: Vec<String>) -> ExitCode {
     }
 }
 
+pub fn terminal(arguments: Vec<String>) -> ExitCode {
+    match arguments.as_slice() {
+        [command] if command == "inspect" => {
+            let snapshot = terminal::discover();
+            print_terminal_snapshot(&snapshot, true);
+            ExitCode::SUCCESS
+        }
+        [command, flag] if command == "inspect" && flag == "--json" => {
+            let snapshot = terminal::discover();
+            match serde_json::to_string_pretty(&snapshot) {
+                Ok(output) => {
+                    println!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => command_error(format!("failed to render terminal snapshot: {error}")),
+            }
+        }
+        _ => usage_error("usage: capsule terminal inspect [--json]".to_owned()),
+    }
+}
+
 pub fn print_docker_snapshot(snapshot: &DockerSnapshot, verbose: bool) {
     match snapshot.status {
         DockerStatus::NotRequested => println!("Docker: not inspected"),
@@ -195,6 +224,98 @@ pub fn print_docker_snapshot(snapshot: &DockerSnapshot, verbose: bool) {
                 }
             }
         }
+    }
+}
+
+pub fn print_terminal_snapshot(snapshot: &TerminalSnapshot, verbose: bool) {
+    match snapshot.status {
+        TerminalStatus::NotRequested => println!("Terminals: not inspected"),
+        TerminalStatus::Unsupported => println!(
+            "Terminals: unsupported ({})",
+            snapshot.message.as_deref().unwrap_or("unsupported platform")
+        ),
+        TerminalStatus::Available | TerminalStatus::Degraded => {
+            let qualifier = if snapshot.status == TerminalStatus::Degraded {
+                " (captured with warnings)"
+            } else {
+                ""
+            };
+            println!(
+                "Terminals: {} open interactive session(s){qualifier}",
+                snapshot.session_count()
+            );
+            println!("  WSL sessions: {}", snapshot.wsl_session_count());
+            println!(
+                "  Windows Terminal layouts: {}",
+                snapshot.windows_terminal_layouts.len()
+            );
+            if let Some(message) = snapshot.message.as_ref() {
+                println!("  note: {message}");
+            }
+            println!("  history captured: no");
+
+            for (index, session) in snapshot.sessions.iter().enumerate() {
+                println!(
+                    "  [{}] {} — host {:?}",
+                    index + 1,
+                    session.shell.as_str(),
+                    session.host
+                );
+                if let TerminalEnvironment::Wsl { distro } = &session.environment {
+                    println!(
+                        "      WSL distro: {}",
+                        distro.as_deref().unwrap_or("unknown")
+                    );
+                }
+                if let Some(profile) = session.profile.as_ref() {
+                    println!("      profile: {profile}");
+                }
+                if let Some(directory) = session.working_directory.as_ref() {
+                    println!(
+                        "      cwd: {directory} ({:?})",
+                        session.working_directory_source
+                    );
+                } else {
+                    println!("      cwd: unknown");
+                }
+                if let Some(pid) = session.pid {
+                    println!("      PID: {pid}");
+                }
+                if let Some(tty) = session.tty.as_ref() {
+                    println!("      TTY: {tty}");
+                }
+                if verbose {
+                    if let Some(command) = session.startup_command.as_ref() {
+                        println!("      startup: {command}");
+                    }
+                    if let Some(command) = session.foreground_command.as_ref() {
+                        println!("      foreground: {command}");
+                    }
+                    if let Some(restart) = session.restart.as_ref() {
+                        println!("      restart: {}", render_restart_plan(restart));
+                    }
+                    println!("      sources: {:?}", session.sources);
+                }
+            }
+
+            for warning in &snapshot.warnings {
+                println!("  warning: {warning}");
+            }
+        }
+    }
+}
+
+fn render_restart_plan(plan: &RestartPlan) -> String {
+    let mut parts = vec![quote_for_display(&plan.executable)];
+    parts.extend(plan.args.iter().map(|argument| quote_for_display(argument)));
+    parts.join(" ")
+}
+
+fn quote_for_display(value: &str) -> String {
+    if value.contains([' ', '\t', '"']) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_owned()
     }
 }
 
@@ -273,8 +394,15 @@ fn print_capsule_summary(name: &str, stored: &StoredCapsuleSnapshot) {
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
+    let terminal_count = stored
+        .snapshot
+        .pointer("/terminals/sessions")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
     println!("  developer tools: {tool_count}");
     println!("  applications: {app_count}");
+    println!("  terminal sessions: {terminal_count}");
 
     match stored.docker() {
         Ok(docker) => {
@@ -356,5 +484,19 @@ mod tests {
             ("demo".to_owned(), true)
         );
         assert!(parse_show_arguments(vec!["--bad".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn restart_plan_rendering_quotes_arguments_for_display() {
+        let plan = RestartPlan {
+            executable: "wt.exe".to_owned(),
+            args: vec!["new-tab".to_owned(), "-d".to_owned(), "C:\\Work Space".to_owned()],
+            working_directory: None,
+            note: None,
+        };
+        assert_eq!(
+            render_restart_plan(&plan),
+            "wt.exe new-tab -d \"C:\\Work Space\""
+        );
     }
 }
