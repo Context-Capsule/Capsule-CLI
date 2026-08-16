@@ -1,0 +1,107 @@
+name: Retry tool probes once
+
+on:
+  push:
+    branches:
+      - agent/windows-discovery-snapshot
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add sequential retry for failed probes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/toolchain.rs')
+          text = path.read_text()
+          old = '''pub fn discover_tools() -> Vec<ToolVersion> {
+              let mut discovered = thread::scope(|scope| {
+                  let handles = TOOLS
+                      .iter()
+                      .copied()
+                      .map(|spec| scope.spawn(move || discover_one(spec)))
+                      .collect::<Vec<_>>();
+
+                  handles
+                      .into_iter()
+                      .filter_map(|handle| handle.join().ok().flatten())
+                      .collect::<Vec<_>>()
+              });
+
+              discovered.sort_by(|left, right| {
+                  left.name
+                      .to_ascii_lowercase()
+                      .cmp(&right.name.to_ascii_lowercase())
+              });
+              discovered
+          }
+          '''
+          new = '''pub fn discover_tools() -> Vec<ToolVersion> {
+              let first_pass = thread::scope(|scope| {
+                  let handles = TOOLS
+                      .iter()
+                      .copied()
+                      .map(|spec| (spec, scope.spawn(move || discover_one(spec))))
+                      .collect::<Vec<_>>();
+
+                  handles
+                      .into_iter()
+                      .map(|(spec, handle)| (spec, handle.join().ok().flatten()))
+                      .collect::<Vec<_>>()
+              });
+
+              let mut discovered = Vec::new();
+              let mut retry = Vec::new();
+              for (spec, result) in first_pass {
+                  match result {
+                      Some(tool) => discovered.push(tool),
+                      None => retry.push(spec),
+                  }
+              }
+
+              // Cold package-manager shims can contend when the parallel pass starts several
+              // Node-family commands at once. Retry only failed probes sequentially so one cold
+              // launcher does not disappear from the snapshot while the common path stays fast.
+              for spec in retry {
+                  if let Some(tool) = discover_one(spec) {
+                      discovered.push(tool);
+                  }
+              }
+
+              discovered.sort_by(|left, right| {
+                  left.name
+                      .to_ascii_lowercase()
+                      .cmp(&right.name.to_ascii_lowercase())
+              });
+              discovered
+          }
+          '''
+
+          if old not in text:
+              raise SystemExit('discover_tools block did not match expected source')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --all
+
+      - name: Commit refinement
+        shell: bash
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name "Context Capsule CI"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/toolchain.rs
+          git commit -m "retry cold developer tool probes"
+          git push origin HEAD:${GITHUB_REF_NAME}
