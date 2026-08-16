@@ -1,4 +1,7 @@
-use crate::persistence::{CapsuleStore, PersistenceError};
+use crate::{
+    persistence::{CapsuleStore, PersistenceError},
+    restore_bridge::{self, RestoreAdapter},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -16,6 +19,7 @@ pub const NATIVE_PROTOCOL_VERSION: u32 = 1;
 pub const BROWSER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_NATIVE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const LIVE_STATE_MAX_AGE: Duration = Duration::from_secs(90);
+const RESTORE_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirefoxSnapshot {
@@ -91,6 +95,14 @@ struct NativeRequest {
     snapshot: Option<FirefoxSnapshot>,
     #[serde(default)]
     capsule_name: Option<String>,
+    #[serde(default)]
+    restore_request_id: Option<String>,
+    #[serde(default)]
+    restore_ok: Option<bool>,
+    #[serde(default)]
+    restore_summary: Option<String>,
+    #[serde(default)]
+    restore_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,6 +120,10 @@ struct NativeResponse {
     stored_at_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capsule_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -115,6 +131,7 @@ pub enum BrowserError {
     Io(io::Error),
     Json(serde_json::Error),
     Persistence(PersistenceError),
+    RestoreBridge(restore_bridge::RestoreBridgeError),
     Invalid(String),
     Command(String),
 }
@@ -125,6 +142,7 @@ impl fmt::Display for BrowserError {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Json(error) => write!(formatter, "JSON error: {error}"),
             Self::Persistence(error) => write!(formatter, "{error}"),
+            Self::RestoreBridge(error) => write!(formatter, "{error}"),
             Self::Invalid(message) => write!(formatter, "{message}"),
             Self::Command(message) => write!(formatter, "{message}"),
         }
@@ -145,6 +163,11 @@ impl From<serde_json::Error> for BrowserError {
 impl From<PersistenceError> for BrowserError {
     fn from(error: PersistenceError) -> Self {
         Self::Persistence(error)
+    }
+}
+impl From<restore_bridge::RestoreBridgeError> for BrowserError {
+    fn from(error: restore_bridge::RestoreBridgeError) -> Self {
+        Self::RestoreBridge(error)
     }
 }
 
@@ -180,6 +203,8 @@ fn handle_request(request: NativeRequest) -> NativeResponse {
             snapshot: None,
             stored_at_unix_ms: None,
             host_version: None,
+            restore_request_id: None,
+            capsule_name: None,
         },
     }
 }
@@ -221,6 +246,42 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
             response.snapshot = Some(snapshot);
             Ok(response)
         }
+        "restore.request.wait" => {
+            let claim = restore_bridge::wait_and_claim(RestoreAdapter::Firefox, RESTORE_WAIT_TIMEOUT)?;
+            let mut response = success_response(if claim.is_some() {
+                "restore.request"
+            } else {
+                "restore.request.none"
+            });
+            if let Some(claim) = claim {
+                response.restore_request_id = Some(claim.request.request_id);
+                response.capsule_name = Some(claim.request.capsule_name);
+            }
+            Ok(response)
+        }
+        "restore.request.complete" => {
+            let restore_request_id = request
+                .restore_request_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    BrowserError::Invalid(
+                        "restore.request.complete requires restore_request_id".to_owned(),
+                    )
+                })?;
+            let ok = request.restore_ok.ok_or_else(|| {
+                BrowserError::Invalid("restore.request.complete requires restore_ok".to_owned())
+            })?;
+            restore_bridge::complete_claimed(
+                RestoreAdapter::Firefox,
+                restore_request_id,
+                ok,
+                request.restore_summary,
+                request.restore_error,
+            )?;
+            Ok(success_response("restore.request.completed"))
+        }
         other => Err(BrowserError::Invalid(format!(
             "unknown native request type '{other}'"
         ))),
@@ -237,6 +298,8 @@ fn success_response(kind: &str) -> NativeResponse {
         snapshot: None,
         stored_at_unix_ms: None,
         host_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        restore_request_id: None,
+        capsule_name: None,
     }
 }
 
