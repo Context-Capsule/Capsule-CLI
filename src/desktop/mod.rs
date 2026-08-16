@@ -1,10 +1,7 @@
 mod classify;
 mod model;
 
-pub use model::{
-    ApplicationClassification, ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate,
-    LaunchSpec, LaunchStrategy, NormalizedRect, Rect, SnapPosition, WindowInfo, WindowState,
-};
+pub use model::{ApplicationInfo, DesktopSnapshot, IgnoredCandidate, WindowInfo};
 
 #[cfg(windows)]
 mod windows;
@@ -22,6 +19,7 @@ pub fn discover() -> Result<DesktopSnapshot, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::model::{ApplicationClassification, Rect, WindowState};
 
     #[test]
     fn virtual_desktops_are_grouped_from_application_windows() {
