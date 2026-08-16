@@ -1,5 +1,5 @@
 use crate::{
-    desktop::{ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate, WindowInfo},
+    desktop::{ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate, Rect, WindowInfo},
     discovery::{DiscoverySnapshot, GitState},
     persistence::{PersistenceError, StoredCapsuleSnapshot},
 };
@@ -135,7 +135,7 @@ fn ignored_value(candidate: &IgnoredCandidate) -> Value {
     })
 }
 
-fn rect_value(rect: crate::desktop::model::Rect) -> Value {
+fn rect_value(rect: Rect) -> Value {
     json!({
         "left": rect.left,
         "top": rect.top,
