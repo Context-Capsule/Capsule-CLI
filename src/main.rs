@@ -187,7 +187,11 @@ fn print_working_context(snapshot: &DiscoverySnapshot, verbose: bool) {
     println!(
         "  System:            {} {} ({})",
         snapshot.system.platform,
-        snapshot.system.version.as_deref().unwrap_or("version unknown"),
+        snapshot
+            .system
+            .version
+            .as_deref()
+            .unwrap_or("version unknown"),
         snapshot.system.architecture
     );
     println!(
