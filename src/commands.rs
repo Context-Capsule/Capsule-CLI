@@ -49,11 +49,7 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     if matches!(discovery.docker.status, DockerStatus::Unavailable) {
         println!(
             "  Docker: {}",
-            discovery
-                .docker
-                .message
-                .as_deref()
-                .unwrap_or("unavailable")
+            discovery.docker.message.as_deref().unwrap_or("unavailable")
         );
     }
 

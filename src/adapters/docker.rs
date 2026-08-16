@@ -209,7 +209,9 @@ pub fn discover() -> DockerSnapshot {
             return DockerSnapshot {
                 status: DockerStatus::Available,
                 context,
-                message: Some(format!("Docker is available, but container inspection failed: {error}")),
+                message: Some(format!(
+                    "Docker is available, but container inspection failed: {error}"
+                )),
                 compose_projects: Vec::new(),
                 standalone_containers: Vec::new(),
             };
@@ -227,7 +229,9 @@ pub fn discover() -> DockerSnapshot {
         Err(error) => DockerSnapshot {
             status: DockerStatus::Available,
             context,
-            message: Some(format!("Docker inspection output could not be parsed: {error}")),
+            message: Some(format!(
+                "Docker inspection output could not be parsed: {error}"
+            )),
             compose_projects: Vec::new(),
             standalone_containers: Vec::new(),
         },
@@ -243,12 +247,11 @@ pub fn restore(snapshot: &DockerSnapshot) -> DockerRestoreReport {
     };
 
     if !matches!(snapshot.status, DockerStatus::Available) {
-        report.failures.push(
-            snapshot
-                .message
-                .clone()
-                .unwrap_or_else(|| "Docker was not available when this capsule was captured".to_owned()),
-        );
+        report
+            .failures
+            .push(snapshot.message.clone().unwrap_or_else(|| {
+                "Docker was not available when this capsule was captured".to_owned()
+            }));
         return report;
     }
 
@@ -317,11 +320,17 @@ fn group_containers(
     let mut projects = BTreeMap::<String, ComposeAccumulator>::new();
     let mut standalone = Vec::new();
 
-    for raw in raw_containers.into_iter().filter(|container| container.state.running) {
+    for raw in raw_containers
+        .into_iter()
+        .filter(|container| container.state.running)
+    {
         let labels = raw.config.labels.clone().unwrap_or_default();
         let resource = to_resource(&raw);
 
-        let Some(project_name) = labels.get(COMPOSE_PROJECT_LABEL).filter(|value| !value.is_empty()) else {
+        let Some(project_name) = labels
+            .get(COMPOSE_PROJECT_LABEL)
+            .filter(|value| !value.is_empty())
+        else {
             standalone.push(resource);
             continue;
         };
@@ -346,7 +355,10 @@ fn group_containers(
             }
         }
 
-        if let Some(service) = labels.get(COMPOSE_SERVICE_LABEL).filter(|value| !value.is_empty()) {
+        if let Some(service) = labels
+            .get(COMPOSE_SERVICE_LABEL)
+            .filter(|value| !value.is_empty())
+        {
             project.services.insert(service.clone());
         }
 
@@ -428,7 +440,10 @@ fn split_compose_files(value: &str) -> Vec<String> {
 
 fn restore_compose_project(project: &ComposeProject) -> Result<Option<String>, String> {
     let usable_config = !project.config_files.is_empty()
-        && project.config_files.iter().all(|path| Path::new(path).is_file());
+        && project
+            .config_files
+            .iter()
+            .all(|path| Path::new(path).is_file());
     let usable_working_directory = project
         .working_directory
         .as_deref()
@@ -525,7 +540,12 @@ fn restore_existing_container(container: &ContainerResource) -> Result<(), Strin
     let inspect = Command::new("docker")
         .args(["inspect", "--type", "container", &container.name])
         .output()
-        .map_err(|error| format!("Container '{}': failed to query Docker: {error}", container.name))?;
+        .map_err(|error| {
+            format!(
+                "Container '{}': failed to query Docker: {error}",
+                container.name
+            )
+        })?;
 
     if !inspect.status.success() {
         return Err(format!(

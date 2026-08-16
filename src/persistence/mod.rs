@@ -1,12 +1,11 @@
 use crate::adapters::docker::DockerSnapshot;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     env,
     error::Error,
-    fmt,
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,11 +31,9 @@ impl StoredCapsuleSnapshot {
     }
 
     pub fn docker(&self) -> Result<DockerSnapshot, PersistenceError> {
-        let value = self
-            .snapshot
-            .get("docker")
-            .cloned()
-            .ok_or_else(|| PersistenceError::InvalidPayload("snapshot has no Docker section".to_owned()))?;
+        let value = self.snapshot.get("docker").cloned().ok_or_else(|| {
+            PersistenceError::InvalidPayload("snapshot has no Docker section".to_owned())
+        })?;
         serde_json::from_value(value).map_err(PersistenceError::Json)
     }
 }
@@ -72,7 +69,9 @@ impl fmt::Display for PersistenceError {
                 "capsule '{name}' already exists; use --force to replace its snapshot"
             ),
             Self::NotFound(name) => write!(formatter, "capsule '{name}' was not found"),
-            Self::InvalidPayload(message) => write!(formatter, "invalid capsule payload: {message}"),
+            Self::InvalidPayload(message) => {
+                write!(formatter, "invalid capsule payload: {message}")
+            }
         }
     }
 }
@@ -103,7 +102,10 @@ impl CapsuleStore {
 
     pub fn open_at(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
 
@@ -261,9 +263,8 @@ pub fn default_database_path() -> Result<PathBuf, PersistenceError> {
 
     #[cfg(target_os = "macos")]
     {
-        let home = env::var_os("HOME").ok_or_else(|| {
-            PersistenceError::InvalidPayload("HOME is not available".to_owned())
-        })?;
+        let home = env::var_os("HOME")
+            .ok_or_else(|| PersistenceError::InvalidPayload("HOME is not available".to_owned()))?;
         return Ok(PathBuf::from(home)
             .join("Library")
             .join("Application Support")
@@ -279,9 +280,8 @@ pub fn default_database_path() -> Result<PathBuf, PersistenceError> {
                 .join(DATABASE_FILE_NAME));
         }
 
-        let home = env::var_os("HOME").ok_or_else(|| {
-            PersistenceError::InvalidPayload("HOME is not available".to_owned())
-        })?;
+        let home = env::var_os("HOME")
+            .ok_or_else(|| PersistenceError::InvalidPayload("HOME is not available".to_owned()))?;
         Ok(PathBuf::from(home)
             .join(".local")
             .join("share")

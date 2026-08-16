@@ -109,9 +109,7 @@ where
                 set_section(&mut options, &mut selected_section, InspectSection::Ignored)?
             }
             "--tools" => set_section(&mut options, &mut selected_section, InspectSection::Tools)?,
-            "--docker" => {
-                set_section(&mut options, &mut selected_section, InspectSection::Docker)?
-            }
+            "--docker" => set_section(&mut options, &mut selected_section, InspectSection::Docker)?,
             other => return Err(format!("unknown inspect option '{other}'")),
         }
     }
@@ -138,8 +136,14 @@ fn set_section(
 
 fn inspect(options: InspectOptions) -> ExitCode {
     let include_tools = matches!(options.section, InspectSection::All | InspectSection::Tools);
-    let include_desktop = !matches!(options.section, InspectSection::Tools | InspectSection::Docker);
-    let include_docker = matches!(options.section, InspectSection::All | InspectSection::Docker);
+    let include_desktop = !matches!(
+        options.section,
+        InspectSection::Tools | InspectSection::Docker
+    );
+    let include_docker = matches!(
+        options.section,
+        InspectSection::All | InspectSection::Docker
+    );
 
     let snapshot = match discovery::discover(include_tools, include_desktop, include_docker) {
         Ok(snapshot) => snapshot,
@@ -543,7 +547,9 @@ fn print_usage() {
     println!("  capsule docker restore <capsule-name>");
     println!("  capsule apps\n");
     println!("Commands:");
-    println!("  inspect    Discover current workspace, tools, applications, windows, displays and Docker");
+    println!(
+        "  inspect    Discover current workspace, tools, applications, windows, displays and Docker"
+    );
     println!("  save       Capture the current semantic workspace into SQLite");
     println!("  list       List saved capsules");
     println!("  show       Show a saved capsule; --json prints the complete stored payload");

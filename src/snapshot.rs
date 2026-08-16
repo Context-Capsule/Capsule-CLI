@@ -3,7 +3,7 @@ use crate::{
     discovery::{DiscoverySnapshot, GitState},
     persistence::{PersistenceError, StoredCapsuleSnapshot},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn capture_snapshot(
     discovery: &DiscoverySnapshot,
