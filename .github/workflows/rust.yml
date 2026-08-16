@@ -159,7 +159,7 @@ jobs:
   docker-integration:
     runs-on: ubuntu-latest
     env:
-      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-docker.db
+      CONTEXT_CAPSULE_DB: /tmp/context-capsule-docker.db
 
     steps:
       - name: Checkout
