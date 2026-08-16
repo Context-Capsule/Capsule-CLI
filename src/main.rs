@@ -87,7 +87,7 @@ fn git_output(args: &[&str]) -> Result<String, GitCommandError> {
 fn print_usage() {
     println!("Context Capsule CLI\n");
     println!("Usage:");
-    println!("  context-capsule inspect\n");
+    println!("  capsule inspect\n");
     println!("Commands:");
     println!("  inspect    Show the current directory and Git context");
 }
