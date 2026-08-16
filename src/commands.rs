@@ -7,9 +7,11 @@ use crate::{
     persistence::{CapsuleStore, StoredCapsuleSnapshot},
     snapshot,
 };
-use context_capsule::restore::{self, RestoreOptions};
 use serde_json::Value;
 use std::process::ExitCode;
+
+#[path = "full_restore_command.rs"]
+mod full_restore_command;
 
 pub fn save(arguments: Vec<String>) -> ExitCode {
     let (name, force) = match parse_save_arguments(arguments) {
@@ -72,82 +74,7 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
 }
 
 pub fn restore(arguments: Vec<String>) -> ExitCode {
-    let (name, dry_run) = match parse_restore_arguments(arguments) {
-        Ok(parsed) => parsed,
-        Err(error) => return usage_error(error),
-    };
-
-    let store = match CapsuleStore::open_default() {
-        Ok(store) => store,
-        Err(error) => return command_error(error.to_string()),
-    };
-    let stored = match store.load(&name) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return command_error(error.to_string()),
-    };
-
-    if dry_run {
-        println!("Planning restore for capsule '{name}' (dry run)...");
-    } else {
-        println!("Restoring capsule '{name}'...");
-    }
-
-    let report = restore::restore_snapshot(&stored.snapshot, RestoreOptions { dry_run });
-    let desktop = &report.desktop;
-    println!("Desktop:");
-    println!("  applications in capsule: {}", desktop.applications_total);
-    println!(
-        "  already running:         {}",
-        desktop.applications_already_running
-    );
-    if dry_run {
-        println!(
-            "  would launch:            {}",
-            desktop.applications_planned_to_launch
-        );
-        println!(
-            "  windows already placed: {}",
-            desktop.windows_already_placed
-        );
-        println!(
-            "  windows to reposition:  {}",
-            desktop.windows_planned_to_move
-        );
-    } else {
-        println!("  launched:                {}", desktop.applications_launched);
-        println!(
-            "  windows already placed: {}",
-            desktop.windows_already_placed
-        );
-        println!("  windows repositioned:   {}", desktop.windows_moved);
-    }
-    if desktop.applications_unlaunchable > 0 {
-        println!(
-            "  apps without launch identity: {}",
-            desktop.applications_unlaunchable
-        );
-    }
-    if desktop.windows_missing > 0 {
-        println!("  saved windows not observed: {}", desktop.windows_missing);
-    }
-
-    for warning in report.warnings.iter().chain(desktop.warnings.iter()) {
-        println!("  warning: {warning}");
-    }
-    for failure in report.failures.iter().chain(desktop.failures.iter()) {
-        eprintln!("  failed: {failure}");
-    }
-
-    if report.success() {
-        if dry_run {
-            println!("Dry run complete; no applications or windows were changed.");
-        } else {
-            println!("Restore pass complete.");
-        }
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    }
+    full_restore_command::run(arguments)
 }
 
 pub fn list(arguments: Vec<String>) -> ExitCode {
@@ -523,25 +450,6 @@ fn parse_save_arguments(arguments: Vec<String>) -> Result<(String, bool), String
         .ok_or_else(|| "usage: capsule save <name> [--force]".to_owned())
 }
 
-fn parse_restore_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
-    let mut name = None;
-    let mut dry_run = false;
-
-    for argument in arguments {
-        match argument.as_str() {
-            "--dry-run" => dry_run = true,
-            value if value.starts_with('-') => {
-                return Err(format!("unknown restore option '{value}'"));
-            }
-            value if name.is_none() => name = Some(value.to_owned()),
-            value => return Err(format!("unexpected restore argument '{value}'")),
-        }
-    }
-
-    name.map(|name| (name, dry_run))
-        .ok_or_else(|| "usage: capsule restore <name> [--dry-run]".to_owned())
-}
-
 fn parse_show_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
     let mut name = None;
     let mut json = false;
@@ -583,21 +491,6 @@ mod tests {
         );
         assert!(parse_save_arguments(Vec::new()).is_err());
         assert!(parse_save_arguments(vec!["a".to_owned(), "b".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn restore_parser_supports_dry_run() {
-        assert_eq!(
-            parse_restore_arguments(vec!["demo".to_owned(), "--dry-run".to_owned()]).unwrap(),
-            ("demo".to_owned(), true)
-        );
-        assert_eq!(
-            parse_restore_arguments(vec!["demo".to_owned()]).unwrap(),
-            ("demo".to_owned(), false)
-        );
-        assert!(parse_restore_arguments(Vec::new()).is_err());
-        assert!(parse_restore_arguments(vec!["demo".to_owned(), "--bad".to_owned()]).is_err());
-        assert!(parse_restore_arguments(vec!["one".to_owned(), "two".to_owned()]).is_err());
     }
 
     #[test]
