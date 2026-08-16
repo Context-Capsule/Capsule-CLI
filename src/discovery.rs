@@ -1,5 +1,8 @@
 use crate::{
-    adapters::docker::{self, DockerSnapshot},
+    adapters::{
+        docker::{self, DockerSnapshot},
+        terminal::{self, TerminalSnapshot},
+    },
     desktop::{self, DesktopSnapshot},
     git::{self, GitContext, GitDiscoveryError},
     system::{self, SystemInfo},
@@ -23,12 +26,14 @@ pub struct DiscoverySnapshot {
     pub version_hints: Vec<VersionHint>,
     pub desktop: Result<DesktopSnapshot, String>,
     pub docker: DockerSnapshot,
+    pub terminals: TerminalSnapshot,
 }
 
 pub fn discover(
     include_tools: bool,
     include_desktop: bool,
     include_docker: bool,
+    include_terminals: bool,
 ) -> Result<DiscoverySnapshot, String> {
     let current_directory = env::current_dir()
         .map_err(|error| format!("failed to determine current directory: {error}"))?;
@@ -66,6 +71,12 @@ pub fn discover(
         DockerSnapshot::not_requested()
     };
 
+    let terminals = if include_terminals {
+        terminal::discover()
+    } else {
+        TerminalSnapshot::not_requested()
+    };
+
     Ok(DiscoverySnapshot {
         current_directory,
         system,
@@ -74,5 +85,6 @@ pub fn discover(
         version_hints,
         desktop,
         docker,
+        terminals,
     })
 }
