@@ -8,7 +8,34 @@ on:
   pull_request:
 
 jobs:
-  check-windows:
+  check:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --all-targets
+
+      - name: Test
+        run: cargo test
+
+      - name: Toolchain discovery smoke test
+        run: cargo run -- inspect --tools
+
+  windows-discovery:
     runs-on: windows-latest
 
     steps:
@@ -18,14 +45,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check
-        run: cargo check --all-targets
+      - name: Full discovery
+        run: cargo run -- inspect --verbose
 
-      - name: Test
-        run: cargo test
+      - name: Application discovery
+        run: cargo run -- inspect --apps
 
-      - name: Run inspect
-        run: cargo run -- inspect
+      - name: Window discovery
+        run: cargo run -- inspect --windows
 
-      - name: Run apps
+      - name: Classification diagnostics
+        run: cargo run -- inspect --processes
+
+      - name: Ignored-candidate diagnostics
+        run: cargo run -- inspect --ignored
+
+      - name: Compatibility apps command
         run: cargo run -- apps
