@@ -35,6 +35,36 @@ jobs:
       - name: Toolchain discovery smoke test
         run: cargo run -- inspect --tools
 
+      - name: Installed Node tools must be discovered
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = cargo run --quiet -- inspect --tools | Out-String
+          $tools = @(
+            @{ Command = 'node'; Label = 'Node.js' },
+            @{ Command = 'npm'; Label = 'npm' },
+            @{ Command = 'npx'; Label = 'npx' },
+            @{ Command = 'pnpm'; Label = 'pnpm' }
+          )
+
+          foreach ($tool in $tools) {
+            $installed = Get-Command $tool.Command -ErrorAction SilentlyContinue
+            if (-not $installed) {
+              Write-Host "$($tool.Command) is not installed on this runner; skipping assertion."
+              continue
+            }
+
+            Write-Host "$($tool.Command) is installed at $($installed.Source)"
+            & $tool.Command --version
+
+            $pattern = "(?m)^\s+$([regex]::Escape($tool.Label))\s+"
+            if ($output -notmatch $pattern) {
+              Write-Host "Context Capsule tool output:"
+              Write-Host $output
+              throw "$($tool.Command) is installed but was not reported by capsule inspect --tools"
+            }
+          }
+
   windows-discovery:
     runs-on: windows-latest
 
