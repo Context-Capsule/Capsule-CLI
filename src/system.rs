@@ -1,3 +1,4 @@
+#[cfg(not(windows))]
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
