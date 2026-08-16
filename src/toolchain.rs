@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolVersion {
     pub name: String,
@@ -300,6 +303,9 @@ pub fn discover_version_hints(project_root: &Path) -> Vec<VersionHint> {
 fn discover_one(spec: ToolSpec) -> Option<ToolVersion> {
     let executable_path = resolve_executable(spec.command)?;
     let output = run_version_command(spec.command, spec.args, &executable_path)?;
+    if !output.status.success() {
+        return None;
+    }
     let version =
         first_non_empty_line(&output.stdout).or_else(|| first_non_empty_line(&output.stderr))?;
 
@@ -325,8 +331,8 @@ fn run_version_command(_command: &str, args: &[&str], executable_path: &str) -> 
 
 #[cfg(windows)]
 fn run_windows_command_shim(executable_path: &str, args: &[&str]) -> Option<Output> {
-    // npm, pnpm, npx, Corepack and similar Windows tools are commonly batch shims.
-    // Execute the exact path discovered by `where.exe` instead of resolving the command again.
+    // Batch shims cannot be launched directly through CreateProcess. Build the exact
+    // command line expected by cmd.exe and bypass Rust's second layer of quoting.
     let command_line = std::iter::once(executable_path)
         .chain(args.iter().copied())
         .map(quote_cmd_argument)
@@ -334,9 +340,7 @@ fn run_windows_command_shim(executable_path: &str, args: &[&str]) -> Option<Outp
         .join(" ");
 
     let mut shell = Command::new("cmd.exe");
-    shell
-        .args(["/D", "/Q", "/C"])
-        .arg(format!("call {command_line}"));
+    shell.raw_arg(format!(r#"/D /S /C "{command_line}""#));
     run_with_timeout(&mut shell, TOOL_VERSION_TIMEOUT)
 }
 
