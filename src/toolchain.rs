@@ -31,7 +31,7 @@ struct ToolSpec {
     args: &'static [&'static str],
 }
 
-const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
+const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_VERSION_HINT_BYTES: u64 = 32 * 1024;
 static CAPTURE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
