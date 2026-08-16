@@ -3,12 +3,18 @@ use crate::{
     discovery::{DiscoverySnapshot, GitState},
     persistence::{PersistenceError, StoredCapsuleSnapshot},
 };
+use context_capsule::browser;
 use serde_json::{Value, json};
 
 pub fn capture_snapshot(
     discovery: &DiscoverySnapshot,
 ) -> Result<StoredCapsuleSnapshot, PersistenceError> {
     let docker = serde_json::to_value(&discovery.docker)?;
+    let firefox = browser::load_recent_firefox_state()
+        .ok()
+        .flatten()
+        .map(serde_json::to_value)
+        .transpose()?;
     let snapshot = json!({
         "current_directory": discovery.current_directory.to_string_lossy(),
         "system": {
@@ -29,6 +35,9 @@ pub fn capture_snapshot(
         })).collect::<Vec<_>>(),
         "desktop": desktop_value(&discovery.desktop),
         "docker": docker,
+        "browsers": {
+            "firefox": firefox,
+        },
     });
 
     Ok(StoredCapsuleSnapshot::new(snapshot))
@@ -155,7 +164,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn snapshot_envelope_is_versioned_and_contains_docker() {
+    fn snapshot_envelope_is_versioned_and_contains_docker_and_browser_slot() {
         let discovery = DiscoverySnapshot {
             current_directory: PathBuf::from("/workspace"),
             system: SystemInfo {
@@ -180,5 +189,6 @@ mod tests {
         assert_eq!(stored.schema_version, 1);
         assert_eq!(stored.snapshot["docker"]["status"], "available");
         assert_eq!(stored.snapshot["git"]["status"], "not-repository");
+        assert!(stored.snapshot.pointer("/browsers/firefox").is_some());
     }
 }

@@ -2,10 +2,15 @@
 name = "context-capsule"
 version = "0.1.0"
 edition = "2024"
+default-run = "capsule"
 
 [[bin]]
 name = "capsule"
 path = "src/main.rs"
+
+[[bin]]
+name = "capsule-firefox-host"
+path = "src/bin/firefox_host.rs"
 
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"] }
