@@ -66,5 +66,7 @@ fn print_usage() {
     println!("  capsule-firefox-host --status");
     println!("  capsule-firefox-host --uninstall");
     println!();
-    println!("With no arguments the binary runs the Firefox native-messaging protocol on stdin/stdout.");
+    println!(
+        "With no arguments the binary runs the Firefox native-messaging protocol on stdin/stdout."
+    );
 }

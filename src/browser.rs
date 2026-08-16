@@ -133,13 +133,19 @@ impl fmt::Display for BrowserError {
 
 impl Error for BrowserError {}
 impl From<io::Error> for BrowserError {
-    fn from(error: io::Error) -> Self { Self::Io(error) }
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 impl From<serde_json::Error> for BrowserError {
-    fn from(error: serde_json::Error) -> Self { Self::Json(error) }
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
 }
 impl From<PersistenceError> for BrowserError {
-    fn from(error: PersistenceError) -> Self { Self::Persistence(error) }
+    fn from(error: PersistenceError) -> Self {
+        Self::Persistence(error)
+    }
 }
 
 pub fn run_native_host() -> Result<(), BrowserError> {
@@ -192,9 +198,9 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
     match request.kind.as_str() {
         "ping" => Ok(success_response("pong")),
         "browser.state.update" => {
-            let snapshot = request
-                .snapshot
-                .ok_or_else(|| BrowserError::Invalid("browser.state.update requires snapshot".to_owned()))?;
+            let snapshot = request.snapshot.ok_or_else(|| {
+                BrowserError::Invalid("browser.state.update requires snapshot".to_owned())
+            })?;
             validate_snapshot(&snapshot)?;
             let stored_at = write_runtime_state(&snapshot)?;
             let mut response = success_response("browser.state.updated");
@@ -207,13 +213,17 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
                 .as_deref()
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
-                .ok_or_else(|| BrowserError::Invalid("browser.capsule.get requires capsule_name".to_owned()))?;
+                .ok_or_else(|| {
+                    BrowserError::Invalid("browser.capsule.get requires capsule_name".to_owned())
+                })?;
             let snapshot = firefox_snapshot_from_capsule(name)?;
             let mut response = success_response("browser.capsule.snapshot");
             response.snapshot = Some(snapshot);
             Ok(response)
         }
-        other => Err(BrowserError::Invalid(format!("unknown native request type '{other}'"))),
+        other => Err(BrowserError::Invalid(format!(
+            "unknown native request type '{other}'"
+        ))),
     }
 }
 
@@ -244,10 +254,14 @@ fn validate_snapshot(snapshot: &FirefoxSnapshot) -> Result<(), BrowserError> {
         )));
     }
     if snapshot.windows.len() > 256 {
-        return Err(BrowserError::Invalid("Firefox snapshot contains too many windows".to_owned()));
+        return Err(BrowserError::Invalid(
+            "Firefox snapshot contains too many windows".to_owned(),
+        ));
     }
     if snapshot.tab_count() > 100_000 {
-        return Err(BrowserError::Invalid("Firefox snapshot contains too many tabs".to_owned()));
+        return Err(BrowserError::Invalid(
+            "Firefox snapshot contains too many tabs".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -261,7 +275,9 @@ fn read_native_message<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, Brows
     reader.read_exact(&mut length_bytes[1..])?;
     let length = u32::from_le_bytes(length_bytes) as usize;
     if length == 0 || length > MAX_NATIVE_MESSAGE_BYTES {
-        return Err(BrowserError::Invalid(format!("invalid native message length {length}")));
+        return Err(BrowserError::Invalid(format!(
+            "invalid native message length {length}"
+        )));
     }
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload)?;
@@ -270,7 +286,10 @@ fn read_native_message<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, Brows
 
 fn write_native_message<W: Write>(writer: &mut W, payload: &[u8]) -> Result<(), BrowserError> {
     if payload.is_empty() || payload.len() > MAX_NATIVE_MESSAGE_BYTES {
-        return Err(BrowserError::Invalid(format!("invalid native response length {}", payload.len())));
+        return Err(BrowserError::Invalid(format!(
+            "invalid native response length {}",
+            payload.len()
+        )));
     }
     let length = u32::try_from(payload.len())
         .map_err(|_| BrowserError::Invalid("native response is too large".to_owned()))?;
@@ -298,7 +317,9 @@ pub fn load_recent_firefox_state() -> Result<Option<FirefoxSnapshot>, BrowserErr
 pub fn runtime_state_path() -> Result<PathBuf, BrowserError> {
     if let Some(path) = env::var_os("CONTEXT_CAPSULE_FIREFOX_STATE_PATH") {
         if path.is_empty() {
-            return Err(BrowserError::Invalid("CONTEXT_CAPSULE_FIREFOX_STATE_PATH is empty".to_owned()));
+            return Err(BrowserError::Invalid(
+                "CONTEXT_CAPSULE_FIREFOX_STATE_PATH is empty".to_owned(),
+            ));
         }
         return Ok(PathBuf::from(path));
     }
@@ -328,7 +349,9 @@ pub fn runtime_state_path() -> Result<PathBuf, BrowserError> {
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         if let Some(base) = env::var_os("XDG_STATE_HOME") {
-            return Ok(PathBuf::from(base).join("context-capsule").join("firefox.json"));
+            return Ok(PathBuf::from(base)
+                .join("context-capsule")
+                .join("firefox.json"));
         }
         let home = env::var_os("HOME")
             .ok_or_else(|| BrowserError::Invalid("HOME is not available".to_owned()))?;
@@ -347,7 +370,11 @@ fn write_runtime_state(snapshot: &FirefoxSnapshot) -> Result<i64, BrowserError> 
     Ok(updated_at)
 }
 
-fn write_runtime_state_at(path: &Path, snapshot: &FirefoxSnapshot, updated_at: i64) -> Result<(), BrowserError> {
+fn write_runtime_state_at(
+    path: &Path,
+    snapshot: &FirefoxSnapshot,
+    updated_at: i64,
+) -> Result<(), BrowserError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -376,7 +403,9 @@ fn firefox_snapshot_from_capsule(name: &str) -> Result<FirefoxSnapshot, BrowserE
         .pointer("/browsers/firefox")
         .cloned()
         .filter(|value| !value.is_null())
-        .ok_or_else(|| BrowserError::Invalid(format!("capsule '{name}' has no Firefox snapshot")))?;
+        .ok_or_else(|| {
+            BrowserError::Invalid(format!("capsule '{name}' has no Firefox snapshot"))
+        })?;
     let snapshot: FirefoxSnapshot = serde_json::from_value(value)?;
     validate_snapshot(&snapshot)?;
     Ok(snapshot)
@@ -422,7 +451,9 @@ pub fn uninstall_native_host() -> Result<PathBuf, BrowserError> {
 pub fn native_manifest_path() -> Result<PathBuf, BrowserError> {
     if let Some(path) = env::var_os("CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH") {
         if path.is_empty() {
-            return Err(BrowserError::Invalid("CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH is empty".to_owned()));
+            return Err(BrowserError::Invalid(
+                "CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH is empty".to_owned(),
+            ));
         }
         return Ok(PathBuf::from(path));
     }
@@ -490,7 +521,9 @@ fn register_windows_manifest(path: &Path) -> Result<(), BrowserError> {
 #[cfg(windows)]
 fn unregister_windows_manifest() -> Result<(), BrowserError> {
     let key = format!(r"HKCU\Software\Mozilla\NativeMessagingHosts\{NATIVE_HOST_NAME}");
-    let output = Command::new("reg.exe").args(["delete", &key, "/f"]).output()?;
+    let output = Command::new("reg.exe")
+        .args(["delete", &key, "/f"])
+        .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.to_ascii_lowercase().contains("unable to find") {
@@ -558,7 +591,8 @@ mod tests {
     fn runtime_state_round_trips() {
         let path = env::temp_dir().join(format!(
             "context-capsule-firefox-state-{}-{}.json",
-            std::process::id(), now_unix_ms()
+            std::process::id(),
+            now_unix_ms()
         ));
         let snapshot = sample_snapshot();
         write_runtime_state_at(&path, &snapshot, 42).expect("write state");
