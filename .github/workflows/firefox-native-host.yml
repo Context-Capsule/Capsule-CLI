@@ -20,6 +20,30 @@ jobs:
       - run: cargo check --all-targets
       - run: cargo test
       - run: cargo build --bin capsule-firefox-host
+      - name: Register and unregister Firefox host on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH: ${{ runner.temp }}\com.contextcapsule.host.json
+        run: |
+          .\target\debug\capsule-firefox-host.exe --install
+          if (-not (Test-Path $env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH)) {
+            throw 'native messaging manifest was not created'
+          }
+
+          $registryPath = 'Registry::HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts\com.contextcapsule.host'
+          if (-not (Test-Path $registryPath)) {
+            throw 'Firefox native messaging registry key was not created'
+          }
+          $registeredManifest = (Get-Item $registryPath).GetValue('')
+          if ($registeredManifest -ne $env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH) {
+            throw "registry points to '$registeredManifest' instead of '$env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH'"
+          }
+
+          .\target\debug\capsule-firefox-host.exe --uninstall
+          if (Test-Path $registryPath) {
+            throw 'Firefox native messaging registry key remained after uninstall'
+          }
 
   protocol-integration:
     runs-on: ubuntu-latest
