@@ -1,3 +1,5 @@
+mod apps;
+
 use std::{
     env,
     process::{Command, ExitCode},
@@ -15,6 +17,15 @@ fn main() -> ExitCode {
             }
 
             inspect()
+        }
+        Some("apps") => {
+            if args.next().is_some() {
+                eprintln!("error: 'apps' does not accept arguments\n");
+                print_usage();
+                return ExitCode::from(2);
+            }
+
+            list_apps()
         }
         Some("-h") | Some("--help") | None => {
             print_usage();
@@ -65,6 +76,30 @@ fn inspect() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn list_apps() -> ExitCode {
+    match apps::list_open_apps() {
+        Ok(open_apps) => {
+            if open_apps.is_empty() {
+                println!("No visible applications detected.");
+                return ExitCode::SUCCESS;
+            }
+
+            println!("Open applications (visible windows): {}\n", open_apps.len());
+            for app in open_apps {
+                let executable = app.executable.as_deref().unwrap_or("unknown executable");
+                println!("{executable} [PID {}]", app.pid);
+                println!("  {}", app.window_title);
+            }
+
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Failed to list open applications: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GitCommandError {
     NotInstalled,
@@ -87,7 +122,8 @@ fn git_output(args: &[&str]) -> Result<String, GitCommandError> {
 fn print_usage() {
     println!("Context Capsule CLI\n");
     println!("Usage:");
-    println!("  capsule inspect\n");
+    println!("  capsule <command>\n");
     println!("Commands:");
     println!("  inspect    Show the current directory and Git context");
+    println!("  apps       List visible open applications on Windows");
 }
