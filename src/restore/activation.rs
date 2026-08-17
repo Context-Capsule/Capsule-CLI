@@ -5,8 +5,7 @@ use std::{
     mem::{size_of, zeroed},
     path::Path,
     process::{Command, Stdio},
-    ptr,
-    thread,
+    ptr, thread,
     time::{Duration, Instant},
 };
 
@@ -341,9 +340,11 @@ fn process_matches(application: &SavedApplication, process: &CurrentProcess) -> 
 
     if let Some(saved) = application.executable_path.as_deref() {
         has_strong_identity = true;
-        if process.executable_path.as_deref().is_some_and(|current| {
-            normalize_windows_path(current) == normalize_windows_path(saved)
-        }) {
+        if process
+            .executable_path
+            .as_deref()
+            .is_some_and(|current| normalize_windows_path(current) == normalize_windows_path(saved))
+        {
             return true;
         }
     }
@@ -399,8 +400,7 @@ fn saved_executable_name(application: &SavedApplication) -> Option<String> {
 }
 
 fn is_explorer(application: &SavedApplication) -> bool {
-    saved_executable_name(application)
-        .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
+    saved_executable_name(application).is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
 }
 
 fn is_windows_terminal(application: &SavedApplication) -> bool {
