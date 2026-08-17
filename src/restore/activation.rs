@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     ptr,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type Hwnd = *mut c_void;
@@ -20,6 +20,8 @@ const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 const MAX_PATH: usize = 260;
 const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 const ACTIVATION_SPACING: Duration = Duration::from_millis(120);
+const VISIBLE_WINDOW_TIMEOUT: Duration = Duration::from_secs(4);
+const VISIBLE_WINDOW_POLL: Duration = Duration::from_millis(140);
 
 #[repr(C)]
 struct ProcessEntry32W {
@@ -96,11 +98,7 @@ pub fn reactivate_background_only_apps(
             continue;
         }
 
-        let matching_pids = processes
-            .iter()
-            .filter(|process| process_matches(application, process))
-            .map(|process| process.pid)
-            .collect::<HashSet<_>>();
+        let matching_pids = matching_pids(application, &processes);
         if should_activate(&matching_pids, &visible_pids) {
             candidates.push(application);
         }
@@ -110,7 +108,16 @@ pub fn reactivate_background_only_apps(
     let total = candidates.len();
     for (index, application) in candidates.into_iter().enumerate() {
         match activate(application) {
-            Ok(()) => report.activated += 1,
+            Ok(()) => {
+                report.activated += 1;
+                if !wait_for_visible_window(application) {
+                    report.warnings.push(format!(
+                        "{} was reactivated but no visible window appeared within {} ms; final placement will continue without blocking longer",
+                        application.name,
+                        VISIBLE_WINDOW_TIMEOUT.as_millis()
+                    ));
+                }
+            }
             Err(error) => report
                 .failures
                 .push(format!("{}: {error}", application.name)),
@@ -131,6 +138,32 @@ pub fn reactivate_background_only_apps(
 
 fn should_activate(matching_pids: &HashSet<u32>, visible_pids: &HashSet<u32>) -> bool {
     !matching_pids.is_empty() && matching_pids.is_disjoint(visible_pids)
+}
+
+fn wait_for_visible_window(application: &SavedApplication) -> bool {
+    let deadline = Instant::now() + VISIBLE_WINDOW_TIMEOUT;
+    loop {
+        let processes = relevant_processes(std::slice::from_ref(application));
+        let matching = matching_pids(application, &processes);
+        if !matching.is_empty() && !matching.is_disjoint(&visible_window_pids()) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(VISIBLE_WINDOW_POLL);
+    }
+}
+
+fn matching_pids(
+    application: &SavedApplication,
+    processes: &[CurrentProcess],
+) -> HashSet<u32> {
+    processes
+        .iter()
+        .filter(|process| process_matches(application, process))
+        .map(|process| process.pid)
+        .collect()
 }
 
 fn activate(application: &SavedApplication) -> Result<(), String> {
@@ -199,22 +232,10 @@ unsafe extern "system" fn enum_visible_window(hwnd: Hwnd, data: isize) -> Bool {
 }
 
 fn relevant_processes(saved: &[SavedApplication]) -> Vec<CurrentProcess> {
-    let candidate_names = saved
-        .iter()
-        .filter_map(saved_executable_name)
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    let need_aumid = saved.iter().any(|application| {
-        application.app_user_model_id.is_some()
-            || application
-                .launch
-                .as_ref()
-                .is_some_and(|launch| launch.strategy == "app-user-model-id")
-    });
-
+    let candidate_names = candidate_executable_names(saved);
     process_entries()
         .into_iter()
-        .filter(|(_, name)| candidate_names.contains(&name.to_ascii_lowercase()) || need_aumid)
+        .filter(|(_, name)| candidate_names.contains(&name.to_ascii_lowercase()))
         .map(|(pid, exe_name)| {
             let (executable_path, app_user_model_id) = process_metadata(pid);
             CurrentProcess {
@@ -225,6 +246,25 @@ fn relevant_processes(saved: &[SavedApplication]) -> Vec<CurrentProcess> {
             }
         })
         .collect()
+}
+
+fn candidate_executable_names(saved: &[SavedApplication]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for application in saved {
+        if let Some(name) = saved_executable_name(application) {
+            names.insert(name.to_ascii_lowercase());
+        }
+        let app_name = application.name.trim();
+        if !app_name.is_empty() && !app_name.contains(['\\', '/']) {
+            let inferred = if app_name.to_ascii_lowercase().ends_with(".exe") {
+                app_name.to_owned()
+            } else {
+                format!("{app_name}.exe")
+            };
+            names.insert(inferred.to_ascii_lowercase());
+        }
+    }
+    names
 }
 
 fn process_entries() -> HashMap<u32, String> {
@@ -376,5 +416,21 @@ mod tests {
         assert!(should_activate(&running, &HashSet::new()));
         assert!(!should_activate(&running, &HashSet::from([41_u32])));
         assert!(!should_activate(&HashSet::new(), &HashSet::new()));
+    }
+
+    #[test]
+    fn candidate_names_include_saved_path_without_scanning_every_process() {
+        let application = SavedApplication {
+            name: "WhatsApp".to_owned(),
+            executable_path: Some(r"C:\Program Files\WindowsApps\WhatsApp.exe".to_owned()),
+            app_user_model_id: Some("WhatsApp_123!App".to_owned()),
+            file_version: None,
+            classification: "user-application".to_owned(),
+            launch: None,
+            windows: Vec::new(),
+            discovered_as_background: false,
+        };
+        let names = candidate_executable_names(&[application]);
+        assert!(names.contains("whatsapp.exe"));
     }
 }
