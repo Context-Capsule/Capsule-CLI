@@ -62,7 +62,7 @@ pub fn prepare(snapshot: &Value, dry_run: bool) -> DevHostPreparation {
         let executable = saved_code_executable(snapshot).unwrap_or_else(|| "code".to_owned());
         if dry_run {
             report.warnings.push(format!(
-                "VS Code restore: would start an Extension Development Host from '{extension_path}' using '{executable}'"
+                "VS Code restore: would start an Extension Development Host from '{extension_path}' using '{executable}' and open that development workspace"
             ));
             return report;
         }
@@ -110,6 +110,11 @@ fn launch_devhost(executable: &str, extension_path: &str) -> Result<(), String> 
     Command::new(executable)
         .arg("--new-window")
         .arg(format!("--extensionDevelopmentPath={extension_path}"))
+        // Opening the development folder is intentional. Context Capsule is an
+        // installed extension in this host, so its own ExtensionMode remains
+        // Production; the workspace-loaded development extension is the stable
+        // signal used to identify this window and route the restore safely.
+        .arg(extension_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
