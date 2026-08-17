@@ -255,6 +255,9 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_dir() -> PathBuf {
         env::temp_dir().join(format!(
@@ -264,46 +267,52 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn request_and_completion_round_trip() {
+    fn with_runtime_dir(test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().expect("restore bus environment lock");
         let dir = temp_dir();
         unsafe { env::set_var("CONTEXT_CAPSULE_RESTORE_RUNTIME_DIR", &dir) };
-        let request = write_request("firefox", serde_json::json!({"schema_version": 1})).unwrap();
-        assert_eq!(read_request("firefox").unwrap().unwrap(), request);
-        complete_request(
-            "firefox",
-            &request.request_id,
-            true,
-            3,
-            1,
-            vec!["minor".to_owned()],
-            None,
-        )
-        .unwrap();
-        let completion = wait_for_completion(
-            "firefox",
-            &request.request_id,
-            Duration::from_millis(20),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(completion.ok);
-        assert_eq!(completion.changed, 3);
-        assert!(!request_path("firefox").unwrap().exists());
+        test();
         fs::remove_dir_all(dir).ok();
         unsafe { env::remove_var("CONTEXT_CAPSULE_RESTORE_RUNTIME_DIR") };
     }
 
     #[test]
+    fn request_and_completion_round_trip() {
+        with_runtime_dir(|| {
+            let request =
+                write_request("firefox", serde_json::json!({"schema_version": 1})).unwrap();
+            assert_eq!(read_request("firefox").unwrap().unwrap(), request);
+            complete_request(
+                "firefox",
+                &request.request_id,
+                true,
+                3,
+                1,
+                vec!["minor".to_owned()],
+                None,
+            )
+            .unwrap();
+            let completion = wait_for_completion(
+                "firefox",
+                &request.request_id,
+                Duration::from_millis(20),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(completion.ok);
+            assert_eq!(completion.changed, 3);
+            assert!(!request_path("firefox").unwrap().exists());
+        });
+    }
+
+    #[test]
     fn cancellation_only_removes_matching_request() {
-        let dir = temp_dir();
-        unsafe { env::set_var("CONTEXT_CAPSULE_RESTORE_RUNTIME_DIR", &dir) };
-        let request = write_request("vscode", serde_json::json!({})).unwrap();
-        assert!(!cancel_request("vscode", "other").unwrap());
-        assert!(request_path("vscode").unwrap().is_file());
-        assert!(cancel_request("vscode", &request.request_id).unwrap());
-        assert!(!request_path("vscode").unwrap().exists());
-        fs::remove_dir_all(dir).ok();
-        unsafe { env::remove_var("CONTEXT_CAPSULE_RESTORE_RUNTIME_DIR") };
+        with_runtime_dir(|| {
+            let request = write_request("vscode", serde_json::json!({})).unwrap();
+            assert!(!cancel_request("vscode", "other").unwrap());
+            assert!(request_path("vscode").unwrap().is_file());
+            assert!(cancel_request("vscode", &request.request_id).unwrap());
+            assert!(!request_path("vscode").unwrap().exists());
+        });
     }
 }
