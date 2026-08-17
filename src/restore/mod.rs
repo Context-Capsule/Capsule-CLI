@@ -1,4 +1,5 @@
 mod model;
+mod semantic;
 
 #[cfg(windows)]
 mod dpi;
@@ -61,39 +62,42 @@ impl RestoreReport {
 pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreReport {
     let mut report = RestoreReport::default();
 
-    let desktop = match SavedDesktop::from_capsule(snapshot) {
-        Ok(Some(desktop)) => desktop,
-        Ok(None) => {
-            report
-                .warnings
-                .push("capsule has no restorable desktop snapshot".to_owned());
-            return report;
-        }
-        Err(error) => {
-            report.failures.push(error);
-            return report;
-        }
-    };
+    match SavedDesktop::from_capsule(snapshot) {
+        Ok(Some(desktop)) => {
+            #[cfg(windows)]
+            {
+                let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
+                report.desktop = windows::restore_desktop(&desktop, options.dry_run);
+                if dpi_guard.is_none() {
+                    report.desktop.warnings.push(
+                        "could not switch the restore thread to Per-Monitor-V2 DPI awareness; placement may be less accurate on mixed-DPI displays"
+                            .to_owned(),
+                    );
+                }
+            }
 
-    #[cfg(windows)]
-    {
-        let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
-        report.desktop = windows::restore_desktop(&desktop, options.dry_run);
-        if dpi_guard.is_none() {
-            report.desktop.warnings.push(
-                "could not switch the restore thread to Per-Monitor-V2 DPI awareness; placement may be less accurate on mixed-DPI displays"
-                    .to_owned(),
-            );
+            #[cfg(not(windows))]
+            {
+                let _ = desktop;
+                report
+                    .warnings
+                    .push("desktop restore is currently implemented for Windows only".to_owned());
+            }
         }
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = (desktop, options);
-        report
+        Ok(None) => report
             .warnings
-            .push("desktop restore is currently implemented for Windows only".to_owned());
+            .push("capsule has no restorable desktop snapshot".to_owned()),
+        Err(error) => report
+            .failures
+            .push(format!("desktop restore metadata: {error}")),
     }
+
+    // Semantic adapters run after the desktop prerequisite pass. Each adapter is
+    // failure-isolated so a browser/editor/container problem cannot prevent the
+    // remaining resources from converging toward the saved capsule.
+    let semantic = semantic::restore(snapshot, options.dry_run);
+    report.warnings.extend(semantic.warnings);
+    report.failures.extend(semantic.failures);
 
     report
 }
@@ -122,12 +126,24 @@ mod tests {
     }
 
     #[test]
-    fn malformed_available_desktop_is_reported() {
+    fn malformed_available_desktop_is_reported_without_panicking() {
         let report = restore_snapshot(
             &json!({ "desktop": { "status": "available", "applications": "wrong" } }),
             RestoreOptions { dry_run: true },
         );
         assert!(!report.success());
         assert_eq!(report.failures.len(), 1);
+    }
+
+    #[test]
+    fn semantic_dry_run_does_not_require_a_desktop_snapshot() {
+        let report = restore_snapshot(
+            &json!({
+                "browsers": { "firefox": { "schema_version": 1, "browser": "firefox" } }
+            }),
+            RestoreOptions { dry_run: true },
+        );
+        assert!(report.success());
+        assert!(report.warnings.iter().any(|warning| warning.contains("Firefox semantic restore")));
     }
 }
