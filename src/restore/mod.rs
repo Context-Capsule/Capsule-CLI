@@ -68,14 +68,15 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     let mut report = RestoreReport::default();
     let mut full_desktop = None;
     let defer_windows_terminal = should_defer_windows_terminal(snapshot);
+    let defer_vscode_devhost = should_defer_vscode_devhost(snapshot);
 
     match SavedDesktop::from_capsule(snapshot) {
         Ok(Some(desktop)) => {
-            let prerequisite = if defer_windows_terminal {
-                desktop_without_windows_terminal(&desktop)
-            } else {
-                desktop.clone()
-            };
+            let prerequisite = desktop_without_semantic_owned_hosts(
+                &desktop,
+                defer_windows_terminal,
+                defer_vscode_devhost,
+            );
 
             #[cfg(windows)]
             {
@@ -104,6 +105,12 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                         .to_owned(),
                 );
             }
+            if defer_vscode_devhost {
+                report.warnings.push(
+                    "VS Code Extension Development Host startup is delegated to its semantic adapter so restore does not create an extra normal Code window first"
+                        .to_owned(),
+                );
+            }
             full_desktop = Some(desktop);
         }
         Ok(None) => report
@@ -114,10 +121,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             .push(format!("desktop restore metadata: {error}")),
     }
 
-    // A saved Extension Development Host is special: the Context Capsule extension
-    // only exists inside that development host, so a generic Code.exe window cannot
-    // consume the restore request. New capsules persist the extension development path
-    // and we recreate the correct host before sending semantic work to it.
     let mut semantic_snapshot = snapshot.clone();
     #[cfg(windows)]
     {
@@ -129,15 +132,10 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
         report.failures.extend(preparation.failures);
     }
 
-    // Semantic adapters run after the prerequisite desktop pass. Each adapter is
-    // failure-isolated so one browser/editor/container problem cannot stop the rest.
     let semantic = semantic::restore(&semantic_snapshot, options.dry_run);
     report.warnings.extend(semantic.warnings);
     report.failures.extend(semantic.failures);
 
-    // Explorer folder locations are captured separately from generic desktop geometry.
-    // This avoids confusing the always-running Windows shell process with a folder
-    // window that actually needs to be reopened.
     let explorer = crate::explorer::restore_from_capsule(snapshot, options.dry_run);
     if options.dry_run && explorer.planned_to_open > 0 {
         report.warnings.push(format!(
@@ -153,11 +151,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     report.warnings.extend(explorer.warnings);
     report.failures.extend(explorer.failures);
 
-    // Some desktop applications (notably packaged messaging apps) leave a background
-    // process alive after their last visible window closes. A process-only check would
-    // incorrectly consider those apps restored. Reactivate only saved apps that still
-    // have a matching process but no visible top-level window, then let the final pass
-    // place the resulting window.
     #[cfg(windows)]
     if !options.dry_run {
         if let Some(desktop) = full_desktop.as_ref() {
@@ -168,9 +161,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
         }
     }
 
-    // Semantic adapters and reactivation can materialize the windows that should
-    // actually be placed. Re-run the convergent desktop pass so geometry targets the
-    // final browser/editor/terminal/Explorer/app windows rather than bootstrap hosts.
     #[cfg(windows)]
     if !options.dry_run {
         if let Some(desktop) = full_desktop.as_ref() {
@@ -203,17 +193,66 @@ fn should_defer_windows_terminal(snapshot: &Value) -> bool {
         .is_some_and(|sessions| {
             sessions.iter().any(|session| {
                 session.get("host").and_then(Value::as_str) == Some("windows-terminal")
-                    && session.get("restart").is_some_and(|restart| !restart.is_null())
+                    && session
+                        .get("restart")
+                        .is_some_and(|restart| !restart.is_null())
             })
         })
 }
 
-fn desktop_without_windows_terminal(desktop: &SavedDesktop) -> SavedDesktop {
+fn should_defer_vscode_devhost(snapshot: &Value) -> bool {
+    if snapshot
+        .pointer("/editors/vscode/extensionMode")
+        .and_then(Value::as_str)
+        == Some("development")
+    {
+        return true;
+    }
+
+    snapshot
+        .pointer("/desktop/applications")
+        .and_then(Value::as_array)
+        .is_some_and(|applications| {
+            applications.iter().any(|application| {
+                application
+                    .get("windows")
+                    .and_then(Value::as_array)
+                    .is_some_and(|windows| {
+                        windows.iter().any(|window| {
+                            window
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .is_some_and(is_vscode_devhost_title)
+                        })
+                    })
+            })
+        })
+}
+
+fn desktop_without_semantic_owned_hosts(
+    desktop: &SavedDesktop,
+    defer_windows_terminal: bool,
+    defer_vscode_devhost: bool,
+) -> SavedDesktop {
     let mut filtered = desktop.clone();
+    filtered.applications.retain(|application| {
+        !(defer_windows_terminal && is_windows_terminal_application(application))
+            && !(defer_vscode_devhost && is_vscode_devhost_application(application))
+    });
     filtered
-        .applications
-        .retain(|application| !is_windows_terminal_application(application));
-    filtered
+}
+
+fn is_vscode_devhost_title(title: &str) -> bool {
+    title
+        .to_ascii_lowercase()
+        .contains("extension development host")
+}
+
+fn is_vscode_devhost_application(application: &SavedApplication) -> bool {
+    application
+        .windows
+        .iter()
+        .any(|window| is_vscode_devhost_title(&window.title))
 }
 
 fn is_windows_terminal_application(application: &SavedApplication) -> bool {
@@ -286,12 +325,10 @@ mod tests {
             RestoreOptions { dry_run: true },
         );
         assert!(report.success());
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("Firefox semantic restore"))
-        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Firefox semantic restore")));
     }
 
     #[test]
@@ -308,6 +345,21 @@ mod tests {
             "terminals": {
                 "sessions": [{ "host": "windows-terminal", "restart": null }]
             }
+        })));
+    }
+
+    #[test]
+    fn vscode_devhost_is_deferred_for_new_and_legacy_capsules() {
+        assert!(should_defer_vscode_devhost(&json!({
+            "editors": { "vscode": { "extensionMode": "development" } }
+        })));
+        assert!(should_defer_vscode_devhost(&json!({
+            "desktop": { "applications": [{
+                "windows": [{ "title": "project - Visual Studio Code [Extension Development Host]" }]
+            }] }
+        })));
+        assert!(!should_defer_vscode_devhost(&json!({
+            "editors": { "vscode": { "extensionMode": "production" } }
         })));
     }
 
