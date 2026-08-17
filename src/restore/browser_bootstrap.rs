@@ -96,7 +96,9 @@ fn safe_zen_executable(application: &SavedApplication) -> Option<&str> {
 }
 
 fn executable_basename(path: &str) -> Option<&str> {
-    path.rsplit(['\\', '/']).next().filter(|name| !name.is_empty())
+    path.rsplit(['\\', '/'])
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 #[cfg(test)]
