@@ -447,6 +447,7 @@ mod tests {
     #[test]
     fn semantic_browser_snapshot_owns_zen_and_firefox_desktop_apps() {
         let desktop = SavedDesktop {
+            status: "available".to_owned(),
             displays: Vec::new(),
             applications: vec![
                 application("zen", Some(r"C:\Program Files\Zen Browser\zen.exe")),
