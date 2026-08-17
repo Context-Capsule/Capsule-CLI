@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZenBootstrapReport {
+    pub already_running: bool,
     pub planned: bool,
     pub launched: bool,
     pub warnings: Vec<String>,
@@ -20,7 +21,10 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
     };
 
     match crate::desktop::application_running_by_executable_name(&["zen.exe", "zen"]) {
-        Ok(true) => return report,
+        Ok(true) => {
+            report.already_running = true;
+            return report;
+        }
         Ok(false) => {}
         Err(error) => {
             report.failures.push(format!(
