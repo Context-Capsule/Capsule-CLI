@@ -10,6 +10,7 @@ use std::{
 pub const VSCODE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const LIVE_STATE_MAX_AGE: Duration = Duration::from_secs(90);
 const MAX_TABS: usize = 100_000;
+const MAX_EXTENSION_PATH_LENGTH: usize = 32_768;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +68,10 @@ pub struct VsCodeSnapshot {
     pub app_host: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension_path: Option<String>,
     pub workspace_trusted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_file: Option<String>,
@@ -80,6 +85,10 @@ pub struct VsCodeSnapshot {
 impl VsCodeSnapshot {
     pub fn tab_count(&self) -> usize {
         self.tab_groups.iter().map(|group| group.tabs.len()).sum()
+    }
+
+    pub fn is_extension_development_host(&self) -> bool {
+        self.extension_mode.as_deref() == Some("development") && self.extension_path.is_some()
     }
 }
 
@@ -197,6 +206,15 @@ fn validate_snapshot(snapshot: &VsCodeSnapshot) -> Result<(), VsCodeError> {
             "VS Code snapshot contains too many tabs".to_owned(),
         ));
     }
+    if snapshot
+        .extension_path
+        .as_ref()
+        .is_some_and(|path| path.len() > MAX_EXTENSION_PATH_LENGTH)
+    {
+        return Err(VsCodeError::Invalid(
+            "VS Code extension development path is unreasonably long".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -231,6 +249,8 @@ mod tests {
             app_name: "Visual Studio Code".to_owned(),
             app_host: "desktop".to_owned(),
             remote_name: Some("wsl".to_owned()),
+            extension_mode: Some("development".to_owned()),
+            extension_path: Some(r"C:\work\Capsule-VSCode-Extension".to_owned()),
             workspace_trusted: true,
             workspace_file: None,
             workspace_folders: vec![WorkspaceFolderSnapshot {
@@ -260,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_recent_state_and_preserves_remote_uris() {
+    fn reads_recent_state_and_preserves_remote_uris_and_devhost_identity() {
         let path = test_path();
         let envelope = RuntimeEnvelope {
             updated_at_unix_ms: now_unix_ms(),
@@ -271,6 +291,7 @@ mod tests {
         validate_snapshot(&loaded.snapshot).unwrap();
         assert_eq!(loaded.snapshot.remote_name.as_deref(), Some("wsl"));
         assert_eq!(loaded.snapshot.tab_count(), 1);
+        assert!(loaded.snapshot.is_extension_development_host());
         fs::remove_file(path).ok();
     }
 
