@@ -3,11 +3,14 @@ use serde_json::Value;
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const RESTORE_BUS_SCHEMA_VERSION: u32 = 1;
+const MAX_REQUEST_AGE_MS: i64 = 60_000;
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RestoreRequest {
@@ -42,19 +45,19 @@ pub fn write_request(adapter: &str, payload: Value) -> io::Result<RestoreRequest
         created_at_unix_ms: now_unix_ms(),
         payload,
     };
-    let path = request_path(adapter)?;
-    atomic_write_json(&path, &request)?;
+
     let result = completion_path(adapter)?;
     if result.is_file() {
         let _ = fs::remove_file(result);
     }
+    atomic_write_json(&request_path(adapter)?, &request)?;
     Ok(request)
 }
 
 pub fn read_request(adapter: &str) -> io::Result<Option<RestoreRequest>> {
     validate_adapter(adapter)?;
     let path = request_path(adapter)?;
-    let bytes = match fs::read(path) {
+    let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -66,7 +69,27 @@ pub fn read_request(adapter: &str) -> io::Result<Option<RestoreRequest>> {
             format!("invalid {adapter} restore request envelope"),
         ));
     }
+    if now_unix_ms().saturating_sub(request.created_at_unix_ms) > MAX_REQUEST_AGE_MS {
+        let _ = fs::remove_file(path);
+        return Ok(None);
+    }
     Ok(Some(request))
+}
+
+pub fn cancel_request(adapter: &str, request_id: &str) -> io::Result<bool> {
+    validate_adapter(adapter)?;
+    let path = request_path(adapter)?;
+    let Some(request) = read_request(adapter)? else {
+        return Ok(false);
+    };
+    if request.request_id != request_id {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn complete_request(
@@ -217,7 +240,8 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 }
 
 fn next_request_id(adapter: &str) -> String {
-    format!("{adapter}-{}-{}", std::process::id(), now_unix_ms())
+    let sequence = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{adapter}-{}-{}-{sequence}", std::process::id(), now_unix_ms())
 }
 
 fn now_unix_ms() -> i64 {
@@ -266,6 +290,19 @@ mod tests {
         assert!(completion.ok);
         assert_eq!(completion.changed, 3);
         assert!(!request_path("firefox").unwrap().exists());
+        fs::remove_dir_all(dir).ok();
+        unsafe { env::remove_var("CONTEXT_CAPSULE_RESTORE_RUNTIME_DIR") };
+    }
+
+    #[test]
+    fn cancellation_only_removes_matching_request() {
+        let dir = temp_dir();
+        unsafe { env::set_var("CONTEXT_CAPSULE_RESTORE_RUNTIME_DIR", &dir) };
+        let request = write_request("vscode", serde_json::json!({})).unwrap();
+        assert!(!cancel_request("vscode", "other").unwrap());
+        assert!(request_path("vscode").unwrap().is_file());
+        assert!(cancel_request("vscode", &request.request_id).unwrap());
+        assert!(!request_path("vscode").unwrap().exists());
         fs::remove_dir_all(dir).ok();
         unsafe { env::remove_var("CONTEXT_CAPSULE_RESTORE_RUNTIME_DIR") };
     }
