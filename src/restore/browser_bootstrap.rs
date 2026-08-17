@@ -1,5 +1,5 @@
 use super::{SavedApplication, SavedDesktop};
-use std::{path::Path, process::{Command, Stdio}};
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZenBootstrapReport {
@@ -11,7 +11,11 @@ pub struct ZenBootstrapReport {
 
 pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapReport {
     let mut report = ZenBootstrapReport::default();
-    let Some(application) = saved.applications.iter().find(|application| is_zen_application(application)) else {
+    let Some(application) = saved
+        .applications
+        .iter()
+        .find(|application| is_zen_application(application))
+    else {
         return report;
     };
 
@@ -70,7 +74,9 @@ fn is_zen_application(application: &SavedApplication) -> bool {
         .as_deref()
         .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
         .and_then(executable_basename)
-        .is_some_and(|name| name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen"))
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen")
+        })
         || application.name.eq_ignore_ascii_case("zen")
         || application.name.eq_ignore_ascii_case("Zen Browser")
 }
@@ -86,10 +92,7 @@ fn safe_zen_executable(application: &SavedApplication) -> Option<&str> {
 }
 
 fn executable_basename(path: &str) -> Option<&str> {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .or_else(|| path.rsplit(['\\', '/']).next())
+    path.rsplit(['\\', '/']).next().filter(|name| !name.is_empty())
 }
 
 #[cfg(test)]
