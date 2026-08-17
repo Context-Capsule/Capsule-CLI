@@ -1,6 +1,6 @@
 pub mod adapters;
 pub mod browser;
-pub mod desktop;
+mod desktop;
 pub mod explorer;
 pub mod persistence;
 pub mod restore;
