@@ -119,9 +119,7 @@ fn launch_devhost(executable: &str, extension_path: &str) -> Result<(), String> 
 }
 
 fn saved_code_executable(snapshot: &Value) -> Option<String> {
-    let applications = snapshot
-        .pointer("/desktop/applications")?
-        .as_array()?;
+    let applications = snapshot.pointer("/desktop/applications")?.as_array()?;
 
     applications
         .iter()
@@ -146,7 +144,9 @@ fn application_executable(application: &Value) -> Option<String> {
         .or_else(|| {
             application
                 .get("launch")
-                .filter(|launch| launch.get("strategy").and_then(Value::as_str) == Some("executable"))
+                .filter(|launch| {
+                    launch.get("strategy").and_then(Value::as_str) == Some("executable")
+                })
                 .and_then(|launch| launch.get("target"))
                 .and_then(Value::as_str)
         })
@@ -245,7 +245,12 @@ mod tests {
         suppress_vscode_semantic(&mut snapshot);
         assert!(snapshot.pointer("/editors/vscode").unwrap().is_null());
         assert_eq!(
-            snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap().len(),
+            snapshot
+                .pointer("/terminals/sessions")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
     }
