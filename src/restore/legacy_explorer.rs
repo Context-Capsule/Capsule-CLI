@@ -1,6 +1,10 @@
 use crate::explorer::{self, ExplorerStatus};
 use serde_json::Value;
-use std::{process::{Command, Stdio}, thread, time::Duration};
+use std::{
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 const LAUNCH_SPACING: Duration = Duration::from_millis(120);
 
@@ -118,13 +122,11 @@ fn is_explorer_application(application: &Value) -> bool {
 }
 
 fn is_home_title(title: &str) -> bool {
-    let normalized = title
-        .trim()
-        .to_ascii_lowercase()
+    let normalized = title.trim().to_ascii_lowercase();
+    let normalized = normalized
         .strip_suffix(" - file explorer")
-        .unwrap_or(&title.trim().to_ascii_lowercase())
-        .trim()
-        .to_owned();
+        .unwrap_or(&normalized)
+        .trim();
     normalized == "home" || normalized == "quick access"
 }
 
