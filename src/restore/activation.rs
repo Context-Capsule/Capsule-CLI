@@ -155,10 +155,7 @@ fn wait_for_visible_window(application: &SavedApplication) -> bool {
     }
 }
 
-fn matching_pids(
-    application: &SavedApplication,
-    processes: &[CurrentProcess],
-) -> HashSet<u32> {
+fn matching_pids(application: &SavedApplication, processes: &[CurrentProcess]) -> HashSet<u32> {
     processes
         .iter()
         .filter(|process| process_matches(application, process))
@@ -329,36 +326,54 @@ fn query_app_user_model_id(process: Handle) -> Option<String> {
 }
 
 fn process_matches(application: &SavedApplication, process: &CurrentProcess) -> bool {
+    let mut has_strong_identity = false;
+
     if let Some(saved) = application.app_user_model_id.as_deref() {
-        return process
+        has_strong_identity = true;
+        if process
             .app_user_model_id
             .as_deref()
-            .is_some_and(|current| current.eq_ignore_ascii_case(saved));
+            .is_some_and(|current| current.eq_ignore_ascii_case(saved))
+        {
+            return true;
+        }
     }
 
     if let Some(saved) = application.executable_path.as_deref() {
-        return process
-            .executable_path
-            .as_deref()
-            .is_some_and(|current| normalize_windows_path(current) == normalize_windows_path(saved));
+        has_strong_identity = true;
+        if process.executable_path.as_deref().is_some_and(|current| {
+            normalize_windows_path(current) == normalize_windows_path(saved)
+        }) {
+            return true;
+        }
     }
 
     if let Some(launch) = application.launch.as_ref() {
         match launch.strategy.as_str() {
             "app-user-model-id" => {
-                return process
+                has_strong_identity = true;
+                if process
                     .app_user_model_id
                     .as_deref()
-                    .is_some_and(|current| current.eq_ignore_ascii_case(&launch.target));
+                    .is_some_and(|current| current.eq_ignore_ascii_case(&launch.target))
+                {
+                    return true;
+                }
             }
             "executable" => {
-                return process
-                    .executable_path
-                    .as_deref()
-                    .is_some_and(|current| normalize_windows_path(current) == normalize_windows_path(&launch.target));
+                has_strong_identity = true;
+                if process.executable_path.as_deref().is_some_and(|current| {
+                    normalize_windows_path(current) == normalize_windows_path(&launch.target)
+                }) {
+                    return true;
+                }
             }
             _ => {}
         }
+    }
+
+    if has_strong_identity {
+        return false;
     }
 
     process
@@ -432,5 +447,26 @@ mod tests {
         };
         let names = candidate_executable_names(&[application]);
         assert!(names.contains("whatsapp.exe"));
+    }
+
+    #[test]
+    fn process_matching_falls_back_from_unavailable_aumid_to_exact_path() {
+        let application = SavedApplication {
+            name: "WhatsApp".to_owned(),
+            executable_path: Some(r"C:\Apps\WhatsApp.exe".to_owned()),
+            app_user_model_id: Some("WhatsApp_123!App".to_owned()),
+            file_version: None,
+            classification: "user-application".to_owned(),
+            launch: None,
+            windows: Vec::new(),
+            discovered_as_background: false,
+        };
+        let process = CurrentProcess {
+            pid: 41,
+            exe_name: "WhatsApp.exe".to_owned(),
+            executable_path: Some(r"c:\apps\whatsapp.exe".to_owned()),
+            app_user_model_id: None,
+        };
+        assert!(process_matches(&application, &process));
     }
 }
