@@ -11,6 +11,8 @@ pub const VSCODE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const LIVE_STATE_MAX_AGE: Duration = Duration::from_secs(90);
 const MAX_TABS: usize = 100_000;
 const MAX_EXTENSION_PATH_LENGTH: usize = 32_768;
+const VSCODE_HOST_STATE_PREFIX: &str = "vscode-host-";
+const VSCODE_HOST_STATE_SUFFIX: &str = ".json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,18 +131,48 @@ impl From<serde_json::Error> for VsCodeError {
 }
 
 pub fn load_recent_vscode_state() -> Result<Option<VsCodeSnapshot>, VsCodeError> {
-    let path = runtime_state_path()?;
-    let envelope = match read_runtime_state_at(&path) {
-        Ok(envelope) => envelope,
-        Err(VsCodeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let age_ms = now_unix_ms().saturating_sub(envelope.updated_at_unix_ms);
-    if age_ms > LIVE_STATE_MAX_AGE.as_millis() as i64 {
-        return Ok(None);
+    let canonical = runtime_state_path()?;
+    let mut best: Option<RuntimeEnvelope> = None;
+    let mut canonical_error: Option<VsCodeError> = None;
+
+    for path in runtime_state_candidates(&canonical) {
+        let envelope = match read_runtime_state_at(&path) {
+            Ok(envelope) => envelope,
+            Err(VsCodeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                if path == canonical {
+                    canonical_error = Some(error);
+                }
+                continue;
+            }
+        };
+
+        let age_ms = now_unix_ms().saturating_sub(envelope.updated_at_unix_ms);
+        if age_ms > LIVE_STATE_MAX_AGE.as_millis() as i64 {
+            continue;
+        }
+        if let Err(error) = validate_snapshot(&envelope.snapshot) {
+            if path == canonical {
+                canonical_error = Some(error);
+            }
+            continue;
+        }
+
+        if best
+            .as_ref()
+            .is_none_or(|current| runtime_envelope_preferred(&envelope, current))
+        {
+            best = Some(envelope);
+        }
     }
-    validate_snapshot(&envelope.snapshot)?;
-    Ok(Some(envelope.snapshot))
+
+    if let Some(envelope) = best {
+        return Ok(Some(envelope.snapshot));
+    }
+    if let Some(error) = canonical_error {
+        return Err(error);
+    }
+    Ok(None)
 }
 
 pub fn runtime_state_path() -> Result<PathBuf, VsCodeError> {
@@ -190,8 +222,51 @@ pub fn runtime_state_path() -> Result<PathBuf, VsCodeError> {
     }
 }
 
+fn runtime_state_candidates(canonical: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![canonical.to_path_buf()];
+    let Some(parent) = canonical.parent() else {
+        return candidates;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return candidates;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(VSCODE_HOST_STATE_PREFIX) && name.ends_with(VSCODE_HOST_STATE_SUFFIX) {
+            candidates.push(entry.path());
+        }
+    }
+    candidates
+}
+
 fn read_runtime_state_at(path: &Path) -> Result<RuntimeEnvelope, VsCodeError> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn runtime_envelope_preferred(candidate: &RuntimeEnvelope, current: &RuntimeEnvelope) -> bool {
+    let candidate_key = (
+        snapshot_priority(&candidate.snapshot),
+        candidate.updated_at_unix_ms,
+        candidate.snapshot.captured_at_unix_ms,
+    );
+    let current_key = (
+        snapshot_priority(&current.snapshot),
+        current.updated_at_unix_ms,
+        current.snapshot.captured_at_unix_ms,
+    );
+    candidate_key > current_key
+}
+
+fn snapshot_priority(snapshot: &VsCodeSnapshot) -> u8 {
+    match snapshot.extension_mode.as_deref() {
+        Some("development") if snapshot.extension_path.is_some() => 4,
+        Some("production") => 3,
+        Some("test") => 2,
+        Some("development") => 1,
+        _ => 0,
+    }
 }
 
 fn validate_snapshot(snapshot: &VsCodeSnapshot) -> Result<(), VsCodeError> {
@@ -293,6 +368,48 @@ mod tests {
         assert_eq!(loaded.snapshot.tab_count(), 1);
         assert!(loaded.snapshot.is_extension_development_host());
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn development_host_state_wins_over_a_newer_production_writer() {
+        let mut production = snapshot();
+        production.extension_mode = Some("production".to_owned());
+        production.extension_path = None;
+        let production = RuntimeEnvelope {
+            updated_at_unix_ms: 200,
+            snapshot: production,
+        };
+        let development = RuntimeEnvelope {
+            updated_at_unix_ms: 100,
+            snapshot: snapshot(),
+        };
+        assert!(runtime_envelope_preferred(&development, &production));
+        assert!(!runtime_envelope_preferred(&production, &development));
+    }
+
+    #[test]
+    fn candidate_scan_includes_per_host_sidecars() {
+        let directory = env::temp_dir().join(format!(
+            "context-capsule-vscode-candidates-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let canonical = directory.join("vscode.json");
+        let sidecar = directory.join("vscode-host-123.json");
+        let unrelated = directory.join("other.json");
+        fs::write(&canonical, b"{}").unwrap();
+        fs::write(&sidecar, b"{}").unwrap();
+        fs::write(&unrelated, b"{}").unwrap();
+
+        let candidates = runtime_state_candidates(&canonical);
+        assert!(candidates.contains(&canonical));
+        assert!(candidates.contains(&sidecar));
+        assert!(!candidates.contains(&unrelated));
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]
