@@ -117,31 +117,10 @@ pub enum ApplicationClassification {
     Unknown,
 }
 
-impl ApplicationClassification {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::UserApplication => "user-application",
-            Self::ApplicationHelper => "application-helper",
-            Self::ShellComponent => "shell-component",
-            Self::BackgroundService => "background-service",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchStrategy {
     Executable,
     AppUserModelId,
-}
-
-impl LaunchStrategy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Executable => "executable",
-            Self::AppUserModelId => "app-user-model-id",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +194,7 @@ pub struct DesktopSnapshot {
 }
 
 impl DesktopSnapshot {
+    #[cfg(test)]
     pub fn virtual_desktops(&self) -> Vec<(String, Option<bool>, usize)> {
         let mut result: Vec<(String, Option<bool>, usize)> = Vec::new();
 
