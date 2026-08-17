@@ -6,6 +6,8 @@ mod activation;
 #[cfg(windows)]
 mod dpi;
 #[cfg(windows)]
+mod legacy_explorer;
+#[cfg(windows)]
 mod vscode_devhost;
 #[cfg(windows)]
 #[allow(dead_code)]
@@ -132,6 +134,19 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
         report.failures.extend(preparation.failures);
     }
 
+    let orphaned_vscode_terminals = suppress_orphan_vscode_semantic(&mut semantic_snapshot);
+    if orphaned_vscode_terminals > 0 {
+        report.warnings.push(format!(
+            "VS Code semantic restore skipped {orphaned_vscode_terminals} integrated terminal session(s) because this capsule contains no VS Code editor snapshot to identify a target extension host; legacy terminal metadata alone cannot be routed safely"
+        ));
+    }
+    if !has_vscode_editor_snapshot(snapshot) && saved_desktop_mentions_devhost(snapshot) {
+        report.warnings.push(
+            "VS Code restore: the capsule contains an Extension Development Host window but no semantic editor snapshot. Its open editor tabs were not captured in this capsule, so they cannot be reconstructed exactly; re-save once with the updated VS Code extension to preserve them."
+                .to_owned(),
+        );
+    }
+
     let semantic = semantic::restore(&semantic_snapshot, options.dry_run);
     report.warnings.extend(semantic.warnings);
     report.failures.extend(semantic.failures);
@@ -150,6 +165,24 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     }
     report.warnings.extend(explorer.warnings);
     report.failures.extend(explorer.failures);
+
+    #[cfg(windows)]
+    {
+        let legacy_explorer = legacy_explorer::restore(snapshot, options.dry_run);
+        if options.dry_run && legacy_explorer.planned > 0 {
+            report.warnings.push(format!(
+                "Legacy Explorer restore: would open {} safe Home/Quick access window(s)",
+                legacy_explorer.planned
+            ));
+        } else if legacy_explorer.opened > 0 {
+            report.warnings.push(format!(
+                "Legacy Explorer restore: opened {} safe Home/Quick access window(s)",
+                legacy_explorer.opened
+            ));
+        }
+        report.warnings.extend(legacy_explorer.warnings);
+        report.failures.extend(legacy_explorer.failures);
+    }
 
     #[cfg(windows)]
     if !options.dry_run {
@@ -200,15 +233,49 @@ fn should_defer_windows_terminal(snapshot: &Value) -> bool {
         })
 }
 
+fn has_vscode_editor_snapshot(snapshot: &Value) -> bool {
+    snapshot
+        .pointer("/editors/vscode")
+        .is_some_and(|value| !value.is_null())
+}
+
+fn suppress_orphan_vscode_semantic(snapshot: &mut Value) -> usize {
+    if has_vscode_editor_snapshot(snapshot) {
+        return 0;
+    }
+
+    let Some(sessions) = snapshot
+        .pointer_mut("/terminals/sessions")
+        .and_then(Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let before = sessions.len();
+    sessions.retain(|session| {
+        session.get("host").and_then(Value::as_str) != Some("visual-studio-code")
+    });
+    before.saturating_sub(sessions.len())
+}
+
 fn should_defer_vscode_devhost(snapshot: &Value) -> bool {
-    if snapshot
-        .pointer("/editors/vscode/extensionMode")
+    let editor = snapshot
+        .pointer("/editors/vscode")
+        .filter(|value| !value.is_null());
+    if editor
+        .and_then(|value| value.get("extensionMode"))
         .and_then(Value::as_str)
         == Some("development")
     {
         return true;
     }
 
+    // A legacy window title is only actionable when a semantic editor snapshot
+    // exists. Deferring an entire Code application without editor data can leave
+    // the restore with no component responsible for starting or targeting it.
+    editor.is_some() && saved_desktop_mentions_devhost(snapshot)
+}
+
+fn saved_desktop_mentions_devhost(snapshot: &Value) -> bool {
     snapshot
         .pointer("/desktop/applications")
         .and_then(Value::as_array)
@@ -349,18 +416,50 @@ mod tests {
     }
 
     #[test]
-    fn vscode_devhost_is_deferred_for_new_and_legacy_capsules() {
+    fn vscode_devhost_is_deferred_only_when_semantic_editor_state_can_target_it() {
         assert!(should_defer_vscode_devhost(&json!({
             "editors": { "vscode": { "extensionMode": "development" } }
         })));
         assert!(should_defer_vscode_devhost(&json!({
+            "editors": { "vscode": { "schemaVersion": 1 } },
             "desktop": { "applications": [{
                 "windows": [{ "title": "project - Visual Studio Code [Extension Development Host]" }]
             }] }
         })));
         assert!(!should_defer_vscode_devhost(&json!({
-            "editors": { "vscode": { "extensionMode": "production" } }
+            "editors": { "vscode": null },
+            "desktop": { "applications": [{
+                "windows": [{ "title": "project - Visual Studio Code [Extension Development Host]" }]
+            }] }
         })));
+    }
+
+    #[test]
+    fn orphan_vscode_terminals_are_removed_without_touching_external_sessions() {
+        let mut snapshot = json!({
+            "editors": { "vscode": null },
+            "terminals": {
+                "sessions": [
+                    { "host": "visual-studio-code" },
+                    { "host": "visual-studio-code" },
+                    { "host": "windows-terminal" }
+                ]
+            }
+        });
+        assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 2);
+        let sessions = snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["host"], "windows-terminal");
+    }
+
+    #[test]
+    fn vscode_terminals_remain_when_editor_snapshot_exists() {
+        let mut snapshot = json!({
+            "editors": { "vscode": { "schemaVersion": 1 } },
+            "terminals": { "sessions": [{ "host": "visual-studio-code" }] }
+        });
+        assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 0);
+        assert_eq!(snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap().len(), 1);
     }
 
     #[test]
