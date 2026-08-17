@@ -18,6 +18,23 @@ pub fn discover() -> Result<DesktopSnapshot, String> {
     Err("desktop discovery is currently supported on Windows only".to_owned())
 }
 
+pub(crate) fn application_running_by_executable_name(
+    executable_names: &[&str],
+) -> Result<bool, String> {
+    let snapshot = discover()?;
+    Ok(snapshot.applications.iter().any(|application| {
+        application
+            .executable_path
+            .as_deref()
+            .and_then(|path| path.rsplit(['\\', '/']).next())
+            .is_some_and(|name| {
+                executable_names
+                    .iter()
+                    .any(|expected| name.eq_ignore_ascii_case(expected))
+            })
+    }))
+}
+
 fn annotate_direct_application_owners(snapshot: &mut DesktopSnapshot) {
     let applications = &snapshot.applications;
 
