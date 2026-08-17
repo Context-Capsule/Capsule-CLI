@@ -69,9 +69,9 @@ pub fn restore(snapshot: &Value, dry_run: bool) -> LegacyExplorerReport {
             .spawn()
         {
             Ok(_) => report.opened += 1,
-            Err(error) => report
-                .failures
-                .push(format!("Legacy Explorer Home window could not be opened: {error}")),
+            Err(error) => report.failures.push(format!(
+                "Legacy Explorer Home window could not be opened: {error}"
+            )),
         }
         if index + 1 < report.planned {
             thread::sleep(LAUNCH_SPACING);
@@ -108,7 +108,11 @@ fn is_explorer_application(application: &Value) -> bool {
     application
         .get("executable_path")
         .and_then(Value::as_str)
-        .or_else(|| application.pointer("/launch/target").and_then(Value::as_str))
+        .or_else(|| {
+            application
+                .pointer("/launch/target")
+                .and_then(Value::as_str)
+        })
         .is_some_and(|value| {
             value
                 .rsplit(['\\', '/'])
