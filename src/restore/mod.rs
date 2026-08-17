@@ -2,8 +2,15 @@ mod model;
 mod semantic;
 
 #[cfg(windows)]
+mod activation;
+#[cfg(windows)]
 mod dpi;
 #[cfg(windows)]
+mod legacy_explorer;
+#[cfg(windows)]
+mod vscode_devhost;
+#[cfg(windows)]
+#[allow(dead_code)]
 mod windows;
 
 use serde_json::Value;
@@ -63,21 +70,20 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     let mut report = RestoreReport::default();
     let mut full_desktop = None;
     let defer_windows_terminal = should_defer_windows_terminal(snapshot);
+    let defer_vscode_devhost = should_defer_vscode_devhost(snapshot);
 
     match SavedDesktop::from_capsule(snapshot) {
         Ok(Some(desktop)) => {
-            let prerequisite = if defer_windows_terminal {
-                desktop_without_windows_terminal(&desktop)
-            } else {
-                desktop.clone()
-            };
+            let prerequisite = desktop_without_semantic_owned_hosts(
+                &desktop,
+                defer_windows_terminal,
+                defer_vscode_devhost,
+            );
 
             #[cfg(windows)]
             {
                 let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
                 report.desktop = windows::restore_desktop(&prerequisite, options.dry_run);
-                // The user-facing total remains the complete capsule even when Windows
-                // Terminal startup is intentionally delegated to the terminal adapter.
                 report.desktop.applications_total = desktop.applications.len();
                 if dpi_guard.is_none() {
                     report.desktop.warnings.push(
@@ -101,6 +107,12 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                         .to_owned(),
                 );
             }
+            if defer_vscode_devhost {
+                report.warnings.push(
+                    "VS Code Extension Development Host startup is delegated to its semantic adapter so restore does not create an extra normal Code window first"
+                        .to_owned(),
+                );
+            }
             full_desktop = Some(desktop);
         }
         Ok(None) => report
@@ -111,19 +123,77 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             .push(format!("desktop restore metadata: {error}")),
     }
 
-    // Semantic adapters run after the prerequisite desktop pass. Each adapter is
-    // failure-isolated so a browser/editor/container problem cannot prevent the
-    // remaining resources from converging toward the saved capsule.
-    let semantic = semantic::restore(snapshot, options.dry_run);
+    let mut semantic_snapshot = snapshot.clone();
+    #[cfg(windows)]
+    {
+        let preparation = vscode_devhost::prepare(snapshot, options.dry_run);
+        if preparation.skip_vscode_semantic_restore {
+            vscode_devhost::suppress_vscode_semantic(&mut semantic_snapshot);
+        }
+        report.warnings.extend(preparation.warnings);
+        report.failures.extend(preparation.failures);
+    }
+
+    let orphaned_vscode_terminals = suppress_orphan_vscode_semantic(&mut semantic_snapshot);
+    if orphaned_vscode_terminals > 0 {
+        report.warnings.push(format!(
+            "VS Code semantic restore skipped {orphaned_vscode_terminals} integrated terminal session(s) because this capsule contains no VS Code editor snapshot to identify a target extension host; legacy terminal metadata alone cannot be routed safely"
+        ));
+    }
+    if !has_vscode_editor_snapshot(snapshot) && saved_desktop_mentions_devhost(snapshot) {
+        report.warnings.push(
+            "VS Code restore: the capsule contains an Extension Development Host window but no semantic editor snapshot. Its open editor tabs were not captured in this capsule, so they cannot be reconstructed exactly; re-save once with the updated VS Code extension to preserve them."
+                .to_owned(),
+        );
+    }
+
+    let semantic = semantic::restore(&semantic_snapshot, options.dry_run);
     report.warnings.extend(semantic.warnings);
     report.failures.extend(semantic.failures);
 
-    // Semantic adapters can materialize the windows that should actually be placed
-    // (browser windows, VS Code content, Windows Terminal sessions). Re-run the
-    // convergent desktop pass afterwards so placement targets those final resources
-    // rather than only the bootstrap host windows. This pass also gives a transient
-    // prerequisite launch one last chance to converge, but any unresolved semantic
-    // failure still keeps the overall restore unsuccessful.
+    let explorer = crate::explorer::restore_from_capsule(snapshot, options.dry_run);
+    if options.dry_run && explorer.planned_to_open > 0 {
+        report.warnings.push(format!(
+            "Explorer restore: would open {} missing folder window(s)",
+            explorer.planned_to_open
+        ));
+    } else if explorer.opened > 0 {
+        report.warnings.push(format!(
+            "Explorer restore: opened {} missing folder window(s)",
+            explorer.opened
+        ));
+    }
+    report.warnings.extend(explorer.warnings);
+    report.failures.extend(explorer.failures);
+
+    #[cfg(windows)]
+    {
+        let legacy_explorer = legacy_explorer::restore(snapshot, options.dry_run);
+        if options.dry_run && legacy_explorer.planned > 0 {
+            report.warnings.push(format!(
+                "Legacy Explorer restore: would open {} safe Home/Quick access window(s)",
+                legacy_explorer.planned
+            ));
+        } else if legacy_explorer.opened > 0 {
+            report.warnings.push(format!(
+                "Legacy Explorer restore: opened {} safe Home/Quick access window(s)",
+                legacy_explorer.opened
+            ));
+        }
+        report.warnings.extend(legacy_explorer.warnings);
+        report.failures.extend(legacy_explorer.failures);
+    }
+
+    #[cfg(windows)]
+    if !options.dry_run {
+        if let Some(desktop) = full_desktop.as_ref() {
+            let activation =
+                activation::reactivate_background_only_apps(desktop, defer_windows_terminal);
+            report.warnings.extend(activation.warnings);
+            report.failures.extend(activation.failures);
+        }
+    }
+
     #[cfg(windows)]
     if !options.dry_run {
         if let Some(desktop) = full_desktop.as_ref() {
@@ -156,17 +226,100 @@ fn should_defer_windows_terminal(snapshot: &Value) -> bool {
         .is_some_and(|sessions| {
             sessions.iter().any(|session| {
                 session.get("host").and_then(Value::as_str) == Some("windows-terminal")
-                    && session.get("restart").is_some_and(|restart| !restart.is_null())
+                    && session
+                        .get("restart")
+                        .is_some_and(|restart| !restart.is_null())
             })
         })
 }
 
-fn desktop_without_windows_terminal(desktop: &SavedDesktop) -> SavedDesktop {
+fn has_vscode_editor_snapshot(snapshot: &Value) -> bool {
+    snapshot
+        .pointer("/editors/vscode")
+        .is_some_and(|value| !value.is_null())
+}
+
+fn suppress_orphan_vscode_semantic(snapshot: &mut Value) -> usize {
+    if has_vscode_editor_snapshot(snapshot) {
+        return 0;
+    }
+
+    let Some(sessions) = snapshot
+        .pointer_mut("/terminals/sessions")
+        .and_then(Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let before = sessions.len();
+    sessions.retain(|session| {
+        session.get("host").and_then(Value::as_str) != Some("visual-studio-code")
+    });
+    before.saturating_sub(sessions.len())
+}
+
+fn should_defer_vscode_devhost(snapshot: &Value) -> bool {
+    let editor = snapshot
+        .pointer("/editors/vscode")
+        .filter(|value| !value.is_null());
+    if editor
+        .and_then(|value| value.get("extensionMode"))
+        .and_then(Value::as_str)
+        == Some("development")
+    {
+        return true;
+    }
+
+    // A legacy window title is only actionable when a semantic editor snapshot
+    // exists. Deferring an entire Code application without editor data can leave
+    // the restore with no component responsible for starting or targeting it.
+    editor.is_some() && saved_desktop_mentions_devhost(snapshot)
+}
+
+fn saved_desktop_mentions_devhost(snapshot: &Value) -> bool {
+    snapshot
+        .pointer("/desktop/applications")
+        .and_then(Value::as_array)
+        .is_some_and(|applications| {
+            applications.iter().any(|application| {
+                application
+                    .get("windows")
+                    .and_then(Value::as_array)
+                    .is_some_and(|windows| {
+                        windows.iter().any(|window| {
+                            window
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .is_some_and(is_vscode_devhost_title)
+                        })
+                    })
+            })
+        })
+}
+
+fn desktop_without_semantic_owned_hosts(
+    desktop: &SavedDesktop,
+    defer_windows_terminal: bool,
+    defer_vscode_devhost: bool,
+) -> SavedDesktop {
     let mut filtered = desktop.clone();
+    filtered.applications.retain(|application| {
+        !(defer_windows_terminal && is_windows_terminal_application(application))
+            && !(defer_vscode_devhost && is_vscode_devhost_application(application))
+    });
     filtered
-        .applications
-        .retain(|application| !is_windows_terminal_application(application));
-    filtered
+}
+
+fn is_vscode_devhost_title(title: &str) -> bool {
+    title
+        .to_ascii_lowercase()
+        .contains("extension development host")
+}
+
+fn is_vscode_devhost_application(application: &SavedApplication) -> bool {
+    application
+        .windows
+        .iter()
+        .any(|window| is_vscode_devhost_title(&window.title))
 }
 
 fn is_windows_terminal_application(application: &SavedApplication) -> bool {
@@ -239,12 +392,10 @@ mod tests {
             RestoreOptions { dry_run: true },
         );
         assert!(report.success());
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("Firefox semantic restore"))
-        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Firefox semantic restore")));
     }
 
     #[test]
@@ -262,6 +413,53 @@ mod tests {
                 "sessions": [{ "host": "windows-terminal", "restart": null }]
             }
         })));
+    }
+
+    #[test]
+    fn vscode_devhost_is_deferred_only_when_semantic_editor_state_can_target_it() {
+        assert!(should_defer_vscode_devhost(&json!({
+            "editors": { "vscode": { "extensionMode": "development" } }
+        })));
+        assert!(should_defer_vscode_devhost(&json!({
+            "editors": { "vscode": { "schemaVersion": 1 } },
+            "desktop": { "applications": [{
+                "windows": [{ "title": "project - Visual Studio Code [Extension Development Host]" }]
+            }] }
+        })));
+        assert!(!should_defer_vscode_devhost(&json!({
+            "editors": { "vscode": null },
+            "desktop": { "applications": [{
+                "windows": [{ "title": "project - Visual Studio Code [Extension Development Host]" }]
+            }] }
+        })));
+    }
+
+    #[test]
+    fn orphan_vscode_terminals_are_removed_without_touching_external_sessions() {
+        let mut snapshot = json!({
+            "editors": { "vscode": null },
+            "terminals": {
+                "sessions": [
+                    { "host": "visual-studio-code" },
+                    { "host": "visual-studio-code" },
+                    { "host": "windows-terminal" }
+                ]
+            }
+        });
+        assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 2);
+        let sessions = snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["host"], "windows-terminal");
+    }
+
+    #[test]
+    fn vscode_terminals_remain_when_editor_snapshot_exists() {
+        let mut snapshot = json!({
+            "editors": { "vscode": { "schemaVersion": 1 } },
+            "terminals": { "sessions": [{ "host": "visual-studio-code" }] }
+        });
+        assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 0);
+        assert_eq!(snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap().len(), 1);
     }
 
     #[test]

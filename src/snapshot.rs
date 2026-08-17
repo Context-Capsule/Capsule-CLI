@@ -3,7 +3,7 @@ use crate::{
     discovery::{DiscoverySnapshot, GitState},
     persistence::{PersistenceError, StoredCapsuleSnapshot},
 };
-use context_capsule::{browser, vscode};
+use context_capsule::{browser, explorer, vscode};
 use serde_json::{Value, json};
 
 pub fn capture_snapshot(
@@ -11,6 +11,7 @@ pub fn capture_snapshot(
 ) -> Result<StoredCapsuleSnapshot, PersistenceError> {
     let docker = serde_json::to_value(&discovery.docker)?;
     let terminals = serde_json::to_value(&discovery.terminals)?;
+    let explorer = serde_json::to_value(explorer::discover())?;
     let firefox = browser::load_recent_firefox_state()
         .ok()
         .flatten()
@@ -40,6 +41,7 @@ pub fn capture_snapshot(
             "value": hint.value,
         })).collect::<Vec<_>>(),
         "desktop": desktop_value(&discovery.desktop),
+        "explorer": explorer,
         "docker": docker,
         "terminals": terminals,
         "browsers": { "firefox": firefox },
@@ -163,6 +165,7 @@ mod tests {
         assert_eq!(stored.snapshot["terminals"]["status"], "not-requested");
         assert_eq!(stored.snapshot["terminals"]["history"]["captured"], false);
         assert_eq!(stored.snapshot["git"]["status"], "not-repository");
+        assert!(stored.snapshot.get("explorer").is_some());
         assert!(stored.snapshot.pointer("/browsers/firefox").is_some());
         assert!(stored.snapshot.pointer("/editors/vscode").is_some());
     }
