@@ -3,11 +3,16 @@ use std::{
     ffi::c_void,
     path::Path,
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 type Hwnd = *mut c_void;
 type Bool = i32;
 type EnumWindowsProc = Option<unsafe extern "system" fn(Hwnd, isize) -> Bool>;
+
+const LIVE_HOST_MATCH_RETRIES: usize = 5;
+const LIVE_HOST_MATCH_DELAY: Duration = Duration::from_millis(150);
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -36,11 +41,11 @@ pub fn prepare(snapshot: &Value, dry_run: bool) -> DevHostPreparation {
     let saved_mode = editor.get("extensionMode").and_then(Value::as_str);
     let saved_path = editor.get("extensionPath").and_then(Value::as_str);
     let legacy_devhost = saved_desktop_mentions_devhost(snapshot);
-    let devhost_visible = extension_development_host_visible();
+    let any_devhost_visible = extension_development_host_visible();
 
     if saved_mode == Some("development") {
         let Some(extension_path) = saved_path.filter(|value| !value.trim().is_empty()) else {
-            report.skip_vscode_semantic_restore = !devhost_visible;
+            report.skip_vscode_semantic_restore = !any_devhost_visible;
             report.warnings.push(
                 "VS Code restore: the saved Extension Development Host does not contain its development extension path; start the development host manually or re-save the capsule with the updated extension"
                     .to_owned(),
@@ -48,9 +53,20 @@ pub fn prepare(snapshot: &Value, dry_run: bool) -> DevHostPreparation {
             return report;
         };
 
-        if devhost_visible {
-            return report;
+        match saved_development_host_is_live(extension_path, any_devhost_visible) {
+            Ok(true) => return report,
+            Ok(false) => {
+                if any_devhost_visible {
+                    report.warnings.push(format!(
+                        "VS Code restore: another Extension Development Host is visible, but it does not match the saved development path '{extension_path}'; the saved target will be started separately"
+                    ));
+                }
+            }
+            Err(error) => report.warnings.push(format!(
+                "VS Code restore: could not verify whether the saved Extension Development Host is already live ({error}); the saved target will be started to avoid routing editor state to the wrong host"
+            )),
         }
+
         if !Path::new(extension_path).is_dir() {
             report.skip_vscode_semantic_restore = true;
             report.failures.push(format!(
@@ -62,7 +78,7 @@ pub fn prepare(snapshot: &Value, dry_run: bool) -> DevHostPreparation {
         let executable = saved_code_executable(snapshot).unwrap_or_else(|| "code".to_owned());
         if dry_run {
             report.warnings.push(format!(
-                "VS Code restore: would start an Extension Development Host from '{extension_path}' using '{executable}'"
+                "VS Code restore: would start an Extension Development Host from '{extension_path}' using '{executable}' and open that development workspace"
             ));
             return report;
         }
@@ -81,7 +97,7 @@ pub fn prepare(snapshot: &Value, dry_run: bool) -> DevHostPreparation {
         return report;
     }
 
-    if saved_mode.is_none() && legacy_devhost && !devhost_visible {
+    if saved_mode.is_none() && legacy_devhost && !any_devhost_visible {
         report.skip_vscode_semantic_restore = true;
         report.warnings.push(
             "VS Code restore: this capsule was saved from an Extension Development Host before Context Capsule captured its development extension path; its editor tabs cannot be auto-restored from this legacy capsule. Start the development host manually for this restore, then re-save the capsule once with the updated extension."
@@ -90,6 +106,25 @@ pub fn prepare(snapshot: &Value, dry_run: bool) -> DevHostPreparation {
     }
 
     report
+}
+
+fn saved_development_host_is_live(
+    extension_path: &str,
+    any_devhost_visible: bool,
+) -> Result<bool, crate::vscode::VsCodeError> {
+    if !any_devhost_visible {
+        return Ok(false);
+    }
+
+    for attempt in 0..LIVE_HOST_MATCH_RETRIES {
+        if crate::vscode::live_development_host_matches_path(extension_path)? {
+            return Ok(true);
+        }
+        if attempt + 1 < LIVE_HOST_MATCH_RETRIES {
+            thread::sleep(LIVE_HOST_MATCH_DELAY);
+        }
+    }
+    Ok(false)
 }
 
 pub fn suppress_vscode_semantic(snapshot: &mut Value) {
@@ -110,6 +145,11 @@ fn launch_devhost(executable: &str, extension_path: &str) -> Result<(), String> 
     Command::new(executable)
         .arg("--new-window")
         .arg(format!("--extensionDevelopmentPath={extension_path}"))
+        // Opening the development folder is intentional. Context Capsule is an
+        // installed extension in this host, so its own ExtensionMode remains
+        // Production; the workspace-loaded development extension is the stable
+        // signal used to identify this window and route the restore safely.
+        .arg(extension_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

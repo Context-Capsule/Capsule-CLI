@@ -4,6 +4,8 @@ mod semantic;
 #[cfg(windows)]
 mod activation;
 #[cfg(windows)]
+mod browser_bootstrap;
+#[cfg(windows)]
 mod dpi;
 #[cfg(windows)]
 mod legacy_explorer;
@@ -68,23 +70,52 @@ impl RestoreReport {
 
 pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreReport {
     let mut report = RestoreReport::default();
-    let mut full_desktop = None;
+    let mut generic_desktop = None;
+    let mut full_application_count = 0usize;
+    let mut zen_semantic_owner = false;
+    #[cfg(windows)]
+    let mut zen_bootstrap = browser_bootstrap::ZenBootstrapReport::default();
     let defer_windows_terminal = should_defer_windows_terminal(snapshot);
     let defer_vscode_devhost = should_defer_vscode_devhost(snapshot);
+    let has_browser_semantic = has_firefox_browser_snapshot(snapshot);
 
     match SavedDesktop::from_capsule(snapshot) {
         Ok(Some(desktop)) => {
+            full_application_count = desktop.applications.len();
+            zen_semantic_owner = has_browser_semantic
+                && desktop
+                    .applications
+                    .iter()
+                    .any(is_zen_semantic_application);
+
+            #[cfg(windows)]
+            if zen_semantic_owner {
+                zen_bootstrap = browser_bootstrap::ensure_zen_started(&desktop, options.dry_run);
+                report.warnings.extend(zen_bootstrap.warnings.clone());
+                report.failures.extend(zen_bootstrap.failures.clone());
+            }
+
             let prerequisite = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
                 defer_vscode_devhost,
+                zen_semantic_owner,
             );
 
             #[cfg(windows)]
             {
                 let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
                 report.desktop = windows::restore_desktop(&prerequisite, options.dry_run);
-                report.desktop.applications_total = desktop.applications.len();
+                report.desktop.applications_total = full_application_count;
+                if zen_bootstrap.already_running {
+                    report.desktop.applications_already_running += 1;
+                }
+                if zen_bootstrap.planned {
+                    report.desktop.applications_planned_to_launch += 1;
+                }
+                if zen_bootstrap.launched {
+                    report.desktop.applications_launched += 1;
+                }
                 if dpi_guard.is_none() {
                     report.desktop.warnings.push(
                         "could not switch the restore thread to Per-Monitor-V2 DPI awareness; placement may be less accurate on mixed-DPI displays"
@@ -113,7 +144,13 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                         .to_owned(),
                 );
             }
-            full_desktop = Some(desktop);
+            if zen_semantic_owner {
+                report.warnings.push(
+                    "Zen browser window creation and placement are delegated to the semantic browser adapter so Zen Window Sync cannot clone or mutate the current Space during generic desktop restore"
+                        .to_owned(),
+                );
+            }
+            generic_desktop = Some(prerequisite);
         }
         Ok(None) => report
             .warnings
@@ -186,7 +223,7 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
 
     #[cfg(windows)]
     if !options.dry_run {
-        if let Some(desktop) = full_desktop.as_ref() {
+        if let Some(desktop) = generic_desktop.as_ref() {
             let activation =
                 activation::reactivate_background_only_apps(desktop, defer_windows_terminal);
             report.warnings.extend(activation.warnings);
@@ -196,13 +233,14 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
 
     #[cfg(windows)]
     if !options.dry_run {
-        if let Some(desktop) = full_desktop.as_ref() {
+        if let Some(desktop) = generic_desktop.as_ref() {
             let initial_launched = report.desktop.applications_launched;
             let initial_already_running = report.desktop.applications_already_running;
             let initial_planned = report.desktop.applications_planned_to_launch;
 
             let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
             let mut final_desktop = windows::restore_desktop(desktop, false);
+            final_desktop.applications_total = full_application_count;
             final_desktop.applications_launched += initial_launched;
             final_desktop.applications_already_running = initial_already_running;
             final_desktop.applications_planned_to_launch = initial_planned;
@@ -231,6 +269,12 @@ fn should_defer_windows_terminal(snapshot: &Value) -> bool {
                         .is_some_and(|restart| !restart.is_null())
             })
         })
+}
+
+fn has_firefox_browser_snapshot(snapshot: &Value) -> bool {
+    snapshot
+        .pointer("/browsers/firefox")
+        .is_some_and(|value| !value.is_null())
 }
 
 fn has_vscode_editor_snapshot(snapshot: &Value) -> bool {
@@ -300,11 +344,13 @@ fn desktop_without_semantic_owned_hosts(
     desktop: &SavedDesktop,
     defer_windows_terminal: bool,
     defer_vscode_devhost: bool,
+    defer_zen_browser: bool,
 ) -> SavedDesktop {
     let mut filtered = desktop.clone();
     filtered.applications.retain(|application| {
         !(defer_windows_terminal && is_windows_terminal_application(application))
             && !(defer_vscode_devhost && is_vscode_devhost_application(application))
+            && !(defer_zen_browser && is_zen_semantic_application(application))
     });
     filtered
 }
@@ -322,6 +368,25 @@ fn is_vscode_devhost_application(application: &SavedApplication) -> bool {
         .any(|window| is_vscode_devhost_title(&window.title))
 }
 
+fn executable_basename(application: &SavedApplication) -> Option<&str> {
+    application
+        .executable_path
+        .as_deref()
+        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .and_then(|value| value.rsplit(['\\', '/']).next())
+}
+
+fn is_zen_semantic_application(application: &SavedApplication) -> bool {
+    if executable_basename(application).is_some_and(|name| {
+        name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen")
+    }) {
+        return true;
+    }
+
+    application.name.eq_ignore_ascii_case("zen")
+        || application.name.eq_ignore_ascii_case("Zen Browser")
+}
+
 fn is_windows_terminal_application(application: &SavedApplication) -> bool {
     if application
         .app_user_model_id
@@ -331,18 +396,8 @@ fn is_windows_terminal_application(application: &SavedApplication) -> bool {
         return true;
     }
 
-    let executable = application
-        .executable_path
-        .as_deref()
-        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()));
-    if executable.is_some_and(|value| {
-        value
-            .rsplit(['\\', '/'])
-            .next()
-            .is_some_and(|name| {
-                name.eq_ignore_ascii_case("windowsterminal.exe")
-                    || name.eq_ignore_ascii_case("wt.exe")
-            })
+    if executable_basename(application).is_some_and(|name| {
+        name.eq_ignore_ascii_case("windowsterminal.exe") || name.eq_ignore_ascii_case("wt.exe")
     }) {
         return true;
     }
@@ -354,6 +409,19 @@ fn is_windows_terminal_application(application: &SavedApplication) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn application(name: &str, executable_path: Option<&str>) -> SavedApplication {
+        SavedApplication {
+            name: name.to_owned(),
+            executable_path: executable_path.map(str::to_owned),
+            app_user_model_id: None,
+            file_version: None,
+            classification: "user-application".to_owned(),
+            launch: None,
+            windows: Vec::new(),
+            discovered_as_background: false,
+        }
+    }
 
     #[test]
     fn missing_desktop_is_a_graceful_noop() {
@@ -396,6 +464,35 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("Firefox semantic restore")));
+    }
+
+    #[test]
+    fn zen_semantic_snapshot_owns_only_zen_desktop_apps() {
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: Vec::new(),
+            applications: vec![
+                application("zen", Some(r"C:\Program Files\Zen Browser\zen.exe")),
+                application(
+                    "Mozilla Firefox",
+                    Some(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
+                ),
+                application("Spotify", Some(r"C:\Users\me\Spotify.exe")),
+            ],
+        };
+        let filtered = desktop_without_semantic_owned_hosts(&desktop, false, false, true);
+        assert_eq!(filtered.applications.len(), 2);
+        assert!(filtered
+            .applications
+            .iter()
+            .any(|application| application.name == "Mozilla Firefox"));
+        assert!(filtered
+            .applications
+            .iter()
+            .any(|application| application.name == "Spotify"));
+
+        let unfiltered = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
+        assert_eq!(unfiltered.applications.len(), 3);
     }
 
     #[test]
