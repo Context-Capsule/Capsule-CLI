@@ -306,13 +306,13 @@ fn validate_snapshot(snapshot: &FirefoxSnapshot) -> Result<(), BrowserError> {
 }
 
 fn is_zen_executable(name: &str, executable_path: &str) -> bool {
-    let executable_name = Path::new(executable_path)
-        .file_name()
-        .and_then(|value| value.to_str());
+    let executable_name = executable_path
+        .rsplit(|character| character == '/' || character == '\\')
+        .next()
+        .unwrap_or(executable_path);
     (name.eq_ignore_ascii_case("zen") || name.eq_ignore_ascii_case("Zen Browser"))
-        && executable_name.is_some_and(|value| {
-            value.eq_ignore_ascii_case("zen.exe") || value.eq_ignore_ascii_case("zen")
-        })
+        && (executable_name.eq_ignore_ascii_case("zen.exe")
+            || executable_name.eq_ignore_ascii_case("zen"))
 }
 
 #[cfg(windows)]
