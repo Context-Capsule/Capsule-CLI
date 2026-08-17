@@ -1,4 +1,7 @@
-use crate::persistence::{CapsuleStore, PersistenceError};
+use crate::{
+    persistence::{CapsuleStore, PersistenceError},
+    restore_bus::{self, RestoreRequest},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -91,6 +94,16 @@ struct NativeRequest {
     snapshot: Option<FirefoxSnapshot>,
     #[serde(default)]
     capsule_name: Option<String>,
+    #[serde(default)]
+    restore_request_id: Option<String>,
+    #[serde(default)]
+    restore_changed: Option<usize>,
+    #[serde(default)]
+    restore_skipped: Option<usize>,
+    #[serde(default)]
+    restore_warnings: Vec<String>,
+    #[serde(default)]
+    restore_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,6 +121,8 @@ struct NativeResponse {
     stored_at_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_request: Option<RestoreRequest>,
 }
 
 #[derive(Debug)]
@@ -180,6 +195,7 @@ fn handle_request(request: NativeRequest) -> NativeResponse {
             snapshot: None,
             stored_at_unix_ms: None,
             host_version: None,
+            restore_request: None,
         },
     }
 }
@@ -196,13 +212,31 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
     }
 
     match request.kind.as_str() {
-        "ping" => Ok(success_response("pong")),
+        "ping" => {
+            let mut response = success_response("pong");
+            response.restore_request = restore_bus::read_request("firefox")?;
+            Ok(response)
+        }
         "browser.state.update" => {
             let snapshot = request.snapshot.ok_or_else(|| {
                 BrowserError::Invalid("browser.state.update requires snapshot".to_owned())
             })?;
             validate_snapshot(&snapshot)?;
             let stored_at = write_runtime_state(&snapshot)?;
+
+            if let Some(restore_request_id) = request.restore_request_id.as_deref() {
+                let restore_error = request.restore_error.clone();
+                restore_bus::complete_request(
+                    "firefox",
+                    restore_request_id,
+                    restore_error.is_none(),
+                    request.restore_changed.unwrap_or(0),
+                    request.restore_skipped.unwrap_or(0),
+                    request.restore_warnings.clone(),
+                    restore_error,
+                )?;
+            }
+
             let mut response = success_response("browser.state.updated");
             response.stored_at_unix_ms = Some(stored_at);
             Ok(response)
@@ -237,6 +271,7 @@ fn success_response(kind: &str) -> NativeResponse {
         snapshot: None,
         stored_at_unix_ms: None,
         host_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        restore_request: None,
     }
 }
 
