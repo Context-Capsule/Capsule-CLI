@@ -2,8 +2,13 @@ mod model;
 mod semantic;
 
 #[cfg(windows)]
+mod activation;
+#[cfg(windows)]
 mod dpi;
 #[cfg(windows)]
+mod vscode_devhost;
+#[cfg(windows)]
+#[allow(dead_code)]
 mod windows;
 
 use serde_json::Value;
@@ -76,8 +81,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             {
                 let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
                 report.desktop = windows::restore_desktop(&prerequisite, options.dry_run);
-                // The user-facing total remains the complete capsule even when Windows
-                // Terminal startup is intentionally delegated to the terminal adapter.
                 report.desktop.applications_total = desktop.applications.len();
                 if dpi_guard.is_none() {
                     report.desktop.warnings.push(
@@ -111,19 +114,63 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             .push(format!("desktop restore metadata: {error}")),
     }
 
+    // A saved Extension Development Host is special: the Context Capsule extension
+    // only exists inside that development host, so a generic Code.exe window cannot
+    // consume the restore request. New capsules persist the extension development path
+    // and we recreate the correct host before sending semantic work to it.
+    let mut semantic_snapshot = snapshot.clone();
+    #[cfg(windows)]
+    {
+        let preparation = vscode_devhost::prepare(snapshot, options.dry_run);
+        if preparation.skip_vscode_semantic_restore {
+            vscode_devhost::suppress_vscode_semantic(&mut semantic_snapshot);
+        }
+        report.warnings.extend(preparation.warnings);
+        report.failures.extend(preparation.failures);
+    }
+
     // Semantic adapters run after the prerequisite desktop pass. Each adapter is
-    // failure-isolated so a browser/editor/container problem cannot prevent the
-    // remaining resources from converging toward the saved capsule.
-    let semantic = semantic::restore(snapshot, options.dry_run);
+    // failure-isolated so one browser/editor/container problem cannot stop the rest.
+    let semantic = semantic::restore(&semantic_snapshot, options.dry_run);
     report.warnings.extend(semantic.warnings);
     report.failures.extend(semantic.failures);
 
-    // Semantic adapters can materialize the windows that should actually be placed
-    // (browser windows, VS Code content, Windows Terminal sessions). Re-run the
-    // convergent desktop pass afterwards so placement targets those final resources
-    // rather than only the bootstrap host windows. This pass also gives a transient
-    // prerequisite launch one last chance to converge, but any unresolved semantic
-    // failure still keeps the overall restore unsuccessful.
+    // Explorer folder locations are captured separately from generic desktop geometry.
+    // This avoids confusing the always-running Windows shell process with a folder
+    // window that actually needs to be reopened.
+    let explorer = crate::explorer::restore_from_capsule(snapshot, options.dry_run);
+    if options.dry_run && explorer.planned_to_open > 0 {
+        report.warnings.push(format!(
+            "Explorer restore: would open {} missing folder window(s)",
+            explorer.planned_to_open
+        ));
+    } else if explorer.opened > 0 {
+        report.warnings.push(format!(
+            "Explorer restore: opened {} missing folder window(s)",
+            explorer.opened
+        ));
+    }
+    report.warnings.extend(explorer.warnings);
+    report.failures.extend(explorer.failures);
+
+    // Some desktop applications (notably packaged messaging apps) leave a background
+    // process alive after their last visible window closes. A process-only check would
+    // incorrectly consider those apps restored. Reactivate only saved apps that still
+    // have a matching process but no visible top-level window, then let the final pass
+    // place the resulting window.
+    #[cfg(windows)]
+    if !options.dry_run {
+        if let Some(desktop) = full_desktop.as_ref() {
+            let activation =
+                activation::reactivate_background_only_apps(desktop, defer_windows_terminal);
+            report.warnings.extend(activation.warnings);
+            report.failures.extend(activation.failures);
+        }
+    }
+
+    // Semantic adapters and reactivation can materialize the windows that should
+    // actually be placed. Re-run the convergent desktop pass so geometry targets the
+    // final browser/editor/terminal/Explorer/app windows rather than bootstrap hosts.
     #[cfg(windows)]
     if !options.dry_run {
         if let Some(desktop) = full_desktop.as_ref() {
