@@ -132,7 +132,8 @@ pub fn restore_from_capsule(snapshot: &Value, dry_run: bool) -> ExplorerRestoreR
             .iter()
             .enumerate()
             .find(|(index, candidate)| {
-                !used.contains(index) && explorer_targets_equal(&saved_window.target, &candidate.target)
+                !used.contains(index)
+                    && explorer_targets_equal(&saved_window.target, &candidate.target)
             })
             .map(|(index, _)| index)
         {
@@ -268,7 +269,13 @@ foreach ($window in @($shell.Windows())) {
 "#;
 
     let output = match Command::new("powershell.exe")
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .output()
