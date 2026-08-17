@@ -61,13 +61,24 @@ impl RestoreReport {
 
 pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreReport {
     let mut report = RestoreReport::default();
+    let mut full_desktop = None;
+    let defer_windows_terminal = should_defer_windows_terminal(snapshot);
 
     match SavedDesktop::from_capsule(snapshot) {
         Ok(Some(desktop)) => {
+            let prerequisite = if defer_windows_terminal {
+                desktop_without_windows_terminal(&desktop)
+            } else {
+                desktop.clone()
+            };
+
             #[cfg(windows)]
             {
                 let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
-                report.desktop = windows::restore_desktop(&desktop, options.dry_run);
+                report.desktop = windows::restore_desktop(&prerequisite, options.dry_run);
+                // The user-facing total remains the complete capsule even when Windows
+                // Terminal startup is intentionally delegated to the terminal adapter.
+                report.desktop.applications_total = desktop.applications.len();
                 if dpi_guard.is_none() {
                     report.desktop.warnings.push(
                         "could not switch the restore thread to Per-Monitor-V2 DPI awareness; placement may be less accurate on mixed-DPI displays"
@@ -78,11 +89,19 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
 
             #[cfg(not(windows))]
             {
-                let _ = desktop;
+                let _ = &prerequisite;
                 report
                     .warnings
                     .push("desktop restore is currently implemented for Windows only".to_owned());
             }
+
+            if defer_windows_terminal {
+                report.warnings.push(
+                    "Windows Terminal startup is delegated to the semantic terminal adapter so restore does not create an extra default tab before recreating the saved sessions"
+                        .to_owned(),
+                );
+            }
+            full_desktop = Some(desktop);
         }
         Ok(None) => report
             .warnings
@@ -92,14 +111,90 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             .push(format!("desktop restore metadata: {error}")),
     }
 
-    // Semantic adapters run after the desktop prerequisite pass. Each adapter is
+    // Semantic adapters run after the prerequisite desktop pass. Each adapter is
     // failure-isolated so a browser/editor/container problem cannot prevent the
     // remaining resources from converging toward the saved capsule.
     let semantic = semantic::restore(snapshot, options.dry_run);
     report.warnings.extend(semantic.warnings);
     report.failures.extend(semantic.failures);
 
+    // Semantic adapters can materialize the windows that should actually be placed
+    // (browser windows, VS Code content, Windows Terminal sessions). Re-run the
+    // convergent desktop pass afterwards so placement targets those final resources
+    // rather than only the bootstrap host windows. This pass also gives a transient
+    // prerequisite launch one last chance to converge, but any unresolved semantic
+    // failure still keeps the overall restore unsuccessful.
+    #[cfg(windows)]
+    if !options.dry_run {
+        if let Some(desktop) = full_desktop.as_ref() {
+            let initial_launched = report.desktop.applications_launched;
+            let initial_already_running = report.desktop.applications_already_running;
+            let initial_planned = report.desktop.applications_planned_to_launch;
+
+            let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
+            let mut final_desktop = windows::restore_desktop(desktop, false);
+            final_desktop.applications_launched += initial_launched;
+            final_desktop.applications_already_running = initial_already_running;
+            final_desktop.applications_planned_to_launch = initial_planned;
+            if dpi_guard.is_none() {
+                final_desktop.warnings.push(
+                    "could not switch the final placement pass to Per-Monitor-V2 DPI awareness; placement may be less accurate on mixed-DPI displays"
+                        .to_owned(),
+                );
+            }
+            report.desktop = final_desktop;
+        }
+    }
+
     report
+}
+
+fn should_defer_windows_terminal(snapshot: &Value) -> bool {
+    snapshot
+        .pointer("/terminals/sessions")
+        .and_then(Value::as_array)
+        .is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                session.get("host").and_then(Value::as_str) == Some("windows-terminal")
+                    && session.get("restart").is_some_and(|restart| !restart.is_null())
+            })
+        })
+}
+
+fn desktop_without_windows_terminal(desktop: &SavedDesktop) -> SavedDesktop {
+    let mut filtered = desktop.clone();
+    filtered
+        .applications
+        .retain(|application| !is_windows_terminal_application(application));
+    filtered
+}
+
+fn is_windows_terminal_application(application: &SavedApplication) -> bool {
+    if application
+        .app_user_model_id
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("windowsterminal"))
+    {
+        return true;
+    }
+
+    let executable = application
+        .executable_path
+        .as_deref()
+        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()));
+    if executable.is_some_and(|value| {
+        value
+            .rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("windowsterminal.exe")
+                    || name.eq_ignore_ascii_case("wt.exe")
+            })
+    }) {
+        return true;
+    }
+
+    application.name.eq_ignore_ascii_case("Windows Terminal")
 }
 
 #[cfg(test)]
@@ -144,6 +239,53 @@ mod tests {
             RestoreOptions { dry_run: true },
         );
         assert!(report.success());
-        assert!(report.warnings.iter().any(|warning| warning.contains("Firefox semantic restore")));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Firefox semantic restore"))
+        );
+    }
+
+    #[test]
+    fn windows_terminal_is_deferred_only_when_a_safe_terminal_plan_exists() {
+        assert!(should_defer_windows_terminal(&json!({
+            "terminals": {
+                "sessions": [{
+                    "host": "windows-terminal",
+                    "restart": { "executable": "wt.exe", "args": [] }
+                }]
+            }
+        })));
+        assert!(!should_defer_windows_terminal(&json!({
+            "terminals": {
+                "sessions": [{ "host": "windows-terminal", "restart": null }]
+            }
+        })));
+    }
+
+    #[test]
+    fn windows_terminal_identity_detection_handles_paths_and_aumids() {
+        let base = SavedApplication {
+            name: "Terminal".to_owned(),
+            executable_path: Some(
+                r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"
+                    .to_owned(),
+            ),
+            app_user_model_id: None,
+            file_version: None,
+            classification: "user-application".to_owned(),
+            launch: None,
+            windows: Vec::new(),
+            discovered_as_background: false,
+        };
+        assert!(is_windows_terminal_application(&base));
+
+        let mut packaged = base.clone();
+        packaged.executable_path = None;
+        packaged.app_user_model_id = Some(
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned(),
+        );
+        assert!(is_windows_terminal_application(&packaged));
     }
 }
