@@ -1,14 +1,22 @@
 use crate::{
     adapters::{
-        docker::{self, DockerSnapshot, DockerStatus},
-        terminal::{self, RestartPlan, TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot, TerminalStatus},
+        docker::{self, ComposeProject, DockerSnapshot, DockerStatus},
+        terminal::{
+            self, RestartPlan, TerminalEnvironment, TerminalHost, TerminalSession,
+            TerminalSnapshot, TerminalStatus,
+        },
     },
     restore_bus,
 };
 use serde_json::{Value, json};
-use std::{collections::HashSet, process::Command, time::Duration};
+use std::{collections::HashSet, time::Duration};
+
+#[cfg(windows)]
+use std::{process::Command, thread};
 
 const ADAPTER_TIMEOUT: Duration = Duration::from_secs(25);
+#[cfg(windows)]
+const TERMINAL_LAUNCH_SPACING: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticRestoreReport {
@@ -16,15 +24,12 @@ pub struct SemanticRestoreReport {
     pub failures: Vec<String>,
 }
 
-impl SemanticRestoreReport {
-    pub fn success(&self) -> bool {
-        self.failures.is_empty()
-    }
-}
-
 pub fn restore(snapshot: &Value, dry_run: bool) -> SemanticRestoreReport {
     let mut report = SemanticRestoreReport::default();
 
+    // Docker can be restored without a GUI host, so converge it first. The GUI
+    // adapters are then handled one at a time to avoid a large browser + editor
+    // state restore hitting the machine simultaneously. External terminals are last.
     restore_docker(snapshot, dry_run, &mut report);
     restore_vscode(snapshot, dry_run, &mut report);
     restore_firefox(snapshot, dry_run, &mut report);
@@ -43,49 +48,14 @@ fn restore_firefox(snapshot: &Value, dry_run: bool, report: &mut SemanticRestore
     };
 
     if dry_run {
-        report
-            .warnings
-            .push("Firefox semantic restore: would reconcile saved tabs, groups, containers and browser windows".to_owned());
+        report.warnings.push(
+            "Firefox semantic restore: would reconcile saved tabs, groups, containers and browser windows"
+                .to_owned(),
+        );
         return;
     }
 
-    let request = match restore_bus::write_request("firefox", saved) {
-        Ok(request) => request,
-        Err(error) => {
-            report
-                .failures
-                .push(format!("Firefox semantic restore request failed: {error}"));
-            return;
-        }
-    };
-
-    match restore_bus::wait_for_completion("firefox", &request.request_id, ADAPTER_TIMEOUT) {
-        Ok(Some(completion)) if completion.ok => {
-            report.warnings.push(format!(
-                "Firefox semantic restore: {} resource(s) changed, {} already satisfied/skipped",
-                completion.changed, completion.skipped
-            ));
-            report.warnings.extend(
-                completion
-                    .warnings
-                    .into_iter()
-                    .map(|warning| format!("Firefox: {warning}")),
-            );
-        }
-        Ok(Some(completion)) => report.failures.push(format!(
-            "Firefox semantic restore failed: {}",
-            completion
-                .error
-                .unwrap_or_else(|| "extension reported failure".to_owned())
-        )),
-        Ok(None) => report.failures.push(
-            "Firefox semantic restore timed out waiting for the Context Capsule browser extension/native host"
-                .to_owned(),
-        ),
-        Err(error) => report
-            .failures
-            .push(format!("Firefox semantic restore wait failed: {error}")),
-    }
+    run_bus_adapter("firefox", "Firefox", saved, report);
 }
 
 fn restore_vscode(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
@@ -113,52 +83,73 @@ fn restore_vscode(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreR
             if integrated_terminals.is_empty() {
                 String::new()
             } else {
-                format!(" and {} integrated terminal session(s)", integrated_terminals.len())
+                format!(
+                    " and {} integrated terminal session(s)",
+                    integrated_terminals.len()
+                )
             }
         ));
         return;
     }
 
-    let payload = json!({
-        "editor": editor,
-        "terminals": integrated_terminals,
-    });
-    let request = match restore_bus::write_request("vscode", payload) {
+    run_bus_adapter(
+        "vscode",
+        "VS Code",
+        json!({
+            "editor": editor,
+            "terminals": integrated_terminals,
+        }),
+        report,
+    );
+}
+
+fn run_bus_adapter(
+    adapter: &str,
+    label: &str,
+    payload: Value,
+    report: &mut SemanticRestoreReport,
+) {
+    let request = match restore_bus::write_request(adapter, payload) {
         Ok(request) => request,
         Err(error) => {
             report
                 .failures
-                .push(format!("VS Code semantic restore request failed: {error}"));
+                .push(format!("{label} semantic restore request failed: {error}"));
             return;
         }
     };
 
-    match restore_bus::wait_for_completion("vscode", &request.request_id, ADAPTER_TIMEOUT) {
+    match restore_bus::wait_for_completion(adapter, &request.request_id, ADAPTER_TIMEOUT) {
         Ok(Some(completion)) if completion.ok => {
             report.warnings.push(format!(
-                "VS Code semantic restore: {} resource(s) changed, {} already satisfied/skipped",
+                "{label} semantic restore: {} resource(s) changed, {} already satisfied/skipped",
                 completion.changed, completion.skipped
             ));
             report.warnings.extend(
                 completion
                     .warnings
                     .into_iter()
-                    .map(|warning| format!("VS Code: {warning}")),
+                    .map(|warning| format!("{label}: {warning}")),
             );
         }
         Ok(Some(completion)) => report.failures.push(format!(
-            "VS Code semantic restore failed: {}",
+            "{label} semantic restore failed: {}",
             completion
                 .error
-                .unwrap_or_else(|| "extension reported failure".to_owned())
+                .unwrap_or_else(|| "adapter reported failure".to_owned())
         )),
-        Ok(None) => report.failures.push(
-            "VS Code semantic restore timed out waiting for the Context Capsule VS Code extension"
-                .to_owned(),
-        ),
-        Err(error) => report
-            .failures
-            .push(format!("VS Code semantic restore wait failed: {error}")),
+        Ok(None) => {
+            let _ = restore_bus::cancel_request(adapter, &request.request_id);
+            report.failures.push(format!(
+                "{label} semantic restore timed out waiting for its Context Capsule adapter"
+            ));
+        }
+        Err(error) => {
+            let _ = restore_bus::cancel_request(adapter, &request.request_id);
+            report
+                .failures
+                .push(format!("{label} semantic restore wait failed: {error}"));
+        }
     }
 }
 
@@ -219,11 +210,6 @@ fn missing_docker_resources(saved: &DockerSnapshot, current: &DockerSnapshot) ->
         return saved.clone();
     }
 
-    let running_projects = current
-        .compose_projects
-        .iter()
-        .map(|project| project.name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
     let running_containers = current
         .standalone_containers
         .iter()
@@ -237,7 +223,12 @@ fn missing_docker_resources(saved: &DockerSnapshot, current: &DockerSnapshot) ->
         compose_projects: saved
             .compose_projects
             .iter()
-            .filter(|project| !running_projects.contains(&project.name.to_ascii_lowercase()))
+            .filter(|saved_project| {
+                !current
+                    .compose_projects
+                    .iter()
+                    .any(|current_project| compose_project_satisfied(saved_project, current_project))
+            })
             .cloned()
             .collect(),
         standalone_containers: saved
@@ -247,6 +238,33 @@ fn missing_docker_resources(saved: &DockerSnapshot, current: &DockerSnapshot) ->
             .cloned()
             .collect(),
     }
+}
+
+fn compose_project_satisfied(saved: &ComposeProject, current: &ComposeProject) -> bool {
+    if !saved.name.eq_ignore_ascii_case(&current.name) {
+        return false;
+    }
+
+    if !saved.services.is_empty() {
+        let current_services = current
+            .services
+            .iter()
+            .map(|service| service.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        return saved
+            .services
+            .iter()
+            .all(|service| current_services.contains(&service.to_ascii_lowercase()));
+    }
+
+    let current_names = current
+        .containers
+        .iter()
+        .map(|container| container.name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    saved.containers.iter().all(|container| {
+        current_names.contains(&container.name.to_ascii_lowercase())
+    })
 }
 
 fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
@@ -260,16 +278,20 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
     let current = terminal::discover();
     let mut used = HashSet::new();
     let mut missing = Vec::new();
+    let mut cursor_warning_added = false;
 
     for saved_session in &saved.sessions {
-        if matches!(saved_session.host, TerminalHost::VisualStudioCode) {
+        if saved_session.host == TerminalHost::VisualStudioCode {
             continue;
         }
-        if matches!(saved_session.host, TerminalHost::Cursor) {
-            report.warnings.push(
-                "Terminal restore: Cursor integrated terminals are preserved in the capsule but no Cursor adapter is installed yet"
-                    .to_owned(),
-            );
+        if saved_session.host == TerminalHost::Cursor {
+            if !cursor_warning_added {
+                report.warnings.push(
+                    "Terminal restore: Cursor integrated terminals are preserved in the capsule but no Cursor adapter is installed yet"
+                        .to_owned(),
+                );
+                cursor_warning_added = true;
+            }
             continue;
         }
 
@@ -299,9 +321,10 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
 
     if missing.is_empty() {
         if !saved.sessions.is_empty() {
-            report
-                .warnings
-                .push("Terminal restore: all safely restorable external sessions are already present".to_owned());
+            report.warnings.push(
+                "Terminal restore: all safely restorable external sessions are already present"
+                    .to_owned(),
+            );
         }
         return;
     }
@@ -315,11 +338,15 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
 
     #[cfg(windows)]
     {
+        let total = missing.len();
         let mut restored = 0usize;
-        for plan in missing {
+        for (index, plan) in missing.into_iter().enumerate() {
             match launch_restart_plan(&plan) {
                 Ok(()) => restored += 1,
                 Err(error) => report.failures.push(format!("Terminal: {error}")),
+            }
+            if index + 1 < total {
+                thread::sleep(TERMINAL_LAUNCH_SPACING);
             }
         }
         report.warnings.push(format!(
@@ -384,7 +411,13 @@ fn environment_matches(left: &TerminalEnvironment, right: &TerminalEnvironment) 
 }
 
 fn paths_equivalent(left: &str, right: &str) -> bool {
-    let normalize = |value: &str| value.trim().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+    let normalize = |value: &str| {
+        value
+            .trim()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
     normalize(left) == normalize(right)
 }
 
@@ -404,17 +437,20 @@ fn launch_restart_plan(plan: &RestartPlan) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::docker::{ComposeProject, ContainerResource};
+    use crate::adapters::docker::{ContainerResource, ComposeProject};
 
-    #[test]
-    fn docker_plan_omits_resource_groups_already_running() {
-        let project = ComposeProject {
-            name: "demo".to_owned(),
+    fn project(name: &str, services: &[&str]) -> ComposeProject {
+        ComposeProject {
+            name: name.to_owned(),
             working_directory: None,
             config_files: Vec::new(),
-            services: vec!["web".to_owned()],
+            services: services.iter().map(|value| (*value).to_owned()).collect(),
             containers: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn docker_plan_omits_only_fully_satisfied_resource_groups() {
         let container = ContainerResource {
             id: "1".to_owned(),
             name: "redis".to_owned(),
@@ -427,28 +463,28 @@ mod tests {
             status: DockerStatus::Available,
             context: None,
             message: None,
-            compose_projects: vec![project.clone()],
+            compose_projects: vec![project("demo", &["web", "worker"])],
             standalone_containers: vec![container.clone()],
         };
-        let current = saved.clone();
-        let missing = missing_docker_resources(&saved, &current);
-        assert!(missing.compose_projects.is_empty());
-        assert!(missing.standalone_containers.is_empty());
-
         let current = DockerSnapshot {
             status: DockerStatus::Available,
             context: None,
             message: None,
-            compose_projects: vec![project],
-            standalone_containers: Vec::new(),
+            compose_projects: vec![project("demo", &["web"])],
+            standalone_containers: vec![container.clone()],
         };
         let missing = missing_docker_resources(&saved, &current);
+        assert_eq!(missing.compose_projects.len(), 1, "missing worker must trigger project restore");
+        assert!(missing.standalone_containers.is_empty());
+
+        let current = saved.clone();
+        let missing = missing_docker_resources(&saved, &current);
         assert!(missing.compose_projects.is_empty());
-        assert_eq!(missing.standalone_containers, vec![container]);
+        assert!(missing.standalone_containers.is_empty());
     }
 
     #[test]
-    fn terminal_matching_respects_multiplicity_and_working_directory() {
+    fn terminal_matching_respects_working_directory() {
         let session = TerminalSession {
             sources: Vec::new(),
             host: TerminalHost::WindowsTerminal,
