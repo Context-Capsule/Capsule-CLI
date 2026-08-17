@@ -9,7 +9,7 @@ use std::{
     fmt, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -255,6 +255,10 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
             response.snapshot = Some(snapshot);
             Ok(response)
         }
+        "browser.window.blank.create" => {
+            create_blank_browser_window()?;
+            Ok(success_response("browser.window.blank.created"))
+        }
         other => Err(BrowserError::Invalid(format!(
             "unknown native request type '{other}'"
         ))),
@@ -299,6 +303,57 @@ fn validate_snapshot(snapshot: &FirefoxSnapshot) -> Result<(), BrowserError> {
         ));
     }
     Ok(())
+}
+
+fn is_zen_executable(name: &str, executable_path: &str) -> bool {
+    let executable_name = Path::new(executable_path)
+        .file_name()
+        .and_then(|value| value.to_str());
+    (name.eq_ignore_ascii_case("zen") || name.eq_ignore_ascii_case("Zen Browser"))
+        && executable_name.is_some_and(|value| {
+            value.eq_ignore_ascii_case("zen.exe") || value.eq_ignore_ascii_case("zen")
+        })
+}
+
+#[cfg(windows)]
+fn create_blank_browser_window() -> Result<(), BrowserError> {
+    let desktop = crate::desktop::discover().map_err(|error| {
+        BrowserError::Command(format!("could not inspect running browsers: {error}"))
+    })?;
+    let executable = desktop
+        .applications
+        .iter()
+        .find_map(|application| {
+            let path = application.executable_path.as_deref()?;
+            is_zen_executable(&application.name, path).then(|| path.to_owned())
+        })
+        .ok_or_else(|| {
+            BrowserError::Command(
+                "Zen blank-window fallback is unavailable because no running zen.exe application was detected"
+                    .to_owned(),
+            )
+        })?;
+
+    Command::new(&executable)
+        .arg("--blank-window")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            BrowserError::Command(format!(
+                "failed to launch Zen blank window using '{}': {error}",
+                executable
+            ))
+        })?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn create_blank_browser_window() -> Result<(), BrowserError> {
+    Err(BrowserError::Command(
+        "Zen blank-window native fallback is currently implemented for Windows only".to_owned(),
+    ))
 }
 
 fn read_native_message<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, BrowserError> {
@@ -666,6 +721,23 @@ mod tests {
         snapshot.browser = "firefox".to_owned();
         snapshot.schema_version = 99;
         assert!(validate_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn zen_blank_window_detection_requires_the_expected_application_and_binary() {
+        assert!(is_zen_executable(
+            "zen",
+            r"C:\Program Files\Zen Browser\zen.exe"
+        ));
+        assert!(is_zen_executable("Zen Browser", "/opt/zen/zen"));
+        assert!(!is_zen_executable(
+            "zen",
+            r"C:\Windows\System32\cmd.exe"
+        ));
+        assert!(!is_zen_executable(
+            "Firefox",
+            r"C:\Program Files\Zen Browser\zen.exe"
+        ));
     }
 
     #[test]
