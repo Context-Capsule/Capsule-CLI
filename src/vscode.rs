@@ -7,12 +7,27 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(windows)]
+use std::ffi::c_void;
+
 pub const VSCODE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const LIVE_STATE_MAX_AGE: Duration = Duration::from_secs(90);
 const MAX_TABS: usize = 100_000;
 const MAX_EXTENSION_PATH_LENGTH: usize = 32_768;
 const VSCODE_HOST_STATE_PREFIX: &str = "vscode-host-";
 const VSCODE_HOST_STATE_SUFFIX: &str = ".json";
+
+#[cfg(windows)]
+type Handle = *mut c_void;
+#[cfg(windows)]
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+    fn CloseHandle(handle: Handle) -> i32;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +81,8 @@ pub struct TabGroupSnapshot {
 pub struct VsCodeSnapshot {
     pub schema_version: u32,
     pub captured_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_pid: Option<u32>,
     pub app_name: String,
     pub app_host: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +174,9 @@ pub fn load_recent_vscode_state() -> Result<Option<VsCodeSnapshot>, VsCodeError>
             }
             continue;
         }
+        if !snapshot_host_is_alive(&envelope.snapshot) {
+            continue;
+        }
 
         if best
             .as_ref()
@@ -173,6 +193,60 @@ pub fn load_recent_vscode_state() -> Result<Option<VsCodeSnapshot>, VsCodeError>
         return Err(error);
     }
     Ok(None)
+}
+
+pub fn live_development_host_matches_path(extension_path: &str) -> Result<bool, VsCodeError> {
+    Ok(load_recent_vscode_state()?.is_some_and(|snapshot| {
+        snapshot.extension_mode.as_deref() == Some("development")
+            && snapshot
+                .extension_path
+                .as_deref()
+                .is_some_and(|current| same_development_path(current, extension_path))
+    }))
+}
+
+fn same_development_path(left: &str, right: &str) -> bool {
+    normalize_development_path(left) == normalize_development_path(right)
+}
+
+fn normalize_development_path(value: &str) -> String {
+    let normalized = value.trim().replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    #[cfg(windows)]
+    {
+        return normalized.to_ascii_lowercase();
+    }
+    #[cfg(not(windows))]
+    {
+        normalized.to_owned()
+    }
+}
+
+fn snapshot_host_is_alive(snapshot: &VsCodeSnapshot) -> bool {
+    snapshot.host_pid.is_none_or(process_is_alive)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn process_is_alive(_pid: u32) -> bool {
+    // The Windows product path can cheaply verify extension-host liveness with
+    // OpenProcess. Other platforms continue to use the short freshness window
+    // until their process-liveness adapter is implemented.
+    true
 }
 
 pub fn runtime_state_path() -> Result<PathBuf, VsCodeError> {
@@ -321,6 +395,7 @@ mod tests {
         VsCodeSnapshot {
             schema_version: 1,
             captured_at_unix_ms: now_unix_ms(),
+            host_pid: Some(std::process::id()),
             app_name: "Visual Studio Code".to_owned(),
             app_host: "desktop".to_owned(),
             remote_name: Some("wsl".to_owned()),
@@ -367,6 +442,7 @@ mod tests {
         assert_eq!(loaded.snapshot.remote_name.as_deref(), Some("wsl"));
         assert_eq!(loaded.snapshot.tab_count(), 1);
         assert!(loaded.snapshot.is_extension_development_host());
+        assert!(snapshot_host_is_alive(&loaded.snapshot));
         fs::remove_file(path).ok();
     }
 
@@ -385,6 +461,18 @@ mod tests {
         };
         assert!(runtime_envelope_preferred(&development, &production));
         assert!(!runtime_envelope_preferred(&production, &development));
+    }
+
+    #[test]
+    fn development_path_matching_is_separator_and_case_insensitive_on_windows() {
+        #[cfg(windows)]
+        assert!(same_development_path(
+            r"C:\Work\Tri-Up\",
+            "c:/work/tri-up"
+        ));
+
+        #[cfg(not(windows))]
+        assert!(same_development_path("/work/tri-up/", "/work/tri-up"));
     }
 
     #[test]
