@@ -20,7 +20,7 @@ pub fn discover() -> Result<DesktopSnapshot, String> {
     Err("desktop discovery is currently supported on Windows only".to_owned())
 }
 
-pub(crate) fn application_running_by_executable_name(
+pub fn application_running_by_executable_name(
     executable_names: &[&str],
 ) -> Result<bool, String> {
     let snapshot = discover()?;
