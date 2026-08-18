@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+const SNAP_GEOMETRY_TOLERANCE: f64 = 0.012;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SavedDesktop {
     pub status: String,
@@ -202,6 +204,33 @@ impl SnapSlot {
             _ => return None,
         })
     }
+
+    fn normalized_geometry(self) -> SavedNormalizedRect {
+        match self {
+            Self::LeftHalf => normalized_xywh(0.0, 0.0, 0.5, 1.0),
+            Self::RightHalf => normalized_xywh(0.5, 0.0, 0.5, 1.0),
+            Self::TopHalf => normalized_xywh(0.0, 0.0, 1.0, 0.5),
+            Self::BottomHalf => normalized_xywh(0.0, 0.5, 1.0, 0.5),
+            Self::TopLeftQuarter => normalized_xywh(0.0, 0.0, 0.5, 0.5),
+            Self::TopRightQuarter => normalized_xywh(0.5, 0.0, 0.5, 0.5),
+            Self::BottomLeftQuarter => normalized_xywh(0.0, 0.5, 0.5, 0.5),
+            Self::BottomRightQuarter => normalized_xywh(0.5, 0.5, 0.5, 0.5),
+            Self::LeftThird => normalized_xywh(0.0, 0.0, 1.0 / 3.0, 1.0),
+            Self::CenterThird => normalized_xywh(1.0 / 3.0, 0.0, 1.0 / 3.0, 1.0),
+            Self::RightThird => normalized_xywh(2.0 / 3.0, 0.0, 1.0 / 3.0, 1.0),
+            Self::LeftTwoThirds => normalized_xywh(0.0, 0.0, 2.0 / 3.0, 1.0),
+            Self::RightTwoThirds => normalized_xywh(1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0),
+        }
+    }
+}
+
+fn normalized_xywh(x: f64, y: f64, width: f64, height: f64) -> SavedNormalizedRect {
+    SavedNormalizedRect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,13 +262,39 @@ pub fn choose_display<'a>(
 pub fn target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
     match window.state_spec() {
         WindowStateSpec::Fullscreen => display.bounds,
-        WindowStateSpec::Snapped(slot) => snap_rect(display.work_area, slot),
+        WindowStateSpec::Snapped(slot) if saved_snap_geometry_matches(window, slot) => {
+            snap_rect(display.work_area, slot)
+        }
+        // Older captures used a 6% snap tolerance. That was broad enough to
+        // label an ordinary near-half/near-third window as snapped. Preserve
+        // the actual saved geometry instead of inflating those legacy windows
+        // to a perfect Windows snap slot.
+        WindowStateSpec::Snapped(_) => normal_target_rect(window, display),
         WindowStateSpec::Normal => normal_target_rect(window, display),
         _ => window
             .normalized_bounds
             .and_then(|bounds| normalized_rect(display.work_area, bounds))
             .unwrap_or_else(|| fallback_rect(window, display)),
     }
+}
+
+fn saved_snap_geometry_matches(window: &SavedWindow, slot: SnapSlot) -> bool {
+    let Some(saved) = window.normalized_bounds else {
+        // Very old capsules may not have normalized geometry. In that case the
+        // explicit state is the only evidence available, so keep honoring it.
+        return true;
+    };
+    let expected = slot.normalized_geometry();
+    normalized_close(saved.x, expected.x)
+        && normalized_close(saved.y, expected.y)
+        && normalized_close(saved.width, expected.width)
+        && normalized_close(saved.height, expected.height)
+}
+
+fn normalized_close(actual: f64, expected: f64) -> bool {
+    actual.is_finite()
+        && expected.is_finite()
+        && (actual - expected).abs() <= SNAP_GEOMETRY_TOLERANCE
 }
 
 fn normal_target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
@@ -478,11 +533,39 @@ mod tests {
 
     #[test]
     fn snapped_geometry_is_recomputed_from_current_work_area() {
-        let actual = target_rect(&window("snapped:right-two-thirds"), &display());
+        let mut saved = window("snapped:right-two-thirds");
+        saved.normalized_bounds = Some(SavedNormalizedRect {
+            x: 1.0 / 3.0,
+            y: 0.0,
+            width: 2.0 / 3.0,
+            height: 1.0,
+        });
+        let actual = target_rect(&saved, &display());
         assert_eq!(actual.left, 640);
         assert_eq!(actual.top, 0);
         assert_eq!(actual.right, 1920);
         assert_eq!(actual.bottom, 1040);
+    }
+
+    #[test]
+    fn legacy_false_snap_uses_saved_normal_geometry_instead_of_expanding() {
+        let mut saved = window("snapped:left-half");
+        saved.bounds = SavedRect {
+            left: 48,
+            top: 30,
+            right: 910,
+            bottom: 990,
+        };
+        saved.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.025,
+            y: 0.029,
+            width: 0.449,
+            height: 0.923,
+        });
+        let actual = target_rect(&saved, &display());
+        assert_ne!(actual, snap_rect(display().work_area, SnapSlot::LeftHalf));
+        assert_eq!(actual.width(), 862);
+        assert!(actual.height() < display().work_area.height());
     }
 
     #[test]
