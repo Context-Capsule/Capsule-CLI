@@ -234,11 +234,42 @@ pub fn target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
     match window.state_spec() {
         WindowStateSpec::Fullscreen => display.bounds,
         WindowStateSpec::Snapped(slot) => snap_rect(display.work_area, slot),
+        WindowStateSpec::Normal => normal_target_rect(window, display),
         _ => window
             .normalized_bounds
             .and_then(|bounds| normalized_rect(display.work_area, bounds))
             .unwrap_or_else(|| fallback_rect(window, display)),
     }
+}
+
+fn normal_target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
+    let normalized = window
+        .normalized_bounds
+        .and_then(|bounds| normalized_rect(display.work_area, bounds));
+
+    // On an unchanged monitor, the captured DWM frame is the most faithful
+    // placement. Normalizing and rounding it again can magnify Electron window
+    // frame/work-area discrepancies. If the normalized reconstruction still
+    // lands near the saved pixels, we know the display topology is effectively
+    // unchanged and can restore those exact frame coordinates. When the monitor
+    // moved or changed resolution the two rectangles diverge, so keep the
+    // portable normalized placement instead.
+    if display.device_name.eq_ignore_ascii_case(&window.display_device)
+        && normalized.is_some_and(|candidate| rect_close(candidate, window.bounds, 32))
+        && rect_center_inside(window.bounds, display.bounds)
+    {
+        return window.bounds;
+    }
+
+    normalized.unwrap_or_else(|| fallback_rect(window, display))
+}
+
+fn rect_center_inside(rect: SavedRect, area: SavedRect) -> bool {
+    let (x, y) = rect.center();
+    x >= area.left as f64
+        && x <= area.right as f64
+        && y >= area.top as f64
+        && y <= area.bottom as f64
 }
 
 fn normalized_rect(reference: SavedRect, normalized: SavedNormalizedRect) -> Option<SavedRect> {
@@ -466,6 +497,18 @@ mod tests {
                 bottom: 780,
             }
         );
+    }
+
+    #[test]
+    fn normal_geometry_preserves_exact_pixels_when_topology_is_unchanged() {
+        let mut saved = window("normal");
+        saved.bounds = SavedRect {
+            left: 480,
+            top: 260,
+            right: 1440,
+            bottom: 780,
+        };
+        assert_eq!(target_rect(&saved, &display()), saved.bounds);
     }
 
     #[test]

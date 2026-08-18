@@ -12,7 +12,6 @@ mod legacy_explorer;
 #[cfg(windows)]
 mod vscode_devhost;
 #[cfg(windows)]
-#[allow(dead_code)]
 mod windows;
 
 use serde_json::Value;
@@ -70,19 +69,20 @@ impl RestoreReport {
 
 pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreReport {
     let mut report = RestoreReport::default();
-    let mut generic_desktop = None;
+    let mut activation_desktop = None;
+    let mut final_placement_desktop = None;
     let mut full_application_count = 0usize;
-    let mut zen_semantic_owner = false;
     #[cfg(windows)]
     let mut zen_bootstrap = browser_bootstrap::ZenBootstrapReport::default();
     let defer_windows_terminal = should_defer_windows_terminal(snapshot);
-    let defer_vscode_devhost = should_defer_vscode_devhost(snapshot);
+    let saved_devhost = saved_desktop_mentions_devhost(snapshot);
+    let has_vscode_semantic = has_vscode_editor_snapshot(snapshot);
     let has_browser_semantic = has_firefox_browser_snapshot(snapshot);
 
     match SavedDesktop::from_capsule(snapshot) {
         Ok(Some(desktop)) => {
             full_application_count = desktop.applications.len();
-            zen_semantic_owner = has_browser_semantic
+            let zen_semantic_owner = has_browser_semantic
                 && desktop
                     .applications
                     .iter()
@@ -98,7 +98,14 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             let prerequisite = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
-                defer_vscode_devhost,
+                saved_devhost,
+                zen_semantic_owner,
+            );
+
+            let final_target = desktop_without_semantic_owned_hosts(
+                &desktop,
+                defer_windows_terminal,
+                saved_devhost && !has_vscode_semantic,
                 zen_semantic_owner,
             );
 
@@ -132,25 +139,8 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                     .push("desktop restore is currently implemented for Windows only".to_owned());
             }
 
-            if defer_windows_terminal {
-                report.warnings.push(
-                    "Windows Terminal startup is delegated to the semantic terminal adapter so restore does not create an extra default tab before recreating the saved sessions"
-                        .to_owned(),
-                );
-            }
-            if defer_vscode_devhost {
-                report.warnings.push(
-                    "VS Code Extension Development Host startup is delegated to its semantic adapter so restore does not create an extra normal Code window first"
-                        .to_owned(),
-                );
-            }
-            if zen_semantic_owner {
-                report.warnings.push(
-                    "Zen browser window creation and placement are delegated to the semantic browser adapter so Zen Window Sync cannot clone or mutate the current Space during generic desktop restore"
-                        .to_owned(),
-                );
-            }
-            generic_desktop = Some(prerequisite);
+            activation_desktop = Some(prerequisite);
+            final_placement_desktop = Some(final_target);
         }
         Ok(None) => report
             .warnings
@@ -174,12 +164,12 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     let orphaned_vscode_terminals = suppress_orphan_vscode_semantic(&mut semantic_snapshot);
     if orphaned_vscode_terminals > 0 {
         report.warnings.push(format!(
-            "VS Code semantic restore skipped {orphaned_vscode_terminals} integrated terminal session(s) because this capsule contains no VS Code editor snapshot to identify a target extension host; legacy terminal metadata alone cannot be routed safely"
+            "Skipped {orphaned_vscode_terminals} legacy VS Code terminal session(s): this capsule has no semantic VS Code host identity."
         ));
     }
-    if !has_vscode_editor_snapshot(snapshot) && saved_desktop_mentions_devhost(snapshot) {
+    if !has_vscode_semantic && saved_devhost {
         report.warnings.push(
-            "VS Code restore: the capsule contains an Extension Development Host window but no semantic editor snapshot. Its open editor tabs were not captured in this capsule, so they cannot be reconstructed exactly; re-save once with the updated VS Code extension to preserve them."
+            "The capsule contains an Extension Development Host but no semantic VS Code snapshot. Context Capsule left that Dev Host's tabs, terminals, and geometry untouched because it cannot route them safely without host identity data."
                 .to_owned(),
         );
     }
@@ -194,11 +184,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             "Explorer restore: would open {} missing folder window(s)",
             explorer.planned_to_open
         ));
-    } else if explorer.opened > 0 {
-        report.warnings.push(format!(
-            "Explorer restore: opened {} missing folder window(s)",
-            explorer.opened
-        ));
     }
     report.warnings.extend(explorer.warnings);
     report.failures.extend(explorer.failures);
@@ -211,11 +196,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 "Legacy Explorer restore: would open {} safe Home/Quick access window(s)",
                 legacy_explorer.planned
             ));
-        } else if legacy_explorer.opened > 0 {
-            report.warnings.push(format!(
-                "Legacy Explorer restore: opened {} safe Home/Quick access window(s)",
-                legacy_explorer.opened
-            ));
         }
         report.warnings.extend(legacy_explorer.warnings);
         report.failures.extend(legacy_explorer.failures);
@@ -223,7 +203,7 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
 
     #[cfg(windows)]
     if !options.dry_run {
-        if let Some(desktop) = generic_desktop.as_ref() {
+        if let Some(desktop) = activation_desktop.as_ref() {
             let activation =
                 activation::reactivate_background_only_apps(desktop, defer_windows_terminal);
             report.warnings.extend(activation.warnings);
@@ -233,7 +213,7 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
 
     #[cfg(windows)]
     if !options.dry_run {
-        if let Some(desktop) = generic_desktop.as_ref() {
+        if let Some(desktop) = final_placement_desktop.as_ref() {
             let initial_launched = report.desktop.applications_launched;
             let initial_already_running = report.desktop.applications_already_running;
             let initial_planned = report.desktop.applications_planned_to_launch;
@@ -301,24 +281,6 @@ fn suppress_orphan_vscode_semantic(snapshot: &mut Value) -> usize {
     before.saturating_sub(sessions.len())
 }
 
-fn should_defer_vscode_devhost(snapshot: &Value) -> bool {
-    let editor = snapshot
-        .pointer("/editors/vscode")
-        .filter(|value| !value.is_null());
-    if editor
-        .and_then(|value| value.get("extensionMode"))
-        .and_then(Value::as_str)
-        == Some("development")
-    {
-        return true;
-    }
-
-    // A legacy window title is only actionable when a semantic editor snapshot
-    // exists. Deferring an entire Code application without editor data can leave
-    // the restore with no component responsible for starting or targeting it.
-    editor.is_some() && saved_desktop_mentions_devhost(snapshot)
-}
-
 fn saved_desktop_mentions_devhost(snapshot: &Value) -> bool {
     snapshot
         .pointer("/desktop/applications")
@@ -347,11 +309,30 @@ fn desktop_without_semantic_owned_hosts(
     defer_zen_browser: bool,
 ) -> SavedDesktop {
     let mut filtered = desktop.clone();
-    filtered.applications.retain(|application| {
-        !(defer_windows_terminal && is_windows_terminal_application(application))
-            && !(defer_vscode_devhost && is_vscode_devhost_application(application))
-            && !(defer_zen_browser && is_zen_semantic_application(application))
-    });
+    filtered.applications = desktop
+        .applications
+        .iter()
+        .filter_map(|saved_application| {
+            if defer_windows_terminal && is_windows_terminal_application(saved_application) {
+                return None;
+            }
+            if defer_zen_browser && is_zen_semantic_application(saved_application) {
+                return None;
+            }
+
+            let had_devhost = is_vscode_devhost_application(saved_application);
+            let mut application = saved_application.clone();
+            if defer_vscode_devhost && had_devhost {
+                application
+                    .windows
+                    .retain(|window| !is_vscode_devhost_title(&window.title));
+                if application.windows.is_empty() && !application.discovered_as_background {
+                    return None;
+                }
+            }
+            Some(application)
+        })
+        .collect();
     filtered
 }
 
@@ -473,23 +454,14 @@ mod tests {
             displays: Vec::new(),
             applications: vec![
                 application("zen", Some(r"C:\Program Files\Zen Browser\zen.exe")),
-                application(
-                    "Mozilla Firefox",
-                    Some(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
-                ),
+                application("Mozilla Firefox", Some(r"C:\Program Files\Mozilla Firefox\firefox.exe")),
                 application("Spotify", Some(r"C:\Users\me\Spotify.exe")),
             ],
         };
         let filtered = desktop_without_semantic_owned_hosts(&desktop, false, false, true);
         assert_eq!(filtered.applications.len(), 2);
-        assert!(filtered
-            .applications
-            .iter()
-            .any(|application| application.name == "Mozilla Firefox"));
-        assert!(filtered
-            .applications
-            .iter()
-            .any(|application| application.name == "Spotify"));
+        assert!(filtered.applications.iter().any(|application| application.name == "Mozilla Firefox"));
+        assert!(filtered.applications.iter().any(|application| application.name == "Spotify"));
 
         let unfiltered = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
         assert_eq!(unfiltered.applications.len(), 3);
@@ -498,50 +470,72 @@ mod tests {
     #[test]
     fn windows_terminal_is_deferred_only_when_a_safe_terminal_plan_exists() {
         assert!(should_defer_windows_terminal(&json!({
-            "terminals": {
-                "sessions": [{
-                    "host": "windows-terminal",
-                    "restart": { "executable": "wt.exe", "args": [] }
-                }]
-            }
+            "terminals": { "sessions": [{ "host": "windows-terminal", "restart": { "executable": "wt.exe", "args": [] } }] }
         })));
         assert!(!should_defer_windows_terminal(&json!({
-            "terminals": {
-                "sessions": [{ "host": "windows-terminal", "restart": null }]
-            }
+            "terminals": { "sessions": [{ "host": "windows-terminal", "restart": null }] }
         })));
     }
 
     #[test]
-    fn vscode_devhost_is_deferred_only_when_semantic_editor_state_can_target_it() {
-        assert!(should_defer_vscode_devhost(&json!({
-            "editors": { "vscode": { "extensionMode": "development" } }
-        })));
-        assert!(should_defer_vscode_devhost(&json!({
-            "editors": { "vscode": { "schemaVersion": 1 } },
-            "desktop": { "applications": [{
-                "windows": [{ "title": "project - Visual Studio Code [Extension Development Host]" }]
-            }] }
-        })));
-        assert!(!should_defer_vscode_devhost(&json!({
-            "editors": { "vscode": null },
-            "desktop": { "applications": [{
-                "windows": [{ "title": "project - Visual Studio Code [Extension Development Host]" }]
-            }] }
-        })));
+    fn devhost_window_is_removed_without_dropping_normal_code_windows() {
+        let mut code = application("Visual Studio Code", Some(r"C:\Program Files\Microsoft VS Code\Code.exe"));
+        let base = SavedWindow {
+            title: "ordinary - Visual Studio Code".to_owned(),
+            bounds: SavedRect { left: 0, top: 0, right: 900, bottom: 700 },
+            restore_bounds: None,
+            normalized_bounds: None,
+            state: "normal".to_owned(),
+            display_device: "DISPLAY1".to_owned(),
+            display_relation: "primary".to_owned(),
+            display_scale_percent: 100,
+            is_foreground: false,
+            z_order: 0,
+            virtual_desktop_id: None,
+            is_on_current_virtual_desktop: Some(true),
+            taskbar_candidate: true,
+        };
+        let mut dev = base.clone();
+        dev.title = "extension - Visual Studio Code [Extension Development Host]".to_owned();
+        code.windows = vec![base, dev];
+        let desktop = SavedDesktop { status: "available".to_owned(), displays: vec![], applications: vec![code] };
+        let filtered = desktop_without_semantic_owned_hosts(&desktop, false, true, false);
+        assert_eq!(filtered.applications.len(), 1);
+        assert_eq!(filtered.applications[0].windows.len(), 1);
+        assert!(!is_vscode_devhost_title(&filtered.applications[0].windows[0].title));
+    }
+
+    #[test]
+    fn devhost_only_application_is_removed_from_pre_semantic_desktop() {
+        let mut code = application("Visual Studio Code", Some(r"C:\Program Files\Microsoft VS Code\Code.exe"));
+        code.windows = vec![SavedWindow {
+            title: "extension - Visual Studio Code [Extension Development Host]".to_owned(),
+            bounds: SavedRect { left: 100, top: 100, right: 1000, bottom: 800 },
+            restore_bounds: None,
+            normalized_bounds: None,
+            state: "normal".to_owned(),
+            display_device: "DISPLAY1".to_owned(),
+            display_relation: "primary".to_owned(),
+            display_scale_percent: 100,
+            is_foreground: true,
+            z_order: 0,
+            virtual_desktop_id: None,
+            is_on_current_virtual_desktop: Some(true),
+            taskbar_candidate: true,
+        }];
+        let desktop = SavedDesktop { status: "available".to_owned(), displays: vec![], applications: vec![code] };
+        assert!(desktop_without_semantic_owned_hosts(&desktop, false, true, false).applications.is_empty());
     }
 
     #[test]
     fn orphan_vscode_terminals_are_removed_without_touching_external_sessions() {
         let mut snapshot = json!({
             "editors": { "vscode": null },
-            "terminals": {
-                "sessions": [
-                    { "host": "visual-studio-code" },
-                    { "host": "visual-studio-code" },
-                    { "host": "windows-terminal" }
-                ]
-            }
+            "terminals": { "sessions": [
+                { "host": "visual-studio-code" },
+                { "host": "visual-studio-code" },
+                { "host": "windows-terminal" }
+            ] }
         });
         assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 2);
         let sessions = snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap();
