@@ -433,6 +433,21 @@ mod tests {
     }
 
     #[test]
+    fn semantic_dry_run_does_not_require_a_desktop_snapshot() {
+        let report = restore_snapshot(
+            &json!({
+                "browsers": { "firefox": { "schema_version": 1, "browser": "firefox" } }
+            }),
+            RestoreOptions { dry_run: true },
+        );
+        assert!(report.success());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Firefox semantic restore")));
+    }
+
+    #[test]
     fn zen_semantic_snapshot_owns_only_zen_desktop_apps() {
         let desktop = SavedDesktop {
             status: "available".to_owned(),
@@ -447,6 +462,9 @@ mod tests {
         assert_eq!(filtered.applications.len(), 2);
         assert!(filtered.applications.iter().any(|application| application.name == "Mozilla Firefox"));
         assert!(filtered.applications.iter().any(|application| application.name == "Spotify"));
+
+        let unfiltered = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
+        assert_eq!(unfiltered.applications.len(), 3);
     }
 
     #[test]
@@ -523,5 +541,40 @@ mod tests {
         let sessions = snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["host"], "windows-terminal");
+    }
+
+    #[test]
+    fn vscode_terminals_remain_when_editor_snapshot_exists() {
+        let mut snapshot = json!({
+            "editors": { "vscode": { "schemaVersion": 1 } },
+            "terminals": { "sessions": [{ "host": "visual-studio-code" }] }
+        });
+        assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 0);
+        assert_eq!(snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn windows_terminal_identity_detection_handles_paths_and_aumids() {
+        let base = SavedApplication {
+            name: "Terminal".to_owned(),
+            executable_path: Some(
+                r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"
+                    .to_owned(),
+            ),
+            app_user_model_id: None,
+            file_version: None,
+            classification: "user-application".to_owned(),
+            launch: None,
+            windows: Vec::new(),
+            discovered_as_background: false,
+        };
+        assert!(is_windows_terminal_application(&base));
+
+        let mut packaged = base.clone();
+        packaged.executable_path = None;
+        packaged.app_user_model_id = Some(
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned(),
+        );
+        assert!(is_windows_terminal_application(&packaged));
     }
 }
