@@ -164,7 +164,14 @@ pub fn display_relation(display: Rect, primary: Rect, is_primary: bool) -> Strin
 }
 
 pub fn detect_snap(bounds: NormalizedRect) -> Option<SnapPosition> {
-    const TOLERANCE: f64 = 0.06;
+    // This must be deliberately strict. The old 6% tolerance could turn an
+    // ordinary user-sized Notepad/Explorer window that merely happened to sit
+    // near a half/third layout into an exact Windows snap slot on restore,
+    // making it visibly larger than it was when captured. Real Windows snap
+    // geometry differs from the idealized fractions by only a small frame/DPI
+    // margin, so ~1.2% is enough to absorb borders without classifying normal
+    // windows as snapped.
+    const TOLERANCE: f64 = 0.012;
 
     let patterns = [
         (SnapPosition::LeftHalf, 0.0, 0.0, 0.5, 1.0),
@@ -264,6 +271,32 @@ mod tests {
                 height: 1.0
             }),
             Some(SnapPosition::RightTwoThirds)
+        );
+    }
+
+    #[test]
+    fn ordinary_near_half_window_is_not_promoted_to_snap_slot() {
+        assert_eq!(
+            detect_snap(NormalizedRect {
+                x: 0.025,
+                y: 0.02,
+                width: 0.46,
+                height: 0.96
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn small_frame_variance_still_counts_as_snapped() {
+        assert_eq!(
+            detect_snap(NormalizedRect {
+                x: 0.004,
+                y: 0.003,
+                width: 0.504,
+                height: 0.994
+            }),
+            Some(SnapPosition::LeftHalf)
         );
     }
 
