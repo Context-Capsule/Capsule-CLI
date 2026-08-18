@@ -190,6 +190,7 @@ impl TerminalSnapshot {
         }
     }
 
+    #[cfg(not(windows))]
     fn unsupported(message: impl Into<String>) -> Self {
         Self {
             status: TerminalStatus::Unsupported,
