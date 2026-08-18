@@ -5,7 +5,7 @@
 
 pub mod adapters;
 pub mod browser;
-mod desktop;
+pub mod desktop;
 pub mod explorer;
 pub mod persistence;
 pub mod restore;
