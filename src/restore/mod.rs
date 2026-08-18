@@ -95,8 +95,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 report.failures.extend(zen_bootstrap.failures.clone());
             }
 
-            // Never let generic launch/placement touch an Extension Development
-            // Host before the semantic adapter has identified the correct host.
             let prerequisite = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
@@ -104,10 +102,6 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 zen_semantic_owner,
             );
 
-            // If semantic editor data exists, add the Dev Host back only for the
-            // final placement pass, after its semantic restore has completed. If
-            // editor data is missing, leave that window untouched rather than
-            // resizing or launching a normal Code window as a substitute.
             let final_target = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
@@ -318,23 +312,21 @@ fn desktop_without_semantic_owned_hosts(
     filtered.applications = desktop
         .applications
         .iter()
-        .filter_map(|application| {
-            if defer_windows_terminal && is_windows_terminal_application(application) {
+        .filter_map(|saved_application| {
+            if defer_windows_terminal && is_windows_terminal_application(saved_application) {
                 return None;
             }
-            if defer_zen_browser && is_zen_semantic_application(application) {
+            if defer_zen_browser && is_zen_semantic_application(saved_application) {
                 return None;
             }
 
-            let mut application = application.clone();
-            if defer_vscode_devhost {
+            let had_devhost = is_vscode_devhost_application(saved_application);
+            let mut application = saved_application.clone();
+            if defer_vscode_devhost && had_devhost {
                 application
                     .windows
                     .retain(|window| !is_vscode_devhost_title(&window.title));
-                if application.windows.is_empty()
-                    && !application.discovered_as_background
-                    && is_vscode_devhost_application(application.as_ref_or_self())
-                {
+                if application.windows.is_empty() && !application.discovered_as_background {
                     return None;
                 }
             }
@@ -342,16 +334,6 @@ fn desktop_without_semantic_owned_hosts(
         })
         .collect();
     filtered
-}
-
-trait ApplicationSelfRef {
-    fn as_ref_or_self(&self) -> &SavedApplication;
-}
-
-impl ApplicationSelfRef for SavedApplication {
-    fn as_ref_or_self(&self) -> &SavedApplication {
-        self
-    }
 }
 
 fn is_vscode_devhost_title(title: &str) -> bool {
@@ -503,6 +485,28 @@ mod tests {
         assert_eq!(filtered.applications.len(), 1);
         assert_eq!(filtered.applications[0].windows.len(), 1);
         assert!(!is_vscode_devhost_title(&filtered.applications[0].windows[0].title));
+    }
+
+    #[test]
+    fn devhost_only_application_is_removed_from_pre_semantic_desktop() {
+        let mut code = application("Visual Studio Code", Some(r"C:\Program Files\Microsoft VS Code\Code.exe"));
+        code.windows = vec![SavedWindow {
+            title: "extension - Visual Studio Code [Extension Development Host]".to_owned(),
+            bounds: SavedRect { left: 100, top: 100, right: 1000, bottom: 800 },
+            restore_bounds: None,
+            normalized_bounds: None,
+            state: "normal".to_owned(),
+            display_device: "DISPLAY1".to_owned(),
+            display_relation: "primary".to_owned(),
+            display_scale_percent: 100,
+            is_foreground: true,
+            z_order: 0,
+            virtual_desktop_id: None,
+            is_on_current_virtual_desktop: Some(true),
+            taskbar_candidate: true,
+        }];
+        let desktop = SavedDesktop { status: "available".to_owned(), displays: vec![], applications: vec![code] };
+        assert!(desktop_without_semantic_owned_hosts(&desktop, false, true, false).applications.is_empty());
     }
 
     #[test]
