@@ -13,6 +13,7 @@ use std::ffi::c_void;
 pub const VSCODE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const LIVE_STATE_MAX_AGE: Duration = Duration::from_secs(90);
 const MAX_TABS: usize = 100_000;
+const MAX_TERMINALS: usize = 10_000;
 const MAX_EXTENSION_PATH_LENGTH: usize = 32_768;
 const VSCODE_HOST_STATE_PREFIX: &str = "vscode-host-";
 const VSCODE_HOST_STATE_SUFFIX: &str = ".json";
@@ -77,6 +78,29 @@ pub struct TabGroupSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IntegratedTerminalShellArgs {
+    String(String),
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegratedTerminalSnapshot {
+    pub name: String,
+    pub kind: String,
+    pub restorable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_args: Option<IntegratedTerminalShellArgs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd_is_uri: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VsCodeSnapshot {
     pub schema_version: u32,
@@ -91,6 +115,8 @@ pub struct VsCodeSnapshot {
     pub extension_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_detection: Option<String>,
     pub workspace_trusted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_file: Option<String>,
@@ -99,6 +125,8 @@ pub struct VsCodeSnapshot {
     pub visible_editor_selections: Vec<EditorSelectionSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_editor_uri: Option<String>,
+    #[serde(default)]
+    pub integrated_terminals: Vec<IntegratedTerminalSnapshot>,
 }
 
 impl VsCodeSnapshot {
@@ -243,9 +271,6 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(not(windows))]
 fn process_is_alive(_pid: u32) -> bool {
-    // The Windows product path can cheaply verify extension-host liveness with
-    // OpenProcess. Other platforms continue to use the short freshness window
-    // until their process-liveness adapter is implemented.
     true
 }
 
@@ -355,6 +380,11 @@ fn validate_snapshot(snapshot: &VsCodeSnapshot) -> Result<(), VsCodeError> {
             "VS Code snapshot contains too many tabs".to_owned(),
         ));
     }
+    if snapshot.integrated_terminals.len() > MAX_TERMINALS {
+        return Err(VsCodeError::Invalid(
+            "VS Code snapshot contains too many integrated terminals".to_owned(),
+        ));
+    }
     if snapshot
         .extension_path
         .as_ref()
@@ -401,6 +431,7 @@ mod tests {
             remote_name: Some("wsl".to_owned()),
             extension_mode: Some("development".to_owned()),
             extension_path: Some(r"C:\work\Capsule-VSCode-Extension".to_owned()),
+            host_detection: Some("workspace-development-extension".to_owned()),
             workspace_trusted: true,
             workspace_file: None,
             workspace_folders: vec![WorkspaceFolderSnapshot {
@@ -426,6 +457,17 @@ mod tests {
             }],
             visible_editor_selections: Vec::new(),
             active_editor_uri: None,
+            integrated_terminals: vec![IntegratedTerminalSnapshot {
+                name: "PowerShell".to_owned(),
+                kind: "process".to_owned(),
+                restorable: true,
+                shell_path: Some("pwsh.exe".to_owned()),
+                shell_args: Some(IntegratedTerminalShellArgs::List(vec![
+                    "-NoLogo".to_owned(),
+                ])),
+                cwd: Some("file:///C:/work/project".to_owned()),
+                cwd_is_uri: Some(true),
+            }],
         }
     }
 
@@ -440,10 +482,60 @@ mod tests {
         let loaded = read_runtime_state_at(&path).unwrap();
         validate_snapshot(&loaded.snapshot).unwrap();
         assert_eq!(loaded.snapshot.remote_name.as_deref(), Some("wsl"));
+        assert_eq!(
+            loaded.snapshot.host_detection.as_deref(),
+            Some("workspace-development-extension")
+        );
         assert_eq!(loaded.snapshot.tab_count(), 1);
+        assert_eq!(loaded.snapshot.integrated_terminals.len(), 1);
         assert!(loaded.snapshot.is_extension_development_host());
         assert!(snapshot_host_is_alive(&loaded.snapshot));
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn typescript_sidecar_fields_survive_rust_round_trip() {
+        let raw = serde_json::json!({
+            "updatedAtUnixMs": now_unix_ms(),
+            "snapshot": {
+                "schemaVersion": 1,
+                "capturedAtUnixMs": now_unix_ms(),
+                "hostPid": std::process::id(),
+                "appName": "Visual Studio Code",
+                "appHost": "desktop",
+                "extensionMode": "development",
+                "extensionPath": "C:/work/extension",
+                "hostDetection": "workspace-development-extension",
+                "workspaceTrusted": true,
+                "workspaceFolders": [],
+                "tabGroups": [],
+                "visibleEditorSelections": [],
+                "integratedTerminals": [{
+                    "name": "PowerShell",
+                    "kind": "process",
+                    "restorable": true,
+                    "shellPath": "pwsh.exe",
+                    "shellArgs": ["-NoLogo"],
+                    "cwd": "file:///C:/work/extension",
+                    "cwdIsUri": true
+                }]
+            }
+        });
+        let envelope: RuntimeEnvelope = serde_json::from_value(raw).unwrap();
+        let serialized = serde_json::to_value(&envelope.snapshot).unwrap();
+        assert_eq!(
+            serialized
+                .get("hostDetection")
+                .and_then(serde_json::Value::as_str),
+            Some("workspace-development-extension")
+        );
+        assert_eq!(
+            serialized
+                .get("integratedTerminals")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]
@@ -466,10 +558,7 @@ mod tests {
     #[test]
     fn development_path_matching_is_separator_and_case_insensitive_on_windows() {
         #[cfg(windows)]
-        assert!(same_development_path(
-            r"C:\Work\Tri-Up\",
-            "c:/work/tri-up"
-        ));
+        assert!(same_development_path(r"C:\Work\Tri-Up\", "c:/work/tri-up"));
 
         #[cfg(not(windows))]
         assert!(same_development_path("/work/tri-up/", "/work/tri-up"));
