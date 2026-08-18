@@ -271,9 +271,6 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(not(windows))]
 fn process_is_alive(_pid: u32) -> bool {
-    // The Windows product path can cheaply verify extension-host liveness with
-    // OpenProcess. Other platforms continue to use the short freshness window
-    // until their process-liveness adapter is implemented.
     true
 }
 
@@ -465,7 +462,9 @@ mod tests {
                 kind: "process".to_owned(),
                 restorable: true,
                 shell_path: Some("pwsh.exe".to_owned()),
-                shell_args: Some(IntegratedTerminalShellArgs::List(vec!["-NoLogo".to_owned()])),
+                shell_args: Some(IntegratedTerminalShellArgs::List(vec![
+                    "-NoLogo".to_owned(),
+                ])),
                 cwd: Some("file:///C:/work/project".to_owned()),
                 cwd_is_uri: Some(true),
             }],
@@ -483,7 +482,10 @@ mod tests {
         let loaded = read_runtime_state_at(&path).unwrap();
         validate_snapshot(&loaded.snapshot).unwrap();
         assert_eq!(loaded.snapshot.remote_name.as_deref(), Some("wsl"));
-        assert_eq!(loaded.snapshot.host_detection.as_deref(), Some("workspace-development-extension"));
+        assert_eq!(
+            loaded.snapshot.host_detection.as_deref(),
+            Some("workspace-development-extension")
+        );
         assert_eq!(loaded.snapshot.tab_count(), 1);
         assert_eq!(loaded.snapshot.integrated_terminals.len(), 1);
         assert!(loaded.snapshot.is_extension_development_host());
@@ -522,7 +524,9 @@ mod tests {
         let envelope: RuntimeEnvelope = serde_json::from_value(raw).unwrap();
         let serialized = serde_json::to_value(&envelope.snapshot).unwrap();
         assert_eq!(
-            serialized.get("hostDetection").and_then(serde_json::Value::as_str),
+            serialized
+                .get("hostDetection")
+                .and_then(serde_json::Value::as_str),
             Some("workspace-development-extension")
         );
         assert_eq!(
@@ -554,10 +558,7 @@ mod tests {
     #[test]
     fn development_path_matching_is_separator_and_case_insensitive_on_windows() {
         #[cfg(windows)]
-        assert!(same_development_path(
-            r"C:\Work\Tri-Up\",
-            "c:/work/tri-up"
-        ));
+        assert!(same_development_path(r"C:\Work\Tri-Up\", "c:/work/tri-up"));
 
         #[cfg(not(windows))]
         assert!(same_development_path("/work/tri-up/", "/work/tri-up"));
