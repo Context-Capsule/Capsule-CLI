@@ -20,7 +20,7 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         return report;
     };
 
-    match crate::desktop::application_running_by_executable_name(&["zen.exe", "zen"]) {
+    match zen_is_running() {
         Ok(true) => {
             report.already_running = true;
             return report;
@@ -44,9 +44,6 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
 
     report.planned = true;
     if dry_run {
-        report.warnings.push(format!(
-            "Zen bootstrap: would start a native blank Zen window using '{executable}' before semantic browser restore"
-        ));
         return report;
     }
 
@@ -57,19 +54,26 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(_) => {
-            report.launched = true;
-            report.warnings.push(
-                "Zen bootstrap: started one native blank window because Zen was fully closed; semantic browser restore owns all saved tab/window reconstruction"
-                    .to_owned(),
-            );
-        }
+        Ok(_) => report.launched = true,
         Err(error) => report.failures.push(format!(
             "Zen bootstrap: failed to launch '{executable} --blank-window': {error}"
         )),
     }
 
     report
+}
+
+fn zen_is_running() -> Result<bool, String> {
+    let snapshot = crate::desktop::discover()?;
+    Ok(snapshot.applications.iter().any(|application| {
+        application
+            .executable_path
+            .as_deref()
+            .and_then(executable_basename)
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen")
+            })
+    }))
 }
 
 fn is_zen_application(application: &SavedApplication) -> bool {
