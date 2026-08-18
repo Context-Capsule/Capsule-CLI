@@ -248,7 +248,11 @@ pub fn choose_display<'a>(
 ) -> Option<&'a TargetDisplay> {
     displays
         .iter()
-        .find(|display| display.device_name.eq_ignore_ascii_case(&window.display_device))
+        .find(|display| {
+            display
+                .device_name
+                .eq_ignore_ascii_case(&window.display_device)
+        })
         .or_else(|| {
             displays.iter().find(|display| {
                 !window.display_relation.is_empty()
@@ -265,10 +269,6 @@ pub fn target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
         WindowStateSpec::Snapped(slot) if saved_snap_geometry_matches(window, slot) => {
             snap_rect(display.work_area, slot)
         }
-        // Older captures used a 6% snap tolerance. That was broad enough to
-        // label an ordinary near-half/near-third window as snapped. Preserve
-        // the actual saved geometry instead of inflating those legacy windows
-        // to a perfect Windows snap slot.
         WindowStateSpec::Snapped(_) => normal_target_rect(window, display),
         WindowStateSpec::Normal => normal_target_rect(window, display),
         _ => window
@@ -280,8 +280,6 @@ pub fn target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
 
 fn saved_snap_geometry_matches(window: &SavedWindow, slot: SnapSlot) -> bool {
     let Some(saved) = window.normalized_bounds else {
-        // Very old capsules may not have normalized geometry. In that case the
-        // explicit state is the only evidence available, so keep honoring it.
         return true;
     };
     let expected = slot.normalized_geometry();
@@ -302,14 +300,9 @@ fn normal_target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRec
         .normalized_bounds
         .and_then(|bounds| normalized_rect(display.work_area, bounds));
 
-    // On an unchanged monitor, the captured DWM frame is the most faithful
-    // placement. Normalizing and rounding it again can magnify Electron window
-    // frame/work-area discrepancies. If the normalized reconstruction still
-    // lands near the saved pixels, we know the display topology is effectively
-    // unchanged and can restore those exact frame coordinates. When the monitor
-    // moved or changed resolution the two rectangles diverge, so keep the
-    // portable normalized placement instead.
-    if display.device_name.eq_ignore_ascii_case(&window.display_device)
+    if display
+        .device_name
+        .eq_ignore_ascii_case(&window.display_device)
         && normalized.is_some_and(|candidate| rect_close(candidate, window.bounds, 32))
         && rect_center_inside(window.bounds, display.bounds)
     {
@@ -357,8 +350,14 @@ fn normalized_rect(reference: SavedRect, normalized: SavedNormalizedRect) -> Opt
 
 fn fallback_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
     let source = window.restore_bounds.unwrap_or(window.bounds);
-    let source_width = source.width().max(240).min(display.work_area.width().max(240));
-    let source_height = source.height().max(160).min(display.work_area.height().max(160));
+    let source_width = source
+        .width()
+        .max(240)
+        .min(display.work_area.width().max(240));
+    let source_height = source
+        .height()
+        .max(160)
+        .min(display.work_area.height().max(160));
     clamp_rect(
         SavedRect {
             left: display.work_area.left,
@@ -397,9 +396,12 @@ pub fn snap_rect(area: SavedRect, slot: SnapSlot) -> SavedRect {
         ),
         SnapSlot::LeftThird => rect_xywh(area.left, area.top, third_w, height),
         SnapSlot::CenterThird => rect_xywh(area.left + third_w, area.top, third_w, height),
-        SnapSlot::RightThird => {
-            rect_xywh(area.left + 2 * third_w, area.top, width - 2 * third_w, height)
-        }
+        SnapSlot::RightThird => rect_xywh(
+            area.left + 2 * third_w,
+            area.top,
+            width - 2 * third_w,
+            height,
+        ),
         SnapSlot::LeftTwoThirds => rect_xywh(area.left, area.top, 2 * third_w, height),
         SnapSlot::RightTwoThirds => {
             rect_xywh(area.left + third_w, area.top, width - third_w, height)
@@ -606,7 +608,10 @@ mod tests {
 
     #[test]
     fn title_matching_prefers_exact_then_related_titles() {
-        assert_eq!(title_match_score("README.md - Code", "README.md - Code"), 100);
+        assert_eq!(
+            title_match_score("README.md - Code", "README.md - Code"),
+            100
+        );
         assert!(title_match_score("README.md - Code", "README.md - Visual Studio Code") > 0);
         assert_eq!(title_match_score("README.md", "Settings"), 0);
     }
