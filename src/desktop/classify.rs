@@ -259,7 +259,7 @@ mod tests {
                 x: 0.0,
                 y: 0.0,
                 width: 0.5,
-                height: 1.0
+                height: 1.0,
             }),
             Some(SnapPosition::LeftHalf)
         );
@@ -268,7 +268,7 @@ mod tests {
                 x: 0.334,
                 y: 0.0,
                 width: 0.666,
-                height: 1.0
+                height: 1.0,
             }),
             Some(SnapPosition::RightTwoThirds)
         );
@@ -281,7 +281,7 @@ mod tests {
                 x: 0.025,
                 y: 0.02,
                 width: 0.46,
-                height: 0.96
+                height: 0.96,
             }),
             None
         );
@@ -294,7 +294,7 @@ mod tests {
                 x: 0.004,
                 y: 0.003,
                 width: 0.504,
-                height: 0.994
+                height: 0.994,
             }),
             Some(SnapPosition::LeftHalf)
         );
@@ -307,7 +307,7 @@ mod tests {
                 x: 0.12,
                 y: 0.11,
                 width: 0.71,
-                height: 0.77
+                height: 0.77,
             }),
             None
         );
