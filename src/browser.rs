@@ -1,4 +1,5 @@
 use crate::{
+    logging::{self, LogLevel},
     persistence::{CapsuleStore, PersistenceError},
     restore_bus::{self, RestoreRequest},
 };
@@ -104,6 +105,10 @@ struct NativeRequest {
     restore_warnings: Vec<String>,
     #[serde(default)]
     restore_error: Option<String>,
+    #[serde(default)]
+    log_level: Option<String>,
+    #[serde(default)]
+    log_message: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -164,9 +169,15 @@ impl From<PersistenceError> for BrowserError {
 }
 
 pub fn run_native_host() -> Result<(), BrowserError> {
+    logging::info("firefox", "native messaging host session started");
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_native_host_io(stdin.lock(), stdout.lock())
+    let result = run_native_host_io(stdin.lock(), stdout.lock());
+    match &result {
+        Ok(()) => logging::info("firefox", "native messaging host session ended"),
+        Err(_) => logging::error("firefox", "native messaging host session failed"),
+    }
+    result
 }
 
 fn run_native_host_io<R: Read, W: Write>(mut reader: R, mut writer: W) -> Result<(), BrowserError> {
@@ -180,23 +191,30 @@ fn run_native_host_io<R: Read, W: Write>(mut reader: R, mut writer: W) -> Result
 
 fn handle_request(request: NativeRequest) -> NativeResponse {
     let request_id = request.request_id.clone();
+    let request_kind = request.kind.clone();
     let result = handle_request_inner(request);
     match result {
         Ok(mut response) => {
             response.request_id = request_id;
             response
         }
-        Err(error) => NativeResponse {
-            protocol_version: NATIVE_PROTOCOL_VERSION,
-            request_id,
-            kind: "error".to_owned(),
-            ok: false,
-            error: Some(error.to_string()),
-            snapshot: None,
-            stored_at_unix_ms: None,
-            host_version: None,
-            restore_request: None,
-        },
+        Err(error) => {
+            logging::error(
+                "firefox",
+                format!("native request failed; type={request_kind}; error={error}"),
+            );
+            NativeResponse {
+                protocol_version: NATIVE_PROTOCOL_VERSION,
+                request_id,
+                kind: "error".to_owned(),
+                ok: false,
+                error: Some(error.to_string()),
+                snapshot: None,
+                stored_at_unix_ms: None,
+                host_version: None,
+                restore_request: None,
+            }
+        }
     }
 }
 
@@ -217,24 +235,65 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
             response.restore_request = restore_bus::read_request("firefox")?;
             Ok(response)
         }
+        "browser.log.append" => {
+            let level = parse_native_log_level(request.log_level.as_deref())?;
+            let message = request
+                .log_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .ok_or_else(|| {
+                    BrowserError::Invalid("browser.log.append requires log_message".to_owned())
+                })?;
+            logging::append("firefox", level, message)?;
+            Ok(success_response("browser.log.appended"))
+        }
         "browser.state.update" => {
             let snapshot = request.snapshot.ok_or_else(|| {
                 BrowserError::Invalid("browser.state.update requires snapshot".to_owned())
             })?;
             validate_snapshot(&snapshot)?;
             let stored_at = write_runtime_state(&snapshot)?;
+            let restore_completion = request.restore_request_id.is_some();
+            let restore_changed = request.restore_changed.unwrap_or(0);
+            let restore_skipped = request.restore_skipped.unwrap_or(0);
+            let restore_warning_count = request.restore_warnings.len();
+            let restore_error = request.restore_error.clone();
 
             if let Some(restore_request_id) = request.restore_request_id.as_deref() {
-                let restore_error = request.restore_error.clone();
                 restore_bus::complete_request(
                     "firefox",
                     restore_request_id,
                     restore_error.is_none(),
-                    request.restore_changed.unwrap_or(0),
-                    request.restore_skipped.unwrap_or(0),
+                    restore_changed,
+                    restore_skipped,
                     request.restore_warnings.clone(),
-                    restore_error,
+                    restore_error.clone(),
                 )?;
+            }
+
+            logging::info(
+                "firefox",
+                format!(
+                    "semantic state synchronized; windows={} tabs={} private_skipped={} extension_version={} restore_completion={restore_completion}",
+                    snapshot.windows.len(),
+                    snapshot.tab_count(),
+                    snapshot.skipped_private_windows,
+                    snapshot.extension_version,
+                ),
+            );
+            if restore_completion {
+                let message = format!(
+                    "restore completed; changed={restore_changed} skipped={restore_skipped} warnings={restore_warning_count} ok={}",
+                    restore_error.is_none()
+                );
+                if restore_error.is_some() {
+                    logging::error("firefox", message);
+                } else if restore_warning_count > 0 {
+                    logging::warn("firefox", message);
+                } else {
+                    logging::info("firefox", message);
+                }
             }
 
             let mut response = success_response("browser.state.updated");
@@ -251,16 +310,38 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
                     BrowserError::Invalid("browser.capsule.get requires capsule_name".to_owned())
                 })?;
             let snapshot = firefox_snapshot_from_capsule(name)?;
+            logging::info(
+                "firefox",
+                format!(
+                    "capsule browser snapshot loaded; windows={} tabs={}",
+                    snapshot.windows.len(),
+                    snapshot.tab_count()
+                ),
+            );
             let mut response = success_response("browser.capsule.snapshot");
             response.snapshot = Some(snapshot);
             Ok(response)
         }
         "browser.window.blank.create" => {
             create_blank_browser_window()?;
+            logging::info("firefox", "native independent blank browser window requested");
             Ok(success_response("browser.window.blank.created"))
         }
         other => Err(BrowserError::Invalid(format!(
             "unknown native request type '{other}'"
+        ))),
+    }
+}
+
+fn parse_native_log_level(level: Option<&str>) -> Result<LogLevel, BrowserError> {
+    match level.unwrap_or("info").trim().to_ascii_lowercase().as_str() {
+        "error" => Ok(LogLevel::Error),
+        "warn" | "warning" => Ok(LogLevel::Warn),
+        "info" => Ok(LogLevel::Info),
+        "debug" => Ok(LogLevel::Debug),
+        "trace" => Ok(LogLevel::Trace),
+        other => Err(BrowserError::Invalid(format!(
+            "unsupported browser log level '{other}'"
         ))),
     }
 }
@@ -721,6 +802,14 @@ mod tests {
         snapshot.browser = "firefox".to_owned();
         snapshot.schema_version = 99;
         assert!(validate_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn browser_log_levels_are_strict_and_case_insensitive() {
+        assert_eq!(parse_native_log_level(None).unwrap(), LogLevel::Info);
+        assert_eq!(parse_native_log_level(Some("WARN")).unwrap(), LogLevel::Warn);
+        assert_eq!(parse_native_log_level(Some("trace")).unwrap(), LogLevel::Trace);
+        assert!(parse_native_log_level(Some("verbose")).is_err());
     }
 
     #[test]
