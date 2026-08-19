@@ -1,4 +1,5 @@
 use super::{DesktopRestoreReport, model::*};
+use crate::windows_snap::{self, SnapDirection};
 use std::{
     collections::HashSet,
     ffi::c_void,
@@ -47,6 +48,7 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(180);
 const GEOMETRY_TOLERANCE: i32 = 14;
 const PLACEMENT_RETRIES: usize = 5;
 const PLACEMENT_SETTLE_BASE_MS: u64 = 120;
+const NATIVE_SNAP_RETRIES: usize = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -318,7 +320,13 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
             } else if dry_run {
                 report.windows_planned_to_move += 1;
             } else {
-                match apply_window_state(current_window, saved_window, display, target) {
+                match apply_window_state(
+                    current_window,
+                    saved_window,
+                    display,
+                    target,
+                    &mut report.warnings,
+                ) {
                     Ok(()) => report.windows_moved += 1,
                     Err(error) => report.failures.push(format!(
                         "{} / '{}': {error}",
@@ -659,7 +667,25 @@ fn window_match_score(
     title + geometry
 }
 
-fn window_satisfied(
+fn native_snap_direction(slot: SnapSlot) -> Option<SnapDirection> {
+    match slot {
+        SnapSlot::LeftHalf => Some(SnapDirection::LeftHalf),
+        SnapSlot::RightHalf => Some(SnapDirection::RightHalf),
+        SnapSlot::TopHalf => Some(SnapDirection::TopHalf),
+        SnapSlot::BottomHalf => Some(SnapDirection::BottomHalf),
+        SnapSlot::TopLeftQuarter
+        | SnapSlot::TopRightQuarter
+        | SnapSlot::BottomLeftQuarter
+        | SnapSlot::BottomRightQuarter
+        | SnapSlot::LeftThird
+        | SnapSlot::CenterThird
+        | SnapSlot::RightThird
+        | SnapSlot::LeftTwoThirds
+        | SnapSlot::RightTwoThirds => None,
+    }
+}
+
+fn window_geometry_satisfied(
     current: &CurrentWindow,
     saved: &SavedWindow,
     display: &TargetDisplay,
@@ -693,46 +719,83 @@ fn window_satisfied(
     }
 }
 
+fn window_satisfied(
+    current: &CurrentWindow,
+    saved: &SavedWindow,
+    display: &TargetDisplay,
+    target: SavedRect,
+) -> bool {
+    if !window_geometry_satisfied(current, saved, display, target) {
+        return false;
+    }
+
+    let WindowStateSpec::Snapped(slot) = saved.state_spec() else {
+        return true;
+    };
+    if native_snap_direction(slot).is_none() {
+        return true;
+    }
+
+    // If the modern arranged-state API exists, require the real Windows snap
+    // state as well as the saved rectangle. On older Windows builds where the
+    // API is missing, exact geometry remains the backward-compatible contract.
+    windows_snap::is_arranged(current.hwnd as Hwnd).unwrap_or(true)
+}
+
+fn stage_window_rect(hwnd: Hwnd, target: SavedRect) -> Result<(), String> {
+    let was_non_normal = unsafe { IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 };
+    if was_non_normal {
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        thread::sleep(Duration::from_millis(40));
+    } else {
+        unsafe {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    let outer = frame_adjusted_outer_rect(hwnd, target);
+    if unsafe {
+        SetWindowPos(
+            hwnd,
+            ptr::null_mut(),
+            outer.left,
+            outer.top,
+            outer.width().max(1),
+            outer.height().max(1),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    } == 0
+    {
+        return Err("SetWindowPos failed".to_owned());
+    }
+    Ok(())
+}
+
 fn apply_window_state(
     current: &CurrentWindow,
     saved: &SavedWindow,
     display: &TargetDisplay,
     target: SavedRect,
+    warnings: &mut Vec<String>,
 ) -> Result<(), String> {
     let hwnd = current.hwnd as Hwnd;
     if hwnd.is_null() {
         return Err("window handle is unavailable".to_owned());
     }
 
+    let native_direction = match saved.state_spec() {
+        WindowStateSpec::Snapped(slot) => native_snap_direction(slot),
+        _ => None,
+    };
+    let mut native_attempts = 0usize;
+    let mut native_failure: Option<String> = None;
+    let mut geometry_converged = false;
     let mut last_observed: Option<CurrentWindow> = None;
-    for attempt in 0..PLACEMENT_RETRIES {
-        let was_non_normal = unsafe { IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 };
-        if was_non_normal {
-            unsafe {
-                ShowWindow(hwnd, SW_RESTORE);
-            }
-            thread::sleep(Duration::from_millis(40));
-        } else {
-            unsafe {
-                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            }
-        }
 
-        let outer = frame_adjusted_outer_rect(hwnd, target);
-        if unsafe {
-            SetWindowPos(
-                hwnd,
-                ptr::null_mut(),
-                outer.left,
-                outer.top,
-                outer.width().max(1),
-                outer.height().max(1),
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-        } == 0
-        {
-            return Err("SetWindowPos failed".to_owned());
-        }
+    for attempt in 0..PLACEMENT_RETRIES {
+        stage_window_rect(hwnd, target)?;
 
         match saved.state_spec() {
             WindowStateSpec::Minimized => unsafe {
@@ -759,6 +822,69 @@ fn apply_window_state(
 
         if let Some(observed) = observe_window(hwnd) {
             if window_satisfied(&observed, saved, display, target) {
+                return Ok(());
+            }
+
+            if window_geometry_satisfied(&observed, saved, display, target) {
+                geometry_converged = true;
+
+                if let Some(direction) = native_direction {
+                    if windows_snap::is_arranged(hwnd) == Some(false)
+                        && native_attempts < NATIVE_SNAP_RETRIES
+                    {
+                        native_attempts += 1;
+                        match windows_snap::snap(hwnd, direction) {
+                            Ok(true) => {
+                                if let Some(after_snap) = observe_window(hwnd) {
+                                    if window_satisfied(&after_snap, saved, display, target) {
+                                        return Ok(());
+                                    }
+                                    native_failure = Some(format!(
+                                        "Windows reported an arranged window, but the resulting geometry/monitor did not match the saved snap slot (observed left={} top={} right={} bottom={})",
+                                        after_snap.bounds.left,
+                                        after_snap.bounds.top,
+                                        after_snap.bounds.right,
+                                        after_snap.bounds.bottom,
+                                    ));
+                                    last_observed = Some(after_snap);
+                                    continue;
+                                }
+                                native_failure = Some(
+                                    "the window became unavailable while verifying native snap"
+                                        .to_owned(),
+                                );
+                            }
+                            Ok(false) => {
+                                native_failure = Some(
+                                    "Windows accepted the snap shortcut but did not report the window as arranged"
+                                        .to_owned(),
+                                );
+                            }
+                            Err(error) => {
+                                native_failure = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+            last_observed = Some(observed);
+        }
+    }
+
+    // Native snapping is deliberately best-effort because SendInput can be
+    // blocked by foreground/UIPI policy and tools such as FancyZones can
+    // override Windows-key behavior. A saved rectangle that converged is still
+    // useful and is safer than failing the entire capsule restore.
+    if geometry_converged && native_direction.is_some() && native_failure.is_some() {
+        stage_window_rect(hwnd, target)?;
+        thread::sleep(Duration::from_millis(PLACEMENT_SETTLE_BASE_MS));
+        if let Some(observed) = observe_window(hwnd) {
+            if window_geometry_satisfied(&observed, saved, display, target) {
+                warnings.push(format!(
+                    "Native Windows snap could not be restored for '{}'; restored the exact saved rectangle instead: {}",
+                    saved.title,
+                    native_failure.as_deref().unwrap_or("unknown native snap failure")
+                ));
                 return Ok(());
             }
             last_observed = Some(observed);
@@ -1276,5 +1402,27 @@ mod tests {
         );
         assert_eq!(matches[0].1.hwnd, 1);
         assert_eq!(matches[1].1.hwnd, 2);
+    }
+
+    #[test]
+    fn native_snap_shortcuts_are_limited_to_unambiguous_half_slots() {
+        assert_eq!(
+            native_snap_direction(SnapSlot::LeftHalf),
+            Some(SnapDirection::LeftHalf)
+        );
+        assert_eq!(
+            native_snap_direction(SnapSlot::RightHalf),
+            Some(SnapDirection::RightHalf)
+        );
+        assert_eq!(
+            native_snap_direction(SnapSlot::TopHalf),
+            Some(SnapDirection::TopHalf)
+        );
+        assert_eq!(
+            native_snap_direction(SnapSlot::BottomHalf),
+            Some(SnapDirection::BottomHalf)
+        );
+        assert_eq!(native_snap_direction(SnapSlot::LeftThird), None);
+        assert_eq!(native_snap_direction(SnapSlot::TopLeftQuarter), None);
     }
 }
