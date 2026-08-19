@@ -99,8 +99,10 @@ pub(crate) fn is_arranged(hwnd: Hwnd) -> Option<bool> {
     if hwnd.is_null() {
         return None;
     }
-    let function = IS_WINDOW_ARRANGED.get_or_init(resolve_is_window_arranged);
-    function.map(|function| unsafe { function(hwnd) != 0 })
+    match *IS_WINDOW_ARRANGED.get_or_init(resolve_is_window_arranged) {
+        Some(function) => Some(unsafe { function(hwnd) != 0 }),
+        None => None,
+    }
 }
 
 /// Ask Windows itself to snap the exact target HWND using its documented
@@ -118,10 +120,12 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
         );
     }
 
-    if unsafe { SetForegroundWindow(hwnd) } == 0 {
-        return Err("Windows foreground-lock policy refused focus for native snap".to_owned());
+    if unsafe { GetForegroundWindow() } != hwnd {
+        if unsafe { SetForegroundWindow(hwnd) } == 0 {
+            return Err("Windows foreground-lock policy refused focus for native snap".to_owned());
+        }
+        thread::sleep(FOREGROUND_SETTLE);
     }
-    thread::sleep(FOREGROUND_SETTLE);
     if unsafe { GetForegroundWindow() } != hwnd {
         return Err(
             "the intended window did not become foreground; native snap shortcut was not sent"
