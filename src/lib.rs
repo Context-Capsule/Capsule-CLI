@@ -3,6 +3,8 @@
 // even though Rust gives the mirror structs distinct module-local types.
 #![allow(clashing_extern_declarations)]
 
+extern crate self as context_capsule;
+
 pub mod adapters;
 pub mod browser;
 pub mod desktop;
