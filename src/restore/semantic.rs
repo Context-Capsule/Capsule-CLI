@@ -456,12 +456,14 @@ fn launched_session_matches(saved: &TerminalSession, current: &TerminalSession) 
     {
         return false;
     }
-    match saved.working_directory.as_deref() {
-        Some(directory) => current
-            .working_directory
-            .as_deref()
-            .is_some_and(|value| paths_equivalent(value, directory)),
-        None => true,
+    match (saved.working_directory.as_deref(), current.working_directory.as_deref()) {
+        (Some(saved_directory), Some(current_directory)) => {
+            paths_equivalent(current_directory, saved_directory)
+        }
+        // This is only used after Context Capsule itself created this exact
+        // child PID and set Command::current_dir from the restart plan. Windows
+        // process discovery may temporarily be unable to read that CWD back.
+        (Some(_), None) | (None, _) => true,
     }
 }
 
@@ -739,10 +741,15 @@ mod tests {
 
     #[test]
     fn spawned_direct_shell_verification_does_not_require_host_ancestry_match() {
-        let saved = terminal_session(TerminalHost::ConsoleHost, ShellKind::CommandPrompt);
+        let mut saved = terminal_session(TerminalHost::ConsoleHost, ShellKind::CommandPrompt);
+        saved.working_directory = Some(r"C:\Work".to_owned());
         let current = terminal_session(TerminalHost::WindowsTerminal, ShellKind::CommandPrompt);
         assert!(!terminal_session_matches(&saved, &current));
         assert!(launched_session_matches(&saved, &current));
+
+        let mut wrong = current;
+        wrong.working_directory = Some(r"C:\Other".to_owned());
+        assert!(!launched_session_matches(&saved, &wrong));
     }
 
     #[cfg(windows)]
