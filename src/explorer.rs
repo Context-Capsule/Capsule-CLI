@@ -163,7 +163,7 @@ pub fn restore_from_capsule(snapshot: &Value, dry_run: bool) -> ExplorerRestoreR
     // unambiguous: exactly one saved folder is missing and exactly one current
     // Explorer folder is unmatched. With multiple candidates Context Capsule
     // remains additive instead of guessing which user window to mutate.
-    if missing.len() == 1 && unmatched_current.len() == 1 {
+    if should_navigate_in_place(missing.len(), unmatched_current.len()) {
         report.planned_to_navigate = 1;
         if dry_run {
             return report;
@@ -237,6 +237,10 @@ pub fn restore_from_capsule(snapshot: &Value, dry_run: bool) -> ExplorerRestoreR
     }
 
     report
+}
+
+fn should_navigate_in_place(missing_saved: usize, unmatched_current: usize) -> bool {
+    missing_saved == 1 && unmatched_current == 1
 }
 
 pub fn explorer_targets_equal(left: &str, right: &str) -> bool {
@@ -387,7 +391,8 @@ fn navigate_existing_target(from: &str, target: &str) -> Result<(), String> {
     const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 function Normalize-Target([string]$value) {
-    $normalized = $value.Trim().Trim('"').Replace('/', '\')
+    $normalized = $value.Trim().Trim('"')
+    $normalized = $normalized.Replace('/', '\')
     if ($normalized.Length -gt 3) { $normalized = $normalized.TrimEnd('\') }
     return $normalized.ToLowerInvariant()
 }
@@ -493,6 +498,14 @@ mod tests {
             r"C:\Users\Dhia\Project",
             r"C:\Users\Dhia\Other"
         ));
+    }
+
+    #[test]
+    fn explorer_reuses_only_an_unambiguous_single_changed_window() {
+        assert!(should_navigate_in_place(1, 1));
+        assert!(!should_navigate_in_place(2, 1));
+        assert!(!should_navigate_in_place(1, 2));
+        assert!(!should_navigate_in_place(0, 1));
     }
 
     #[test]
