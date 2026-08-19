@@ -445,6 +445,7 @@ fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) 
     }
 }
 
+#[cfg(any(windows, test))]
 fn launched_session_matches(saved: &TerminalSession, current: &TerminalSession) -> bool {
     if !environment_matches(&saved.environment, &current.environment) {
         return false;
@@ -516,7 +517,8 @@ fn wait_for_terminal_launch(
     timeout: Duration,
 ) -> bool {
     let deadline = Instant::now() + timeout;
-    let direct_shell = needs_fresh_console_window(saved, plan) && direct_shell_process(&plan.executable);
+    let direct_shell =
+        needs_fresh_console_window(saved, plan) && direct_shell_process(&plan.executable);
 
     loop {
         let current = terminal::discover();
