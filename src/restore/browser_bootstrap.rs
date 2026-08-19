@@ -63,9 +63,9 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
     }
 
     // A stale firefox.json from before Zen was closed is not proof that the
-    // extension survived the restart. Record the launch time and require a
-    // state heartbeat written after it before the semantic restore request is
-    // allowed to proceed.
+    // extension survived the restart. Record the previous heartbeat and launch
+    // time, then require a genuinely newer state write before semantic restore.
+    let previous_heartbeat = adapter_state_updated_at_unix_ms().ok().flatten();
     let launched_after_unix_ms = now_unix_ms();
     match Command::new(executable)
         .arg("--blank-window")
@@ -84,7 +84,11 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         }
     }
 
-    match wait_for_fresh_adapter_heartbeat(launched_after_unix_ms, ADAPTER_READY_TIMEOUT) {
+    match wait_for_fresh_adapter_heartbeat(
+        previous_heartbeat,
+        launched_after_unix_ms,
+        ADAPTER_READY_TIMEOUT,
+    ) {
         Ok(true) => {}
         Ok(false) => {
             report.skip_semantic_restore = true;
@@ -105,34 +109,53 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
 }
 
 fn wait_for_fresh_adapter_heartbeat(
+    previous_heartbeat: Option<i64>,
     launched_after_unix_ms: i64,
     timeout: Duration,
 ) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+
     loop {
         match adapter_state_updated_at_unix_ms() {
             Ok(Some(updated_at))
-                if updated_at.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS)
-                    >= launched_after_unix_ms =>
+                if adapter_heartbeat_is_fresh(
+                    updated_at,
+                    previous_heartbeat,
+                    launched_after_unix_ms,
+                ) =>
             {
                 return Ok(true);
             }
-            Ok(_) => {}
+            Ok(_) => {
+                last_error = None;
+            }
             Err(error) => {
                 // A partially-written/temporarily unavailable runtime file can
-                // occur during startup. Keep polling until the deadline; retain
-                // the final error only if readiness never succeeds.
-                if Instant::now() >= deadline {
-                    return Err(error);
-                }
+                // occur during startup. Keep polling until the deadline rather
+                // than failing on a transient read while the extension writes.
+                last_error = Some(error);
             }
         }
 
         if Instant::now() >= deadline {
-            return Ok(false);
+            return last_error.map_or(Ok(false), Err);
         }
         thread::sleep(ADAPTER_READY_POLL);
     }
+}
+
+fn adapter_heartbeat_is_fresh(
+    updated_at_unix_ms: i64,
+    previous_heartbeat: Option<i64>,
+    launched_after_unix_ms: i64,
+) -> bool {
+    let newer_than_previous = previous_heartbeat
+        .map(|previous| updated_at_unix_ms > previous)
+        .unwrap_or(true);
+    newer_than_previous
+        && updated_at_unix_ms.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS)
+            >= launched_after_unix_ms
 }
 
 fn adapter_state_updated_at_unix_ms() -> Result<Option<i64>, String> {
@@ -243,11 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_timestamp_allows_small_clock_or_filesystem_slop() {
+    fn heartbeat_must_be_newer_than_the_prelaunch_state_even_with_clock_slop() {
         let launched = 50_000_i64;
-        let fresh = 49_100_i64;
-        assert!(fresh.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS) >= launched);
-        let stale = 48_999_i64;
-        assert!(stale.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS) < launched);
+        let previous = Some(49_900_i64);
+        assert!(!adapter_heartbeat_is_fresh(49_900, previous, launched));
+        assert!(adapter_heartbeat_is_fresh(50_050, previous, launched));
+        assert!(!adapter_heartbeat_is_fresh(48_999, None, launched));
     }
 }
