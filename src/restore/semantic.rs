@@ -516,7 +516,10 @@ fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<
 
 #[cfg(windows)]
 fn needs_fresh_console_window(session: &TerminalSession, plan: &RestartPlan) -> bool {
-    if matches!(session.host, TerminalHost::VisualStudioCode | TerminalHost::Cursor) {
+    if !matches!(
+        &session.host,
+        TerminalHost::ConsoleHost | TerminalHost::Unknown | TerminalHost::Wsl
+    ) {
         return false;
     }
 
@@ -650,7 +653,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn raw_console_shell_restart_requests_a_fresh_console() {
+    fn raw_console_shell_restart_requests_a_fresh_console_only_for_standalone_hosts() {
         let session = terminal_session(TerminalHost::Unknown, ShellKind::CommandPrompt);
         let plan = RestartPlan {
             executable: r"C:\Windows\System32\cmd.exe".to_owned(),
@@ -659,6 +662,9 @@ mod tests {
             note: None,
         };
         assert!(needs_fresh_console_window(&session, &plan));
+
+        let windows_terminal = terminal_session(TerminalHost::WindowsTerminal, ShellKind::CommandPrompt);
+        assert!(!needs_fresh_console_window(&windows_terminal, &plan));
 
         let wt = RestartPlan {
             executable: "wt.exe".to_owned(),
