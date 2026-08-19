@@ -1,9 +1,9 @@
 use crate::{
     adapters::docker::{self, DockerStatus},
-    browser, logging,
+    logging,
     persistence::CapsuleStore,
-    vscode,
 };
+use context_capsule::{browser, vscode};
 use serde::Serialize;
 use serde_json::Value;
 use std::{fs, path::PathBuf, process::Command};
