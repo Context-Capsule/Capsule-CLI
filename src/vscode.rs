@@ -91,6 +91,8 @@ pub struct IntegratedTerminalSnapshot {
     pub kind: String,
     pub restorable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shell_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell_args: Option<IntegratedTerminalShellArgs>,
@@ -461,6 +463,7 @@ mod tests {
                 name: "PowerShell".to_owned(),
                 kind: "process".to_owned(),
                 restorable: true,
+                active: Some(true),
                 shell_path: Some("pwsh.exe".to_owned()),
                 shell_args: Some(IntegratedTerminalShellArgs::List(vec![
                     "-NoLogo".to_owned(),
@@ -488,6 +491,7 @@ mod tests {
         );
         assert_eq!(loaded.snapshot.tab_count(), 1);
         assert_eq!(loaded.snapshot.integrated_terminals.len(), 1);
+        assert_eq!(loaded.snapshot.integrated_terminals[0].active, Some(true));
         assert!(loaded.snapshot.is_extension_development_host());
         assert!(snapshot_host_is_alive(&loaded.snapshot));
         fs::remove_file(path).ok();
@@ -514,6 +518,7 @@ mod tests {
                     "name": "PowerShell",
                     "kind": "process",
                     "restorable": true,
+                    "active": true,
                     "shellPath": "pwsh.exe",
                     "shellArgs": ["-NoLogo"],
                     "cwd": "file:///C:/work/extension",
@@ -535,6 +540,15 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
             Some(1)
+        );
+        assert_eq!(
+            serialized
+                .get("integratedTerminals")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|terminals| terminals.first())
+                .and_then(|terminal| terminal.get("active"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 
