@@ -1,7 +1,6 @@
 use std::{
     ffi::c_void,
     mem::{size_of, transmute},
-    ptr,
     sync::OnceLock,
     thread,
     time::Duration,
@@ -150,7 +149,7 @@ fn resolve_is_window_arranged() -> Option<IsWindowArrangedFn> {
     if module.is_null() {
         return None;
     }
-    let address = unsafe { GetProcAddress(module, c"IsWindowArranged".as_ptr().cast()) };
+    let address = unsafe { GetProcAddress(module, b"IsWindowArranged\0".as_ptr()) };
     if address.is_null() {
         return None;
     }
