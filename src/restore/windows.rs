@@ -1245,7 +1245,12 @@ mod tests {
             hwnd: 1,
             pid: 1,
             title: "Left document".to_owned(),
-            bounds: SavedRect { left: 900, top: 0, right: 1700, bottom: 600 },
+            bounds: SavedRect {
+                left: 900,
+                top: 0,
+                right: 1700,
+                bottom: 600,
+            },
             minimized: false,
             maximized: false,
             display_device: Some("DISPLAY1".to_owned()),
@@ -1256,7 +1261,12 @@ mod tests {
             hwnd: 2,
             pid: 1,
             title: "Right document".to_owned(),
-            bounds: SavedRect { left: 0, top: 0, right: 800, bottom: 600 },
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 800,
+                bottom: 600,
+            },
             minimized: false,
             maximized: false,
             display_device: Some("DISPLAY1".to_owned()),
@@ -1265,8 +1275,18 @@ mod tests {
         };
         let display = TargetDisplay {
             device_name: "DISPLAY1".to_owned(),
-            bounds: SavedRect { left: 0, top: 0, right: 1920, bottom: 1080 },
-            work_area: SavedRect { left: 0, top: 0, right: 1920, bottom: 1040 },
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            work_area: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
             is_primary: true,
             relation_to_primary: "primary".to_owned(),
         };
