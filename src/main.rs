@@ -1,8 +1,12 @@
 mod adapters;
 mod commands;
 mod desktop;
+mod diagnostics;
+mod diff;
 mod discovery;
 mod git;
+mod lifecycle;
+mod logging;
 mod persistence;
 mod snapshot;
 mod system;
@@ -56,10 +60,14 @@ fn main() -> ExitCode {
             }
         }
         Some("save") => commands::save(args.collect()),
+        Some("update") => lifecycle::update(args.collect()),
         Some("restore") => commands::restore(args.collect()),
         Some("list") => commands::list(args.collect()),
+        Some("history") => lifecycle::history(args.collect()),
         Some("show") => commands::show(args.collect()),
+        Some("diff") => lifecycle::diff(args.collect()),
         Some("delete") => commands::delete(args.collect()),
+        Some("doctor") => lifecycle::doctor(args.collect()),
         Some("docker") => commands::docker(args.collect()),
         Some("terminal") => commands::terminal(args.collect()),
         Some("apps") => {
@@ -564,10 +572,14 @@ fn print_usage() {
     println!("Usage:");
     println!("  capsule inspect [options]");
     println!("  capsule save <name> [--force]");
-    println!("  capsule restore <name> [--dry-run]");
+    println!("  capsule update <name>");
+    println!("  capsule restore <name[@revision]> [--dry-run]");
     println!("  capsule list");
-    println!("  capsule show <name> [--json]");
+    println!("  capsule history <name>");
+    println!("  capsule show <name[@revision]> [--json]");
+    println!("  capsule diff <before> <after> [--json]");
     println!("  capsule delete <name>");
+    println!("  capsule doctor [-v|--verbose] [--json]");
     println!("  capsule docker inspect");
     println!("  capsule docker restore <capsule-name>");
     println!("  capsule terminal inspect [--json]");
@@ -576,11 +588,15 @@ fn print_usage() {
     println!(
         "  inspect    Discover current workspace, tools, terminals, applications, windows, displays and Docker"
     );
-    println!("  save       Capture the current semantic workspace into SQLite");
-    println!("  restore    Restore missing applications and reconcile saved window placement");
+    println!("  save       Capture a new capsule; --force creates a new immutable revision if it exists");
+    println!("  update     Capture the current workspace as the next revision of an existing capsule");
+    println!("  restore    Restore the current or an explicit @revision capsule state");
     println!("  list       List saved capsules");
-    println!("  show       Show a saved capsule; --json prints the complete stored payload");
-    println!("  delete     Delete a saved capsule");
+    println!("  history    List immutable revisions for a capsule");
+    println!("  show       Show a saved capsule or revision; --json prints the complete stored payload");
+    println!("  diff       Compare two capsule states semantically");
+    println!("  delete     Delete a saved capsule and all of its revisions");
+    println!("  doctor     Check local database, adapters, native host, Git, Docker and logging");
     println!("  docker     Inspect Docker or restore Docker resources from a saved capsule");
     println!("  terminal   Inspect semantic terminal and WSL session metadata");
     println!("  apps       Compatibility alias for 'capsule inspect --apps'");
