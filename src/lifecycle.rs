@@ -1,12 +1,9 @@
 use crate::{
+    diagnostics::{self, DoctorStatus},
     diff::{self, DiffChange, DiffKind},
-    discovery,
+    discovery, logging,
     persistence::{CapsuleStore, parse_capsule_reference},
     snapshot,
-};
-use context_capsule::{
-    diagnostics::{self, DoctorStatus},
-    logging,
 };
 use std::process::ExitCode;
 
@@ -223,7 +220,7 @@ pub fn doctor(arguments: Vec<String>) -> ExitCode {
 }
 
 fn print_change(change: &DiffChange) {
-    match change.kind {
+    match &change.kind {
         DiffKind::Added => println!(
             "  + {}: {}",
             change.key,
