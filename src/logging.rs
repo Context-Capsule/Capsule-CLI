@@ -97,29 +97,35 @@ pub fn error(component: &str, message: impl AsRef<str>) {
 }
 
 fn append_at(path: &Path, level: LogLevel, message: &str, max_bytes: u64) -> io::Result<()> {
+    if max_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "log size bound must be greater than zero",
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    rotate_if_needed(path, max_bytes)?;
     let line = format!(
         "{} [{}] {}\n",
         now_unix_ms(),
         level.as_str(),
         sanitize_message(message)
     );
+    rotate_if_needed(path, max_bytes, line.len() as u64)?;
     use std::io::Write;
     let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
 }
 
-fn rotate_if_needed(path: &Path, max_bytes: u64) -> io::Result<()> {
+fn rotate_if_needed(path: &Path, max_bytes: u64, incoming_bytes: u64) -> io::Result<()> {
     let size = match fs::metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if size < max_bytes {
+    if size == 0 || size.saturating_add(incoming_bytes) <= max_bytes {
         return Ok(());
     }
 
@@ -203,15 +209,22 @@ mod tests {
     }
 
     #[test]
-    fn log_rotation_keeps_one_bounded_previous_file() {
+    fn log_rotation_happens_before_the_next_line_exceeds_the_bound() {
         let path = temp_log("rotate");
-        fs::write(&path, b"1234567890").unwrap();
+        fs::write(&path, b"12345678").unwrap();
         append_at(&path, LogLevel::Info, "new", 10).unwrap();
         let rotated = path.with_extension("log.1");
-        assert_eq!(fs::read(&rotated).unwrap(), b"1234567890");
+        assert_eq!(fs::read(&rotated).unwrap(), b"12345678");
         let current = fs::read_to_string(&path).unwrap();
         assert!(current.contains("[INFO] new"));
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(rotated);
+    }
+
+    #[test]
+    fn zero_log_bound_is_rejected() {
+        let path = temp_log("zero-bound");
+        assert!(append_at(&path, LogLevel::Info, "message", 0).is_err());
+        let _ = fs::remove_file(path);
     }
 }
