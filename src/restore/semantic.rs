@@ -372,11 +372,17 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
             let baseline = matching_terminal_count(&saved_session);
             match launch_restart_plan(&saved_session, &plan) {
                 Ok(pid) => {
-                    if wait_for_additional_terminal(&saved_session, baseline, TERMINAL_VERIFY_TIMEOUT) {
+                    if wait_for_terminal_launch(
+                        &saved_session,
+                        &plan,
+                        pid,
+                        baseline,
+                        TERMINAL_VERIFY_TIMEOUT,
+                    ) {
                         verified += 1;
                     } else {
                         report.failures.push(format!(
-                            "Terminal: started '{}' as process {pid}, but no additional matching interactive {:?} / {} session became observable within {} ms",
+                            "Terminal: started '{}' as process {pid}, but no matching interactive {:?} / {} session became observable within {} ms",
                             plan.executable,
                             saved_session.host,
                             saved_session.shell.as_str(),
@@ -439,6 +445,25 @@ fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) 
     }
 }
 
+fn launched_session_matches(saved: &TerminalSession, current: &TerminalSession) -> bool {
+    if !environment_matches(&saved.environment, &current.environment) {
+        return false;
+    }
+    if saved.shell != current.shell
+        && saved.shell.as_str() != "Unknown shell"
+        && current.shell.as_str() != "Unknown shell"
+    {
+        return false;
+    }
+    match saved.working_directory.as_deref() {
+        Some(directory) => current
+            .working_directory
+            .as_deref()
+            .is_some_and(|value| paths_equivalent(value, directory)),
+        None => true,
+    }
+}
+
 fn terminal_hosts_compatible(saved: &TerminalHost, current: &TerminalHost) -> bool {
     saved == current
         || matches!(
@@ -483,12 +508,34 @@ fn matching_terminal_count(saved: &TerminalSession) -> usize {
 }
 
 #[cfg(windows)]
-fn wait_for_additional_terminal(saved: &TerminalSession, baseline: usize, timeout: Duration) -> bool {
+fn wait_for_terminal_launch(
+    saved: &TerminalSession,
+    plan: &RestartPlan,
+    spawned_pid: u32,
+    baseline: usize,
+    timeout: Duration,
+) -> bool {
     let deadline = Instant::now() + timeout;
+    let direct_shell = needs_fresh_console_window(saved, plan) && direct_shell_process(&plan.executable);
+
     loop {
-        if matching_terminal_count(saved) > baseline {
+        let current = terminal::discover();
+        if direct_shell {
+            if current.sessions.iter().any(|session| {
+                session.pid == Some(spawned_pid) && launched_session_matches(saved, session)
+            }) {
+                return true;
+            }
+        } else if current
+            .sessions
+            .iter()
+            .filter(|session| terminal_session_matches(saved, session))
+            .count()
+            > baseline
+        {
             return true;
         }
+
         if Instant::now() >= deadline {
             return false;
         }
@@ -522,12 +569,15 @@ fn needs_fresh_console_window(session: &TerminalSession, plan: &RestartPlan) -> 
     ) {
         return false;
     }
+    fresh_console_executable(&plan.executable)
+}
 
-    let executable = plan
-        .executable
+#[cfg(windows)]
+fn fresh_console_executable(executable: &str) -> bool {
+    let executable = executable
         .rsplit(['\\', '/'])
         .next()
-        .unwrap_or(&plan.executable)
+        .unwrap_or(executable)
         .to_ascii_lowercase();
     matches!(
         executable.as_str(),
@@ -539,6 +589,36 @@ fn needs_fresh_console_window(session: &TerminalSession, plan: &RestartPlan) -> 
             | "pwsh"
             | "wsl.exe"
             | "wsl"
+            | "bash.exe"
+            | "bash"
+            | "zsh.exe"
+            | "zsh"
+            | "fish.exe"
+            | "fish"
+            | "nu.exe"
+            | "nu"
+            | "nushell.exe"
+            | "nushell"
+            | "sh.exe"
+            | "sh"
+    )
+}
+
+#[cfg(windows)]
+fn direct_shell_process(executable: &str) -> bool {
+    let executable = executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    matches!(
+        executable.as_str(),
+        "cmd.exe"
+            | "cmd"
+            | "powershell.exe"
+            | "powershell"
+            | "pwsh.exe"
+            | "pwsh"
             | "bash.exe"
             | "bash"
             | "zsh.exe"
@@ -617,7 +697,11 @@ mod tests {
             standalone_containers: vec![container.clone()],
         };
         let missing = missing_docker_resources(&saved, &current);
-        assert_eq!(missing.compose_projects.len(), 1, "missing worker must trigger project restore");
+        assert_eq!(
+            missing.compose_projects.len(),
+            1,
+            "missing worker must trigger project restore"
+        );
         assert!(missing.standalone_containers.is_empty());
 
         let current = saved.clone();
@@ -651,6 +735,14 @@ mod tests {
         assert!(terminal_session_matches(&saved, &current));
     }
 
+    #[test]
+    fn spawned_direct_shell_verification_does_not_require_host_ancestry_match() {
+        let saved = terminal_session(TerminalHost::ConsoleHost, ShellKind::CommandPrompt);
+        let current = terminal_session(TerminalHost::WindowsTerminal, ShellKind::CommandPrompt);
+        assert!(!terminal_session_matches(&saved, &current));
+        assert!(launched_session_matches(&saved, &current));
+    }
+
     #[cfg(windows)]
     #[test]
     fn raw_console_shell_restart_requests_a_fresh_console_only_for_standalone_hosts() {
@@ -662,8 +754,10 @@ mod tests {
             note: None,
         };
         assert!(needs_fresh_console_window(&session, &plan));
+        assert!(direct_shell_process(&plan.executable));
 
-        let windows_terminal = terminal_session(TerminalHost::WindowsTerminal, ShellKind::CommandPrompt);
+        let windows_terminal =
+            terminal_session(TerminalHost::WindowsTerminal, ShellKind::CommandPrompt);
         assert!(!needs_fresh_console_window(&windows_terminal, &plan));
 
         let wt = RestartPlan {
@@ -671,5 +765,6 @@ mod tests {
             ..plan
         };
         assert!(!needs_fresh_console_window(&session, &wt));
+        assert!(!direct_shell_process(&wt.executable));
     }
 }
