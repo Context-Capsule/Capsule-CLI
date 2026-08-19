@@ -153,6 +153,10 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     let mut semantic_snapshot = snapshot.clone();
     #[cfg(windows)]
     {
+        if zen_bootstrap.skip_semantic_restore {
+            suppress_firefox_semantic(&mut semantic_snapshot);
+        }
+
         let preparation = vscode_devhost::prepare(snapshot, options.dry_run);
         if preparation.skip_vscode_semantic_restore {
             vscode_devhost::suppress_vscode_semantic(&mut semantic_snapshot);
@@ -179,6 +183,12 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     report.failures.extend(semantic.failures);
 
     let explorer = crate::explorer::restore_from_capsule(snapshot, options.dry_run);
+    if options.dry_run && explorer.planned_to_navigate > 0 {
+        report.warnings.push(format!(
+            "Explorer restore: would navigate {} unambiguous changed folder window(s) back to the saved target",
+            explorer.planned_to_navigate
+        ));
+    }
     if options.dry_run && explorer.planned_to_open > 0 {
         report.warnings.push(format!(
             "Explorer restore: would open {} missing folder window(s)",
@@ -261,6 +271,12 @@ fn has_vscode_editor_snapshot(snapshot: &Value) -> bool {
     snapshot
         .pointer("/editors/vscode")
         .is_some_and(|value| !value.is_null())
+}
+
+fn suppress_firefox_semantic(snapshot: &mut Value) {
+    if let Some(browsers) = snapshot.get_mut("browsers").and_then(Value::as_object_mut) {
+        browsers.insert("firefox".to_owned(), Value::Null);
+    }
 }
 
 fn suppress_orphan_vscode_semantic(snapshot: &mut Value) -> usize {
@@ -475,6 +491,17 @@ mod tests {
         assert!(!should_defer_windows_terminal(&json!({
             "terminals": { "sessions": [{ "host": "windows-terminal", "restart": null }] }
         })));
+    }
+
+    #[test]
+    fn suppressing_firefox_semantic_only_removes_the_browser_payload() {
+        let mut snapshot = json!({
+            "browsers": { "firefox": { "windows": [1] } },
+            "editors": { "vscode": { "tabs": [1] } }
+        });
+        suppress_firefox_semantic(&mut snapshot);
+        assert!(snapshot.pointer("/browsers/firefox").unwrap().is_null());
+        assert_eq!(snapshot.pointer("/editors/vscode/tabs/0"), Some(&json!(1)));
     }
 
     #[test]
