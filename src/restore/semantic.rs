@@ -12,11 +12,25 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 
 #[cfg(windows)]
-use std::{process::Command, thread};
+use std::{
+    os::windows::process::CommandExt,
+    process::Command,
+    thread,
+    time::Instant,
+};
 
-const ADAPTER_TIMEOUT: Duration = Duration::from_secs(25);
+const VSCODE_ADAPTER_TIMEOUT: Duration = Duration::from_secs(25);
+const FIREFOX_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const TERMINAL_LAUNCH_SPACING: Duration = Duration::from_millis(120);
+#[cfg(windows)]
+const TERMINAL_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
+#[cfg(windows)]
+const TERMINAL_VERIFY_POLL: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticRestoreReport {
@@ -55,7 +69,13 @@ fn restore_firefox(snapshot: &Value, dry_run: bool, report: &mut SemanticRestore
         return;
     }
 
-    run_bus_adapter("firefox", "Firefox", saved, report);
+    run_bus_adapter(
+        "firefox",
+        "Firefox",
+        saved,
+        FIREFOX_ADAPTER_TIMEOUT,
+        report,
+    );
 }
 
 fn restore_vscode(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
@@ -99,6 +119,7 @@ fn restore_vscode(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreR
             "editor": editor,
             "terminals": integrated_terminals,
         }),
+        VSCODE_ADAPTER_TIMEOUT,
         report,
     );
 }
@@ -107,6 +128,7 @@ fn run_bus_adapter(
     adapter: &str,
     label: &str,
     payload: Value,
+    timeout: Duration,
     report: &mut SemanticRestoreReport,
 ) {
     let request = match restore_bus::write_request(adapter, payload) {
@@ -119,7 +141,7 @@ fn run_bus_adapter(
         }
     };
 
-    match restore_bus::wait_for_completion(adapter, &request.request_id, ADAPTER_TIMEOUT) {
+    match restore_bus::wait_for_completion(adapter, &request.request_id, timeout) {
         Ok(Some(completion)) if completion.ok => {
             report.warnings.push(format!(
                 "{label} semantic restore: {} resource(s) changed, {} already satisfied/skipped",
@@ -141,7 +163,13 @@ fn run_bus_adapter(
         Ok(None) => {
             let _ = restore_bus::cancel_request(adapter, &request.request_id);
             report.failures.push(format!(
-                "{label} semantic restore timed out waiting for its Context Capsule adapter"
+                "{label} semantic restore timed out after {} seconds waiting for its Context Capsule adapter{}",
+                timeout.as_secs(),
+                if adapter == "firefox" {
+                    "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore"
+                } else {
+                    ""
+                }
             ));
         }
         Err(error) => {
@@ -277,7 +305,7 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
 
     let current = terminal::discover();
     let mut used = HashSet::new();
-    let mut missing = Vec::new();
+    let mut missing: Vec<(TerminalSession, RestartPlan)> = Vec::new();
     let mut cursor_warning_added = false;
 
     for saved_session in &saved.sessions {
@@ -309,7 +337,7 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
         }
 
         if let Some(plan) = saved_session.restart.clone() {
-            missing.push(plan);
+            missing.push((saved_session.clone(), plan));
         } else {
             report.warnings.push(format!(
                 "Terminal restore: {:?} / {} has no safe restart plan",
@@ -330,7 +358,7 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
     }
     if dry_run {
         report.warnings.push(format!(
-            "Terminal restore: would start {} missing safe session(s)",
+            "Terminal restore: would start and verify {} missing safe session(s)",
             missing.len()
         ));
         return;
@@ -339,10 +367,23 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
     #[cfg(windows)]
     {
         let total = missing.len();
-        let mut restored = 0usize;
-        for (index, plan) in missing.into_iter().enumerate() {
-            match launch_restart_plan(&plan) {
-                Ok(()) => restored += 1,
+        let mut verified = 0usize;
+        for (index, (saved_session, plan)) in missing.into_iter().enumerate() {
+            let baseline = matching_terminal_count(&saved_session);
+            match launch_restart_plan(&saved_session, &plan) {
+                Ok(pid) => {
+                    if wait_for_additional_terminal(&saved_session, baseline, TERMINAL_VERIFY_TIMEOUT) {
+                        verified += 1;
+                    } else {
+                        report.failures.push(format!(
+                            "Terminal: started '{}' as process {pid}, but no additional matching interactive {:?} / {} session became observable within {} ms",
+                            plan.executable,
+                            saved_session.host,
+                            saved_session.shell.as_str(),
+                            TERMINAL_VERIFY_TIMEOUT.as_millis()
+                        ));
+                    }
+                }
                 Err(error) => report.failures.push(format!("Terminal: {error}")),
             }
             if index + 1 < total {
@@ -350,7 +391,7 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
             }
         }
         report.warnings.push(format!(
-            "Terminal restore: started {restored} missing safe session(s)"
+            "Terminal restore: verified {verified}/{total} missing safe session(s)"
         ));
     }
 
@@ -369,7 +410,9 @@ fn terminal_snapshot(snapshot: &Value) -> Option<TerminalSnapshot> {
 }
 
 fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) -> bool {
-    if saved.host != current.host || !environment_matches(&saved.environment, &current.environment) {
+    if !terminal_hosts_compatible(&saved.host, &current.host)
+        || !environment_matches(&saved.environment, &current.environment)
+    {
         return false;
     }
     if saved.shell != current.shell
@@ -394,6 +437,15 @@ fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) 
             .is_some_and(|value| paths_equivalent(value, directory)),
         None => true,
     }
+}
+
+fn terminal_hosts_compatible(saved: &TerminalHost, current: &TerminalHost) -> bool {
+    saved == current
+        || matches!(
+            (saved, current),
+            (TerminalHost::ConsoleHost, TerminalHost::Unknown)
+                | (TerminalHost::Unknown, TerminalHost::ConsoleHost)
+        )
 }
 
 fn environment_matches(left: &TerminalEnvironment, right: &TerminalEnvironment) -> bool {
@@ -422,22 +474,90 @@ fn paths_equivalent(left: &str, right: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn launch_restart_plan(plan: &RestartPlan) -> Result<(), String> {
+fn matching_terminal_count(saved: &TerminalSession) -> usize {
+    terminal::discover()
+        .sessions
+        .iter()
+        .filter(|current| terminal_session_matches(saved, current))
+        .count()
+}
+
+#[cfg(windows)]
+fn wait_for_additional_terminal(saved: &TerminalSession, baseline: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if matching_terminal_count(saved) > baseline {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(TERMINAL_VERIFY_POLL);
+    }
+}
+
+#[cfg(windows)]
+fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<u32, String> {
     let mut command = Command::new(&plan.executable);
     command.args(&plan.args);
     if let Some(directory) = plan.working_directory.as_deref() {
         command.current_dir(directory);
     }
+
+    if needs_fresh_console_window(session, plan) {
+        command.creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
+    }
+
     command
         .spawn()
-        .map(|_| ())
+        .map(|child| child.id())
         .map_err(|error| format!("failed to start '{}': {error}", plan.executable))
+}
+
+#[cfg(windows)]
+fn needs_fresh_console_window(session: &TerminalSession, plan: &RestartPlan) -> bool {
+    if matches!(session.host, TerminalHost::VisualStudioCode | TerminalHost::Cursor) {
+        return false;
+    }
+
+    let executable = plan
+        .executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(&plan.executable)
+        .to_ascii_lowercase();
+    matches!(
+        executable.as_str(),
+        "cmd.exe"
+            | "cmd"
+            | "powershell.exe"
+            | "powershell"
+            | "pwsh.exe"
+            | "pwsh"
+            | "wsl.exe"
+            | "wsl"
+            | "bash.exe"
+            | "bash"
+            | "zsh.exe"
+            | "zsh"
+            | "fish.exe"
+            | "fish"
+            | "nu.exe"
+            | "nu"
+            | "nushell.exe"
+            | "nushell"
+            | "sh.exe"
+            | "sh"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::docker::{ContainerResource, ComposeProject};
+    use crate::adapters::{
+        docker::{ContainerResource, ComposeProject},
+        terminal::{ShellKind, WorkingDirectorySource},
+    };
 
     fn project(name: &str, services: &[&str]) -> ComposeProject {
         ComposeProject {
@@ -446,6 +566,26 @@ mod tests {
             config_files: Vec::new(),
             services: services.iter().map(|value| (*value).to_owned()).collect(),
             containers: Vec::new(),
+        }
+    }
+
+    fn terminal_session(host: TerminalHost, shell: ShellKind) -> TerminalSession {
+        TerminalSession {
+            sources: Vec::new(),
+            host,
+            shell,
+            shell_executable: Some("cmd.exe".to_owned()),
+            environment: TerminalEnvironment::Windows,
+            pid: None,
+            parent_pid: None,
+            tty: None,
+            profile: None,
+            title: None,
+            working_directory: None,
+            working_directory_source: WorkingDirectorySource::Unknown,
+            startup_command: None,
+            foreground_command: None,
+            restart: None,
         }
     }
 
@@ -486,26 +626,44 @@ mod tests {
     #[test]
     fn terminal_matching_respects_working_directory() {
         let session = TerminalSession {
-            sources: Vec::new(),
-            host: TerminalHost::WindowsTerminal,
-            shell: crate::adapters::terminal::ShellKind::PowerShell,
-            shell_executable: Some("pwsh.exe".to_owned()),
-            environment: TerminalEnvironment::Windows,
-            pid: None,
-            parent_pid: None,
-            tty: None,
             profile: Some("PowerShell".to_owned()),
-            title: None,
             working_directory: Some(r"C:\Work\Project".to_owned()),
-            working_directory_source: crate::adapters::terminal::WorkingDirectorySource::WindowsTerminalState,
-            startup_command: None,
-            foreground_command: None,
-            restart: None,
+            working_directory_source: WorkingDirectorySource::WindowsTerminalState,
+            shell: ShellKind::PowerShell,
+            host: TerminalHost::WindowsTerminal,
+            shell_executable: Some("pwsh.exe".to_owned()),
+            ..terminal_session(TerminalHost::WindowsTerminal, ShellKind::PowerShell)
         };
         let mut other = session.clone();
         other.working_directory = Some(r"C:/work/project".to_owned());
         assert!(terminal_session_matches(&session, &other));
         other.working_directory = Some(r"C:\Other".to_owned());
         assert!(!terminal_session_matches(&session, &other));
+    }
+
+    #[test]
+    fn console_host_and_unknown_are_compatible_for_standalone_shells() {
+        let saved = terminal_session(TerminalHost::ConsoleHost, ShellKind::CommandPrompt);
+        let current = terminal_session(TerminalHost::Unknown, ShellKind::CommandPrompt);
+        assert!(terminal_session_matches(&saved, &current));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_console_shell_restart_requests_a_fresh_console() {
+        let session = terminal_session(TerminalHost::Unknown, ShellKind::CommandPrompt);
+        let plan = RestartPlan {
+            executable: r"C:\Windows\System32\cmd.exe".to_owned(),
+            args: Vec::new(),
+            working_directory: None,
+            note: None,
+        };
+        assert!(needs_fresh_console_window(&session, &plan));
+
+        let wt = RestartPlan {
+            executable: "wt.exe".to_owned(),
+            ..plan
+        };
+        assert!(!needs_fresh_console_window(&session, &wt));
     }
 }
