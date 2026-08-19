@@ -113,7 +113,7 @@ fn wait_for_fresh_adapter_heartbeat(
     timeout: Duration,
 ) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
-    let mut last_error = None;
+    let mut last_error: Option<String>;
 
     loop {
         match adapter_state_updated_at_unix_ms() {
