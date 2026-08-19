@@ -6,13 +6,17 @@ use std::collections::HashSet;
 use std::{
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const EXPLORER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(windows)]
 const EXPLORER_LAUNCH_SPACING: Duration = Duration::from_millis(120);
+#[cfg(windows)]
+const EXPLORER_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(windows)]
+const EXPLORER_NAVIGATION_POLL: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -53,6 +57,8 @@ impl ExplorerSnapshot {
 pub struct ExplorerRestoreReport {
     pub saved: usize,
     pub already_open: usize,
+    pub planned_to_navigate: usize,
+    pub navigated: usize,
     pub planned_to_open: usize,
     pub opened: usize,
     pub warnings: Vec<String>,
@@ -144,6 +150,62 @@ pub fn restore_from_capsule(snapshot: &Value, dry_run: bool) -> ExplorerRestoreR
         }
     }
 
+    let unmatched_current = current
+        .windows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used.contains(index))
+        .map(|(_, window)| window)
+        .collect::<Vec<_>>();
+
+    // A changed Explorer location is the same user-facing resource, not a reason
+    // to manufacture another window. Reconcile in place only when ownership is
+    // unambiguous: exactly one saved folder is missing and exactly one current
+    // Explorer folder is unmatched. With multiple candidates Context Capsule
+    // remains additive instead of guessing which user window to mutate.
+    if should_navigate_in_place(missing.len(), unmatched_current.len()) {
+        report.planned_to_navigate = 1;
+        if dry_run {
+            return report;
+        }
+
+        #[cfg(windows)]
+        {
+            let from = &unmatched_current[0].target;
+            let target = &missing[0].target;
+            match navigate_existing_target(from, target) {
+                Ok(()) if wait_for_target(target, EXPLORER_NAVIGATION_TIMEOUT) => {
+                    report.navigated = 1;
+                    return report;
+                }
+                Ok(()) => {
+                    report.failures.push(format!(
+                        "Explorer '{}' accepted navigation to '{}' but the saved target was not observed within {} ms",
+                        from,
+                        target,
+                        EXPLORER_NAVIGATION_TIMEOUT.as_millis()
+                    ));
+                    return report;
+                }
+                Err(error) => {
+                    report.failures.push(format!(
+                        "Explorer '{}' could not be navigated back to '{}': {error}",
+                        from, target
+                    ));
+                    return report;
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            report
+                .warnings
+                .push("Explorer in-place navigation is available on Windows only".to_owned());
+            return report;
+        }
+    }
+
     report.planned_to_open = missing.len();
     if dry_run || missing.is_empty() {
         return report;
@@ -175,6 +237,10 @@ pub fn restore_from_capsule(snapshot: &Value, dry_run: bool) -> ExplorerRestoreR
     }
 
     report
+}
+
+fn should_navigate_in_place(missing_saved: usize, unmatched_current: usize) -> bool {
+    missing_saved == 1 && unmatched_current == 1
 }
 
 pub fn explorer_targets_equal(left: &str, right: &str) -> bool {
@@ -321,6 +387,91 @@ foreach ($window in @($shell.Windows())) {
 }
 
 #[cfg(windows)]
+fn navigate_existing_target(from: &str, target: &str) -> Result<(), String> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+function Normalize-Target([string]$value) {
+    $normalized = $value.Trim().Trim('"')
+    $normalized = $normalized.Replace('/', '\')
+    if ($normalized.Length -gt 3) { $normalized = $normalized.TrimEnd('\') }
+    return $normalized.ToLowerInvariant()
+}
+function Window-Target($window) {
+    $value = ''
+    try { $value = [string]$window.Document.Folder.Self.Path } catch {}
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        try {
+            $locationUrl = [string]$window.LocationURL
+            if (-not [string]::IsNullOrWhiteSpace($locationUrl)) {
+                $value = ([Uri]$locationUrl).LocalPath
+            }
+        } catch {}
+    }
+    return $value
+}
+$shell = New-Object -ComObject Shell.Application
+$from = Normalize-Target $env:CONTEXT_CAPSULE_EXPLORER_FROM
+$target = $env:CONTEXT_CAPSULE_EXPLORER_TARGET
+foreach ($window in @($shell.Windows())) {
+    try {
+        if ((Normalize-Target (Window-Target $window)) -eq $from) {
+            $window.Navigate($target)
+            exit 0
+        }
+    } catch {}
+}
+throw "the unmatched Explorer window could not be found"
+"#;
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
+        .env("CONTEXT_CAPSULE_EXPLORER_FROM", from)
+        .env("CONTEXT_CAPSULE_EXPLORER_TARGET", target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("could not start Explorer navigation helper: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if stderr.is_empty() {
+            format!("navigation helper exited with {}", output.status)
+        } else {
+            stderr
+        })
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_target(target: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = discover_windows();
+        if snapshot.status == ExplorerStatus::Available
+            && snapshot
+                .windows
+                .iter()
+                .any(|window| explorer_targets_equal(&window.target, target))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(EXPLORER_NAVIGATION_POLL);
+    }
+}
+
+#[cfg(windows)]
 fn launch_target(target: &str) -> Result<(), String> {
     Command::new("explorer.exe")
         .arg(target)
@@ -347,6 +498,14 @@ mod tests {
             r"C:\Users\Dhia\Project",
             r"C:\Users\Dhia\Other"
         ));
+    }
+
+    #[test]
+    fn explorer_reuses_only_an_unambiguous_single_changed_window() {
+        assert!(should_navigate_in_place(1, 1));
+        assert!(!should_navigate_in_place(2, 1));
+        assert!(!should_navigate_in_place(1, 2));
+        assert!(!should_navigate_in_place(0, 1));
     }
 
     #[test]

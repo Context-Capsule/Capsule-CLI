@@ -45,6 +45,8 @@ const SETTLE_MAXIMUM: Duration = Duration::from_secs(8);
 const SETTLE_STABLE_FOR: Duration = Duration::from_millis(900);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(180);
 const GEOMETRY_TOLERANCE: i32 = 14;
+const PLACEMENT_RETRIES: usize = 5;
+const PLACEMENT_SETTLE_BASE_MS: u64 = 120;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -64,23 +66,6 @@ impl From<NativeRect> for SavedRect {
             bottom: value.bottom,
         }
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Point {
-    x: i32,
-    y: i32,
-}
-
-#[repr(C)]
-struct WindowPlacement {
-    length: u32,
-    flags: u32,
-    show_cmd: u32,
-    min_position: Point,
-    max_position: Point,
-    normal_position: NativeRect,
 }
 
 #[repr(C)]
@@ -114,7 +99,6 @@ unsafe extern "system" {
     fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max_count: i32) -> i32;
     fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
     fn GetWindowRect(hwnd: Hwnd, rect: *mut NativeRect) -> Bool;
-    fn GetWindowPlacement(hwnd: Hwnd, placement: *mut WindowPlacement) -> Bool;
     fn IsIconic(hwnd: Hwnd) -> Bool;
     fn IsZoomed(hwnd: Hwnd) -> Bool;
     fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> Hmonitor;
@@ -334,7 +318,7 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
             } else if dry_run {
                 report.windows_planned_to_move += 1;
             } else {
-                match apply_window_state(current_window, saved_window, target) {
+                match apply_window_state(current_window, saved_window, display, target) {
                     Ok(()) => report.windows_moved += 1,
                     Err(error) => report.failures.push(format!(
                         "{} / '{}': {error}",
@@ -712,6 +696,7 @@ fn window_satisfied(
 fn apply_window_state(
     current: &CurrentWindow,
     saved: &SavedWindow,
+    display: &TargetDisplay,
     target: SavedRect,
 ) -> Result<(), String> {
     let hwnd = current.hwnd as Hwnd;
@@ -719,45 +704,110 @@ fn apply_window_state(
         return Err("window handle is unavailable".to_owned());
     }
 
-    if current.minimized || current.maximized {
-        unsafe {
-            ShowWindow(hwnd, SW_RESTORE);
+    let mut last_observed: Option<CurrentWindow> = None;
+    for attempt in 0..PLACEMENT_RETRIES {
+        let was_non_normal = unsafe { IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 };
+        if was_non_normal {
+            unsafe {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            thread::sleep(Duration::from_millis(40));
+        } else {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
         }
-    } else {
-        unsafe {
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+        let outer = frame_adjusted_outer_rect(hwnd, target);
+        if unsafe {
+            SetWindowPos(
+                hwnd,
+                ptr::null_mut(),
+                outer.left,
+                outer.top,
+                outer.width().max(1),
+                outer.height().max(1),
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        } == 0
+        {
+            return Err("SetWindowPos failed".to_owned());
+        }
+
+        match saved.state_spec() {
+            WindowStateSpec::Minimized => unsafe {
+                ShowWindow(hwnd, SW_MINIMIZE);
+            },
+            WindowStateSpec::Maximized => unsafe {
+                ShowWindow(hwnd, SW_MAXIMIZE);
+            },
+            WindowStateSpec::Normal
+            | WindowStateSpec::Fullscreen
+            | WindowStateSpec::Snapped(_)
+            | WindowStateSpec::Unknown(_) => {}
+        }
+
+        thread::sleep(Duration::from_millis(
+            PLACEMENT_SETTLE_BASE_MS * (attempt as u64 + 1),
+        ));
+
+        if matches!(saved.state_spec(), WindowStateSpec::Minimized)
+            && unsafe { IsIconic(hwnd) != 0 }
+        {
+            return Ok(());
+        }
+
+        if let Some(observed) = observe_window(hwnd) {
+            if window_satisfied(&observed, saved, display, target) {
+                return Ok(());
+            }
+            last_observed = Some(observed);
         }
     }
 
-    let outer = frame_adjusted_outer_rect(hwnd, target);
-    if unsafe {
-        SetWindowPos(
-            hwnd,
-            ptr::null_mut(),
-            outer.left,
-            outer.top,
-            outer.width().max(1),
-            outer.height().max(1),
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-    } == 0
-    {
-        return Err("SetWindowPos failed".to_owned());
-    }
+    let observed = last_observed
+        .as_ref()
+        .map(|window| {
+            format!(
+                "left={} top={} right={} bottom={} minimized={} maximized={} display={}",
+                window.bounds.left,
+                window.bounds.top,
+                window.bounds.right,
+                window.bounds.bottom,
+                window.minimized,
+                window.maximized,
+                window.display_device.as_deref().unwrap_or("unknown")
+            )
+        })
+        .unwrap_or_else(|| "window became unavailable".to_owned());
+    Err(format!(
+        "window placement did not converge after {PLACEMENT_RETRIES} attempts; desired left={} top={} right={} bottom={} state={}; observed {observed}",
+        target.left, target.top, target.right, target.bottom, saved.state
+    ))
+}
 
-    match saved.state_spec() {
-        WindowStateSpec::Minimized => unsafe {
-            ShowWindow(hwnd, SW_MINIMIZE);
-        },
-        WindowStateSpec::Maximized => unsafe {
-            ShowWindow(hwnd, SW_MAXIMIZE);
-        },
-        WindowStateSpec::Normal
-        | WindowStateSpec::Fullscreen
-        | WindowStateSpec::Snapped(_)
-        | WindowStateSpec::Unknown(_) => {}
+fn observe_window(hwnd: Hwnd) -> Option<CurrentWindow> {
+    if hwnd.is_null() {
+        return None;
     }
-    Ok(())
+    let bounds = window_bounds(hwnd)?;
+    let mut pid = 0_u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let display_device = monitor_info(monitor).map(|display| display.device_name);
+    Some(CurrentWindow {
+        hwnd: hwnd as usize,
+        pid,
+        title: window_title(hwnd),
+        bounds,
+        minimized: unsafe { IsIconic(hwnd) != 0 },
+        maximized: unsafe { IsZoomed(hwnd) != 0 },
+        display_device,
+        z_order: 0,
+        is_foreground: hwnd as usize == unsafe { GetForegroundWindow() } as usize,
+    })
 }
 
 fn frame_adjusted_outer_rect(hwnd: Hwnd, desired_frame: SavedRect) -> SavedRect {
@@ -1174,7 +1224,12 @@ mod tests {
             hwnd: 1,
             pid: 1,
             title: "Left document".to_owned(),
-            bounds: SavedRect { left: 900, top: 0, right: 1700, bottom: 600 },
+            bounds: SavedRect {
+                left: 900,
+                top: 0,
+                right: 1700,
+                bottom: 600,
+            },
             minimized: false,
             maximized: false,
             display_device: Some("DISPLAY1".to_owned()),
@@ -1185,7 +1240,12 @@ mod tests {
             hwnd: 2,
             pid: 1,
             title: "Right document".to_owned(),
-            bounds: SavedRect { left: 0, top: 0, right: 800, bottom: 600 },
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 800,
+                bottom: 600,
+            },
             minimized: false,
             maximized: false,
             display_device: Some("DISPLAY1".to_owned()),
@@ -1194,8 +1254,18 @@ mod tests {
         };
         let display = TargetDisplay {
             device_name: "DISPLAY1".to_owned(),
-            bounds: SavedRect { left: 0, top: 0, right: 1920, bottom: 1080 },
-            work_area: SavedRect { left: 0, top: 0, right: 1920, bottom: 1040 },
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            work_area: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
             is_primary: true,
             relation_to_primary: "primary".to_owned(),
         };

@@ -153,6 +153,10 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     let mut semantic_snapshot = snapshot.clone();
     #[cfg(windows)]
     {
+        if zen_bootstrap.skip_semantic_restore {
+            suppress_firefox_semantic(&mut semantic_snapshot);
+        }
+
         let preparation = vscode_devhost::prepare(snapshot, options.dry_run);
         if preparation.skip_vscode_semantic_restore {
             vscode_devhost::suppress_vscode_semantic(&mut semantic_snapshot);
@@ -179,6 +183,12 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
     report.failures.extend(semantic.failures);
 
     let explorer = crate::explorer::restore_from_capsule(snapshot, options.dry_run);
+    if options.dry_run && explorer.planned_to_navigate > 0 {
+        report.warnings.push(format!(
+            "Explorer restore: would navigate {} unambiguous changed folder window(s) back to the saved target",
+            explorer.planned_to_navigate
+        ));
+    }
     if options.dry_run && explorer.planned_to_open > 0 {
         report.warnings.push(format!(
             "Explorer restore: would open {} missing folder window(s)",
@@ -261,6 +271,13 @@ fn has_vscode_editor_snapshot(snapshot: &Value) -> bool {
     snapshot
         .pointer("/editors/vscode")
         .is_some_and(|value| !value.is_null())
+}
+
+#[cfg(any(windows, test))]
+fn suppress_firefox_semantic(snapshot: &mut Value) {
+    if let Some(browsers) = snapshot.get_mut("browsers").and_then(Value::as_object_mut) {
+        browsers.insert("firefox".to_owned(), Value::Null);
+    }
 }
 
 fn suppress_orphan_vscode_semantic(snapshot: &mut Value) -> usize {
@@ -478,11 +495,30 @@ mod tests {
     }
 
     #[test]
+    fn suppressing_firefox_semantic_only_removes_the_browser_payload() {
+        let mut snapshot = json!({
+            "browsers": { "firefox": { "windows": [1] } },
+            "editors": { "vscode": { "tabs": [1] } }
+        });
+        suppress_firefox_semantic(&mut snapshot);
+        assert!(snapshot.pointer("/browsers/firefox").unwrap().is_null());
+        assert_eq!(snapshot.pointer("/editors/vscode/tabs/0"), Some(&json!(1)));
+    }
+
+    #[test]
     fn devhost_window_is_removed_without_dropping_normal_code_windows() {
-        let mut code = application("Visual Studio Code", Some(r"C:\Program Files\Microsoft VS Code\Code.exe"));
+        let mut code = application(
+            "Visual Studio Code",
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+        );
         let base = SavedWindow {
             title: "ordinary - Visual Studio Code".to_owned(),
-            bounds: SavedRect { left: 0, top: 0, right: 900, bottom: 700 },
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 900,
+                bottom: 700,
+            },
             restore_bounds: None,
             normalized_bounds: None,
             state: "normal".to_owned(),
@@ -498,19 +534,33 @@ mod tests {
         let mut dev = base.clone();
         dev.title = "extension - Visual Studio Code [Extension Development Host]".to_owned();
         code.windows = vec![base, dev];
-        let desktop = SavedDesktop { status: "available".to_owned(), displays: vec![], applications: vec![code] };
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: vec![],
+            applications: vec![code],
+        };
         let filtered = desktop_without_semantic_owned_hosts(&desktop, false, true, false);
         assert_eq!(filtered.applications.len(), 1);
         assert_eq!(filtered.applications[0].windows.len(), 1);
-        assert!(!is_vscode_devhost_title(&filtered.applications[0].windows[0].title));
+        assert!(!is_vscode_devhost_title(
+            &filtered.applications[0].windows[0].title
+        ));
     }
 
     #[test]
     fn devhost_only_application_is_removed_from_pre_semantic_desktop() {
-        let mut code = application("Visual Studio Code", Some(r"C:\Program Files\Microsoft VS Code\Code.exe"));
+        let mut code = application(
+            "Visual Studio Code",
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+        );
         code.windows = vec![SavedWindow {
             title: "extension - Visual Studio Code [Extension Development Host]".to_owned(),
-            bounds: SavedRect { left: 100, top: 100, right: 1000, bottom: 800 },
+            bounds: SavedRect {
+                left: 100,
+                top: 100,
+                right: 1000,
+                bottom: 800,
+            },
             restore_bounds: None,
             normalized_bounds: None,
             state: "normal".to_owned(),
@@ -523,8 +573,16 @@ mod tests {
             is_on_current_virtual_desktop: Some(true),
             taskbar_candidate: true,
         }];
-        let desktop = SavedDesktop { status: "available".to_owned(), displays: vec![], applications: vec![code] };
-        assert!(desktop_without_semantic_owned_hosts(&desktop, false, true, false).applications.is_empty());
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: vec![],
+            applications: vec![code],
+        };
+        assert!(
+            desktop_without_semantic_owned_hosts(&desktop, false, true, false)
+                .applications
+                .is_empty()
+        );
     }
 
     #[test]
@@ -538,7 +596,11 @@ mod tests {
             ] }
         });
         assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 2);
-        let sessions = snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap();
+        let sessions = snapshot
+            .pointer("/terminals/sessions")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["host"], "windows-terminal");
     }
@@ -550,7 +612,15 @@ mod tests {
             "terminals": { "sessions": [{ "host": "visual-studio-code" }] }
         });
         assert_eq!(suppress_orphan_vscode_semantic(&mut snapshot), 0);
-        assert_eq!(snapshot.pointer("/terminals/sessions").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot
+                .pointer("/terminals/sessions")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -572,9 +642,8 @@ mod tests {
 
         let mut packaged = base.clone();
         packaged.executable_path = None;
-        packaged.app_user_model_id = Some(
-            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned(),
-        );
+        packaged.app_user_model_id =
+            Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned());
         assert!(is_windows_terminal_application(&packaged));
     }
 }
