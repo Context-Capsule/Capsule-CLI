@@ -328,28 +328,25 @@ fn docker_check() -> DoctorCheck {
 
 fn logging_check() -> DoctorCheck {
     match logging::log_directory() {
-        Ok(path) => {
-            let result = fs::create_dir_all(&path);
-            match result {
-                Ok(()) => check(
-                    "Logging",
-                    DoctorStatus::Ok,
-                    "persistent component logs available",
-                    vec![
-                        format!("directory: {}", path.display()),
-                        "rotation: 1 MiB per component, one previous file retained".to_owned(),
-                    ],
-                    None,
-                ),
-                Err(error) => check(
-                    "Logging",
-                    DoctorStatus::Error,
-                    format!("cannot create log directory: {error}"),
-                    vec![format!("directory: {}", path.display())],
-                    Some("Check filesystem permissions for the Context Capsule state directory."),
-                ),
-            }
-        }
+        Ok(path) => match fs::create_dir_all(&path) {
+            Ok(()) => check(
+                "Logging",
+                DoctorStatus::Ok,
+                "persistent component logs available",
+                vec![
+                    format!("directory: {}", path.display()),
+                    "rotation: 1 MiB per component, one previous file retained".to_owned(),
+                ],
+                None,
+            ),
+            Err(error) => check(
+                "Logging",
+                DoctorStatus::Error,
+                format!("cannot create log directory: {error}"),
+                vec![format!("directory: {}", path.display())],
+                Some("Check filesystem permissions for the Context Capsule state directory."),
+            ),
+        },
         Err(error) => check(
             "Logging",
             DoctorStatus::Error,
@@ -365,14 +362,14 @@ fn check(
     status: DoctorStatus,
     summary: impl Into<String>,
     details: Vec<String>,
-    hint: Option<impl Into<String>>,
+    hint: Option<&str>,
 ) -> DoctorCheck {
     DoctorCheck {
         component: component.into(),
         status,
         summary: summary.into(),
         details,
-        hint: hint.map(Into::into),
+        hint: hint.map(str::to_owned),
     }
 }
 
@@ -385,13 +382,13 @@ mod tests {
         let report = DoctorReport {
             version: "test".to_owned(),
             checks: vec![
-                check("one", DoctorStatus::Ok, "ok", Vec::new(), None::<String>),
+                check("one", DoctorStatus::Ok, "ok", Vec::new(), None),
                 check(
                     "two",
                     DoctorStatus::Warning,
                     "warning",
                     Vec::new(),
-                    None::<String>,
+                    None,
                 ),
             ],
         };
@@ -405,7 +402,7 @@ mod tests {
                 DoctorStatus::Error,
                 "error",
                 Vec::new(),
-                None::<String>,
+                None,
             )],
         };
         assert!(report.has_errors());
