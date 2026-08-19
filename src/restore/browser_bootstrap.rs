@@ -16,7 +16,6 @@ pub struct ZenBootstrapReport {
     pub already_running: bool,
     pub planned: bool,
     pub launched: bool,
-    pub adapter_ready: bool,
     pub skip_semantic_restore: bool,
     pub warnings: Vec<String>,
     pub failures: Vec<String>,
@@ -37,7 +36,6 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
             // Preserve the proven warm-restore path. The semantic adapter itself
             // still owns the final request/timeout diagnostics in this case.
             report.already_running = true;
-            report.adapter_ready = true;
             return report;
         }
         Ok(false) => {}
@@ -87,9 +85,7 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
     }
 
     match wait_for_fresh_adapter_heartbeat(launched_after_unix_ms, ADAPTER_READY_TIMEOUT) {
-        Ok(true) => {
-            report.adapter_ready = true;
-        }
+        Ok(true) => {}
         Ok(false) => {
             report.skip_semantic_restore = true;
             report.failures.push(format!(
