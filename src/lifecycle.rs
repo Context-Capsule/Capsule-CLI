@@ -1,9 +1,12 @@
 use crate::{
-    diagnostics::{self, DoctorStatus},
     diff::{self, DiffChange, DiffKind},
-    discovery, logging,
-    persistence::{CapsuleStore, PersistenceError, parse_capsule_reference},
+    discovery,
+    persistence::{CapsuleStore, parse_capsule_reference},
     snapshot,
+};
+use context_capsule::{
+    diagnostics::{self, DoctorStatus},
+    logging,
 };
 use std::process::ExitCode;
 
@@ -330,11 +333,5 @@ mod tests {
         );
         assert!(parse_single_name("update", Vec::new()).is_err());
         assert!(parse_single_name("history", vec!["a".to_owned(), "b".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn persistence_error_type_remains_available_to_lifecycle_module() {
-        let error = PersistenceError::NotFound("demo".to_owned());
-        assert!(error.to_string().contains("demo"));
     }
 }
