@@ -6,7 +6,10 @@
 pub mod adapters;
 pub mod browser;
 pub mod desktop;
+pub mod diagnostics;
+pub mod diff;
 pub mod explorer;
+pub mod logging;
 pub mod persistence;
 pub mod restore;
 pub mod restore_bus;
