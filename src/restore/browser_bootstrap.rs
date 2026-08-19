@@ -9,7 +9,6 @@ use std::{
 
 const ADAPTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const ADAPTER_READY_POLL: Duration = Duration::from_millis(150);
-const ADAPTER_TIMESTAMP_SLOP_MS: i64 = 1_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZenBootstrapReport {
@@ -153,9 +152,7 @@ fn adapter_heartbeat_is_fresh(
     let newer_than_previous = previous_heartbeat
         .map(|previous| updated_at_unix_ms > previous)
         .unwrap_or(true);
-    newer_than_previous
-        && updated_at_unix_ms.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS)
-            >= launched_after_unix_ms
+    newer_than_previous && updated_at_unix_ms >= launched_after_unix_ms
 }
 
 fn adapter_state_updated_at_unix_ms() -> Result<Option<i64>, String> {
@@ -266,11 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_must_be_newer_than_the_prelaunch_state_even_with_clock_slop() {
+    fn heartbeat_must_be_newer_than_the_prelaunch_state_and_not_predate_launch() {
         let launched = 50_000_i64;
         let previous = Some(49_900_i64);
         assert!(!adapter_heartbeat_is_fresh(49_900, previous, launched));
+        assert!(!adapter_heartbeat_is_fresh(49_999, previous, launched));
+        assert!(adapter_heartbeat_is_fresh(50_000, previous, launched));
         assert!(adapter_heartbeat_is_fresh(50_050, previous, launched));
-        assert!(!adapter_heartbeat_is_fresh(48_999, None, launched));
+        assert!(!adapter_heartbeat_is_fresh(49_999, None, launched));
     }
 }
