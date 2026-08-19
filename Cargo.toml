@@ -3,10 +3,11 @@ name = "context-capsule"
 version = "0.1.0"
 edition = "2024"
 default-run = "capsule"
+autobins = false
 
 [[bin]]
 name = "capsule"
-path = "src/main.rs"
+path = "src/capsule_main.rs"
 
 [[bin]]
 name = "capsule-firefox-host"
