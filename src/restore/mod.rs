@@ -95,6 +95,9 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 report.failures.extend(zen_bootstrap.failures.clone());
             }
 
+            // Semantic adapters own host/window creation first: keep Zen and
+            // the VS Code Dev Host out of the prerequisite desktop pass so the
+            // generic launcher cannot race their richer restore logic.
             let prerequisite = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
@@ -102,11 +105,15 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 zen_semantic_owner,
             );
 
+            // After semantic restore has recreated browser/editor topology, the
+            // final Win32 pass owns only physical desktop convergence. Include
+            // Zen here so newly recreated windows get their saved monitor,
+            // rectangle and native Windows snap state without touching tabs.
             let final_target = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
                 saved_devhost && !has_vscode_semantic,
-                zen_semantic_owner,
+                false,
             );
 
             #[cfg(windows)]
@@ -465,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn zen_semantic_snapshot_owns_only_zen_desktop_apps() {
+    fn zen_semantic_snapshot_is_deferred_only_before_semantic_restore() {
         let desktop = SavedDesktop {
             status: "available".to_owned(),
             displays: Vec::new(),
@@ -475,13 +482,15 @@ mod tests {
                 application("Spotify", Some(r"C:\Users\me\Spotify.exe")),
             ],
         };
-        let filtered = desktop_without_semantic_owned_hosts(&desktop, false, false, true);
-        assert_eq!(filtered.applications.len(), 2);
-        assert!(filtered.applications.iter().any(|application| application.name == "Mozilla Firefox"));
-        assert!(filtered.applications.iter().any(|application| application.name == "Spotify"));
+        let prerequisite = desktop_without_semantic_owned_hosts(&desktop, false, false, true);
+        assert_eq!(prerequisite.applications.len(), 2);
+        assert!(prerequisite.applications.iter().any(|application| application.name == "Mozilla Firefox"));
+        assert!(prerequisite.applications.iter().any(|application| application.name == "Spotify"));
+        assert!(!prerequisite.applications.iter().any(is_zen_semantic_application));
 
-        let unfiltered = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
-        assert_eq!(unfiltered.applications.len(), 3);
+        let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
+        assert_eq!(final_placement.applications.len(), 3);
+        assert!(final_placement.applications.iter().any(is_zen_semantic_application));
     }
 
     #[test]

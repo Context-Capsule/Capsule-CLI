@@ -2,7 +2,7 @@ use super::{
     classify::{classify_candidate, detect_snap, display_relation, is_known_background_app},
     model::{
         ApplicationClassification, ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate,
-        LaunchSpec, LaunchStrategy, NormalizedRect, Rect, WindowInfo, WindowState,
+        LaunchSpec, LaunchStrategy, NormalizedRect, Rect, SnapPosition, WindowInfo, WindowState,
     },
 };
 use std::{
@@ -725,13 +725,17 @@ fn build_window_info(
         window.bounds
     };
     let normalized = NormalizedRect::from_rect(geometry_bounds, display.work_area);
+    let detected_snap = snap_from_arrangement(
+        normalized,
+        crate::windows_snap::is_arranged(window.hwnd),
+    );
     let state = if window.minimized {
         WindowState::Minimized
     } else if rect_matches(window.bounds, display.bounds, 4) {
         WindowState::Fullscreen
     } else if window.maximized {
         WindowState::Maximized
-    } else if let Some(snap) = normalized.and_then(detect_snap) {
+    } else if let Some(snap) = detected_snap {
         WindowState::Snapped(snap)
     } else {
         WindowState::Normal
@@ -754,6 +758,20 @@ fn build_window_info(
         is_on_current_virtual_desktop: on_current_desktop,
         taskbar_candidate: window.taskbar_candidate,
     })
+}
+
+fn snap_from_arrangement(
+    normalized: Option<NormalizedRect>,
+    arranged: Option<bool>,
+) -> Option<SnapPosition> {
+    // On Windows versions that expose IsWindowArranged, geometry alone is not
+    // enough: a normal user-sized window can coincidentally occupy an exact
+    // half/third. On older systems where the API is unavailable, preserve the
+    // existing strict geometry fallback.
+    match arranged {
+        Some(false) => None,
+        Some(true) | None => normalized.and_then(detect_snap),
+    }
 }
 
 fn rect_matches(left: Rect, right: Rect, tolerance: i32) -> bool {
@@ -1009,5 +1027,25 @@ mod tests {
             bottom: 1081,
         };
         assert!(rect_matches(window, display, 4));
+    }
+
+    #[test]
+    fn arrangement_signal_prevents_false_half_snap_capture() {
+        let half = NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        assert_eq!(snap_from_arrangement(Some(half), Some(false)), None);
+        assert_eq!(
+            snap_from_arrangement(Some(half), Some(true)),
+            Some(SnapPosition::LeftHalf)
+        );
+        // Preserve geometry-only compatibility if IsWindowArranged is missing.
+        assert_eq!(
+            snap_from_arrangement(Some(half), None),
+            Some(SnapPosition::LeftHalf)
+        );
     }
 }
