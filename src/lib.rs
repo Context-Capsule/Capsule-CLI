@@ -16,3 +16,6 @@ pub mod persistence;
 pub mod restore;
 pub mod restore_bus;
 pub mod vscode;
+
+#[cfg(windows)]
+pub(crate) mod windows_snap;
