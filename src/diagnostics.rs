@@ -295,11 +295,12 @@ fn git_check() -> DoctorCheck {
 
 fn docker_check() -> DoctorCheck {
     let snapshot = docker::discover();
+    let running_containers = snapshot.running_container_count();
     match snapshot.status {
         DockerStatus::Available => check(
             "Docker",
             DoctorStatus::Ok,
-            format!("{} running container(s)", snapshot.running_container_count()),
+            format!("{running_containers} running container(s)"),
             snapshot
                 .context
                 .into_iter()
