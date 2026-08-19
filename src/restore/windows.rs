@@ -69,23 +69,6 @@ impl From<NativeRect> for SavedRect {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Point {
-    x: i32,
-    y: i32,
-}
-
-#[repr(C)]
-struct WindowPlacement {
-    length: u32,
-    flags: u32,
-    show_cmd: u32,
-    min_position: Point,
-    max_position: Point,
-    normal_position: NativeRect,
-}
-
-#[repr(C)]
 struct MonitorInfoExW {
     size: u32,
     monitor: NativeRect,
@@ -116,7 +99,6 @@ unsafe extern "system" {
     fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max_count: i32) -> i32;
     fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
     fn GetWindowRect(hwnd: Hwnd, rect: *mut NativeRect) -> Bool;
-    fn GetWindowPlacement(hwnd: Hwnd, placement: *mut WindowPlacement) -> Bool;
     fn IsIconic(hwnd: Hwnd) -> Bool;
     fn IsZoomed(hwnd: Hwnd) -> Bool;
     fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> Hmonitor;
@@ -729,9 +711,6 @@ fn apply_window_state(
             unsafe {
                 ShowWindow(hwnd, SW_RESTORE);
             }
-            // WinUI/Electron frames can report their old maximized/minimized
-            // non-client metrics for a short period after SW_RESTORE. Let the
-            // frame settle before converting desired DWM bounds to outer bounds.
             thread::sleep(Duration::from_millis(40));
         } else {
             unsafe {
