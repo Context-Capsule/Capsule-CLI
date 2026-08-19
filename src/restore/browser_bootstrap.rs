@@ -1,11 +1,23 @@
 use super::{SavedApplication, SavedDesktop};
-use std::process::{Command, Stdio};
+use serde_json::Value;
+use std::{
+    fs,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+const ADAPTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const ADAPTER_READY_POLL: Duration = Duration::from_millis(150);
+const ADAPTER_TIMESTAMP_SLOP_MS: i64 = 1_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZenBootstrapReport {
     pub already_running: bool,
     pub planned: bool,
     pub launched: bool,
+    pub adapter_ready: bool,
+    pub skip_semantic_restore: bool,
     pub warnings: Vec<String>,
     pub failures: Vec<String>,
 }
@@ -22,7 +34,10 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
 
     match zen_is_running() {
         Ok(true) => {
+            // Preserve the proven warm-restore path. The semantic adapter itself
+            // still owns the final request/timeout diagnostics in this case.
             report.already_running = true;
+            report.adapter_ready = true;
             return report;
         }
         Ok(false) => {}
@@ -30,6 +45,7 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
             report.failures.push(format!(
                 "Zen bootstrap: could not inspect whether Zen is already running: {error}"
             ));
+            report.skip_semantic_restore = true;
             return report;
         }
     }
@@ -39,6 +55,7 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
             "Zen bootstrap: the saved browser is closed and its capsule entry has no safe zen.exe launch target"
                 .to_owned(),
         );
+        report.skip_semantic_restore = true;
         return report;
     };
 
@@ -47,6 +64,11 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         return report;
     }
 
+    // A stale firefox.json from before Zen was closed is not proof that the
+    // extension survived the restart. Record the launch time and require a
+    // state heartbeat written after it before the semantic restore request is
+    // allowed to proceed.
+    let launched_after_unix_ms = now_unix_ms();
     match Command::new(executable)
         .arg("--blank-window")
         .stdin(Stdio::null())
@@ -55,12 +77,97 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         .spawn()
     {
         Ok(_) => report.launched = true,
-        Err(error) => report.failures.push(format!(
-            "Zen bootstrap: failed to launch '{executable} --blank-window': {error}"
-        )),
+        Err(error) => {
+            report.failures.push(format!(
+                "Zen bootstrap: failed to launch '{executable} --blank-window': {error}"
+            ));
+            report.skip_semantic_restore = true;
+            return report;
+        }
+    }
+
+    match wait_for_fresh_adapter_heartbeat(launched_after_unix_ms, ADAPTER_READY_TIMEOUT) {
+        Ok(true) => {
+            report.adapter_ready = true;
+        }
+        Ok(false) => {
+            report.skip_semantic_restore = true;
+            report.failures.push(format!(
+                "Zen bootstrap: Zen started, but the Context Capsule Firefox/Zen adapter did not publish a fresh heartbeat within {} seconds. The semantic restore was not attempted. If the extension was loaded temporarily from about:debugging, a full Zen shutdown removes that temporary installation; load/install the extension again (or use a persistent packaged installation) and retry. See firefox.log for adapter startup diagnostics.",
+                ADAPTER_READY_TIMEOUT.as_secs()
+            ));
+        }
+        Err(error) => {
+            report.skip_semantic_restore = true;
+            report.failures.push(format!(
+                "Zen bootstrap: Zen started, but Context Capsule could not verify that the Firefox/Zen adapter reconnected: {error}. The semantic restore was not attempted."
+            ));
+        }
     }
 
     report
+}
+
+fn wait_for_fresh_adapter_heartbeat(
+    launched_after_unix_ms: i64,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match adapter_state_updated_at_unix_ms() {
+            Ok(Some(updated_at))
+                if updated_at.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS)
+                    >= launched_after_unix_ms =>
+            {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // A partially-written/temporarily unavailable runtime file can
+                // occur during startup. Keep polling until the deadline; retain
+                // the final error only if readiness never succeeds.
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(ADAPTER_READY_POLL);
+    }
+}
+
+fn adapter_state_updated_at_unix_ms() -> Result<Option<i64>, String> {
+    let path = crate::browser::runtime_state_path().map_err(|error| error.to_string())?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not read Firefox adapter state '{}': {error}",
+                path.display()
+            ));
+        }
+    };
+    let envelope: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Firefox adapter state '{}' is invalid JSON: {error}",
+            path.display()
+        )
+    })?;
+    Ok(envelope
+        .get("updated_at_unix_ms")
+        .and_then(Value::as_i64))
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn zen_is_running() -> Result<bool, String> {
@@ -137,5 +244,14 @@ mod tests {
         let malicious = application("Zen Browser", Some(r"C:\Windows\System32\cmd.exe"));
         assert!(is_zen_application(&malicious));
         assert_eq!(safe_zen_executable(&malicious), None);
+    }
+
+    #[test]
+    fn fresh_timestamp_allows_small_clock_or_filesystem_slop() {
+        let launched = 50_000_i64;
+        let fresh = 49_100_i64;
+        assert!(fresh.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS) >= launched);
+        let stale = 48_999_i64;
+        assert!(stale.saturating_add(ADAPTER_TIMESTAMP_SLOP_MS) < launched);
     }
 }
