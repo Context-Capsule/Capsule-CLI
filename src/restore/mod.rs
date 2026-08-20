@@ -111,12 +111,15 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // final Win32 pass owns only physical desktop convergence. Include
             // Zen here so newly recreated windows get their saved monitor,
             // rectangle and native Windows snap state without touching tabs.
-            let final_target = desktop_without_semantic_owned_hosts(
+            let mut final_target = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
                 saved_devhost && !has_vscode_semantic,
                 false,
             );
+            if zen_semantic_owner {
+                disable_zen_title_identity_for_physical_matching(&mut final_target);
+            }
 
             #[cfg(windows)]
             {
@@ -254,6 +257,10 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // Once every semantic-owned window exists and is on the right monitor,
             // rebuild supported custom two-window layouts as genuine Windows Snap
             // groups by snapping a native pair and replaying the saved divider drag.
+            // `desktop` is the physical-matching copy: Zen titles are intentionally
+            // blank so both this pass and custom-Snap attribution use the geometry
+            // established by the semantic adapter rather than volatile active-tab
+            // titles.
             let custom = custom_snap::restore(desktop);
             final_desktop.warnings.extend(custom.warnings);
             final_desktop.failures.extend(custom.failures);
@@ -371,6 +378,26 @@ fn desktop_without_semantic_owned_hosts(
     filtered
 }
 
+/// The Firefox/Zen semantic adapter has already decided which tab topology
+/// belongs to each browser window and has restored every saved browser window's
+/// geometry before the final Win32 pass begins. Browser chrome titles are just
+/// the active tab title; they are therefore volatile and must not be used to
+/// re-identify semantic windows in the physical-only phase.
+///
+/// Clearing titles on this cloned physical target makes the existing generic
+/// and custom-Snap matchers fall back to geometry for Zen only. The original
+/// capsule is untouched, and non-Zen applications retain title identity.
+fn disable_zen_title_identity_for_physical_matching(desktop: &mut SavedDesktop) {
+    for application in &mut desktop.applications {
+        if !is_zen_semantic_application(application) {
+            continue;
+        }
+        for window in &mut application.windows {
+            window.title.clear();
+        }
+    }
+}
+
 fn is_vscode_devhost_title(title: &str) -> bool {
     title
         .to_ascii_lowercase()
@@ -439,6 +466,29 @@ mod tests {
         }
     }
 
+    fn physical_test_window(title: &str) -> SavedWindow {
+        SavedWindow {
+            title: title.to_owned(),
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 900,
+                bottom: 700,
+            },
+            restore_bounds: None,
+            normalized_bounds: None,
+            state: "normal".to_owned(),
+            display_device: "DISPLAY1".to_owned(),
+            display_relation: "primary".to_owned(),
+            display_scale_percent: 100,
+            is_foreground: false,
+            z_order: 0,
+            virtual_desktop_id: None,
+            is_on_current_virtual_desktop: Some(true),
+            taskbar_candidate: true,
+        }
+    }
+
     #[test]
     fn missing_desktop_is_a_graceful_noop() {
         let report = restore_snapshot(&json!({}), RestoreOptions { dry_run: true });
@@ -502,6 +552,48 @@ mod tests {
         let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
         assert_eq!(final_placement.applications.len(), 3);
         assert!(final_placement.applications.iter().any(is_zen_semantic_application));
+    }
+
+    #[test]
+    fn zen_titles_are_disabled_only_in_the_physical_matching_copy() {
+        let mut zen = application("Zen Browser", Some(r"C:\Program Files\Zen Browser\zen.exe"));
+        zen.windows = vec![
+            physical_test_window("Many tabs — Zen Browser"),
+            physical_test_window("ChatGPT — Zen Browser"),
+        ];
+        zen.windows[1].z_order = 1;
+
+        let mut other = application("Notepad", Some(r"C:\Windows\System32\notepad.exe"));
+        other.windows = vec![physical_test_window("notes.txt - Notepad")];
+
+        let original_zen_titles = zen
+            .windows
+            .iter()
+            .map(|window| window.title.clone())
+            .collect::<Vec<_>>();
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: Vec::new(),
+            applications: vec![zen, other],
+        };
+        let mut physical = desktop.clone();
+        disable_zen_title_identity_for_physical_matching(&mut physical);
+
+        let zen_physical = physical
+            .applications
+            .iter()
+            .find(|application| is_zen_semantic_application(application))
+            .unwrap();
+        assert!(zen_physical.windows.iter().all(|window| window.title.is_empty()));
+        assert_eq!(physical.applications[1].windows[0].title, "notes.txt - Notepad");
+        assert_eq!(
+            desktop.applications[0]
+                .windows
+                .iter()
+                .map(|window| window.title.clone())
+                .collect::<Vec<_>>(),
+            original_zen_titles
+        );
     }
 
     #[test]
