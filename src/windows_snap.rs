@@ -26,12 +26,24 @@ const VK_MENU: u16 = 0x12;
 const VK_LWIN: u16 = 0x5B;
 const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
 
+const WM_NCHITTEST: u32 = 0x0084;
+const SMTO_ABORTIFHUNG: u32 = 0x0002;
+const HTLEFT: i32 = 10;
+const HTRIGHT: i32 = 11;
+const HTTOP: i32 = 12;
+const HTBOTTOM: i32 = 15;
+
 const FOREGROUND_SETTLE: Duration = Duration::from_millis(45);
 const SNAP_SETTLE: Duration = Duration::from_millis(220);
 const DIVIDER_HOVER_SETTLE: Duration = Duration::from_millis(90);
 const DIVIDER_STEP_SETTLE: Duration = Duration::from_millis(12);
 const DIVIDER_RESULT_SETTLE: Duration = Duration::from_millis(280);
 const CUSTOM_TARGET_TOLERANCE: i32 = 24;
+const HIT_TEST_TIMEOUT_MS: u32 = 120;
+
+const EDGE_SCAN_OFFSETS: [i32; 21] = [
+    0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -8, 8, -10, 10, -12, 12, -16, 16,
+];
 
 static IS_WINDOW_ARRANGED: OnceLock<Option<IsWindowArrangedFn>> = OnceLock::new();
 
@@ -154,6 +166,15 @@ unsafe extern "system" {
     fn SetCursorPos(x: i32, y: i32) -> Bool;
     fn GetCursorPos(point: *mut Point) -> Bool;
     fn GetWindowRect(hwnd: Hwnd, rect: *mut NativeRect) -> Bool;
+    fn SendMessageTimeoutW(
+        hwnd: Hwnd,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        flags: u32,
+        timeout: u32,
+        result: *mut usize,
+    ) -> isize;
 }
 
 #[link(name = "kernel32")]
@@ -236,10 +257,13 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
 
 /// Recreate a two-window custom Windows Snap split.
 ///
-/// There is no generally available cross-process Win32 setter for arbitrary
-/// arranged state. Establish a real native 50/50 pair using Windows' own snap
-/// shortcuts, then emulate the user's divider drag to the saved ratio. Windows
-/// keeps both windows arranged while resizing adjacent snapped windows.
+/// Windows 11 can choose different seed zones depending on monitor shape and
+/// orientation. In particular, portrait monitors can seed a top/bottom pair as
+/// thirds rather than as one shared 50/50 divider. Do not assume a particular
+/// seed rectangle. First create a real arranged pair, then ask each window
+/// where its actual non-client resize handle is (`WM_NCHITTEST`) and drag that
+/// snapped edge to the saved divider coordinate. This mirrors what a user does
+/// with the mouse and preserves the real `IsWindowArranged` state.
 pub(crate) fn restore_resized_pair(
     first_hwnd: usize,
     second_hwnd: usize,
@@ -278,48 +302,82 @@ pub(crate) fn restore_resized_pair(
         }
     };
 
-    let mut last_error = String::new();
-    for candidate_index in 0..3 {
+    let mut errors = Vec::new();
+
+    // Try the leading window's saved divider-facing edge first. This is the
+    // important portrait path: if Windows seeded top-third + bottom-third,
+    // dragging the top window's real HTBOTTOM handle down to the 2/3 line fills
+    // the middle third while both windows remain arranged.
+    for first_side in [true, false] {
         establish_pair(first, second, orientation)?;
 
-        let first_rect = frame_bounds(first)
-            .ok_or_else(|| "could not read first snapped window frame".to_owned())?;
-        let second_rect = frame_bounds(second)
-            .ok_or_else(|| "could not read second snapped window frame".to_owned())?;
+        let primary = if first_side { first } else { second };
+        let secondary = if first_side { second } else { first };
 
-        let start = divider_start_candidate(
-            first_rect,
-            second_rect,
-            work_area,
-            orientation,
-            candidate_index,
-        );
+        match drag_saved_edge(primary, first_side, orientation, target) {
+            Ok(()) => {
+                if pair_matches_target(first, second, orientation, target) {
+                    return Ok(());
+                }
+
+                // Some Snap layouts do not resize the partner automatically.
+                // If the first edge remained arranged, move the partner's
+                // corresponding edge to the same divider instead of assuming a
+                // linked divider exists.
+                if is_arranged(primary) == Some(true) && is_arranged(secondary) == Some(true) {
+                    if let Err(error) =
+                        drag_saved_edge(secondary, !first_side, orientation, target)
+                    {
+                        errors.push(format!(
+                            "{} edge reached the target but the partner edge could not be resized: {error}",
+                            if first_side { "first" } else { "second" }
+                        ));
+                    } else if pair_matches_target(first, second, orientation, target) {
+                        return Ok(());
+                    }
+                }
+
+                errors.push(format!(
+                    "{} edge drag completed, but {}",
+                    if first_side { "first" } else { "second" },
+                    pair_mismatch_description(first, second, orientation, target)
+                ));
+            }
+            Err(error) => errors.push(format!(
+                "{} divider-facing edge: {error}",
+                if first_side { "first" } else { "second" }
+            )),
+        }
+    }
+
+    // Final fallback for machines/layouts where Windows exposes the shared
+    // splitter hit target between two already adjacent arranged windows but
+    // neither individual frame reports a resize handle exactly where DWM draws
+    // the visible edge.
+    establish_pair(first, second, orientation)?;
+    if let Some(start) = shared_divider_fallback(first, second, work_area, orientation) {
         let end = match orientation {
             SplitOrientation::SideBySide => (target, start.1),
             SplitOrientation::Stacked => (start.0, target),
         };
-
-        if let Err(error) = drag_divider(start, end) {
-            last_error = error;
-            continue;
+        match drag_divider(start, end) {
+            Ok(()) if pair_matches_target(first, second, orientation, target) => return Ok(()),
+            Ok(()) => errors.push(format!(
+                "shared-divider fallback completed, but {}",
+                pair_mismatch_description(first, second, orientation, target)
+            )),
+            Err(error) => errors.push(format!("shared-divider fallback: {error}")),
         }
-
-        if pair_matches_target(first, second, orientation, target) {
-            return Ok(());
-        }
-
-        last_error = format!(
-            "Windows accepted the divider drag but the pair did not remain arranged at the requested divider coordinate {target}"
-        );
+    } else {
+        errors.push("shared-divider fallback could not read the arranged window frames".to_owned());
     }
 
-    Err(if last_error.is_empty() {
-        "could not recreate the native custom snap pair".to_owned()
-    } else {
-        format!(
-            "could not recreate the native custom snap pair: {last_error}. Synthetic input can be blocked by UIPI; if either target app is elevated, run Context Capsule from an equally elevated terminal"
-        )
-    })
+    Err(format!(
+        "could not recreate the native custom snap pair at divider coordinate {target}: {}. \
+Synthetic input can be blocked by UIPI; if either target app is elevated, run Context Capsule \
+from an equally elevated terminal",
+        errors.join(" | ")
+    ))
 }
 
 fn establish_pair(
@@ -354,35 +412,159 @@ fn establish_pair(
     Ok(())
 }
 
-fn divider_start_candidate(
-    first: NativeRect,
-    second: NativeRect,
+fn drag_saved_edge(
+    hwnd: Hwnd,
+    first_side: bool,
+    orientation: SplitOrientation,
+    target: i32,
+) -> Result<(), String> {
+    let rect = frame_bounds(hwnd)
+        .ok_or_else(|| "could not read the arranged window frame".to_owned())?;
+    let expected_hit = resize_hit_code(first_side, orientation);
+    let start = find_resize_handle(hwnd, rect, first_side, orientation).ok_or_else(|| {
+        format!(
+            "Windows did not expose the expected {} resize handle around the arranged frame",
+            hit_name(expected_hit)
+        )
+    })?;
+    let end = match orientation {
+        SplitOrientation::SideBySide => (target, start.1),
+        SplitOrientation::Stacked => (start.0, target),
+    };
+    drag_resize_handle(hwnd, expected_hit, start, end)
+}
+
+fn resize_hit_code(first_side: bool, orientation: SplitOrientation) -> i32 {
+    match (orientation, first_side) {
+        (SplitOrientation::SideBySide, true) => HTRIGHT,
+        (SplitOrientation::SideBySide, false) => HTLEFT,
+        (SplitOrientation::Stacked, true) => HTBOTTOM,
+        (SplitOrientation::Stacked, false) => HTTOP,
+    }
+}
+
+fn hit_name(hit: i32) -> &'static str {
+    match hit {
+        HTLEFT => "HTLEFT",
+        HTRIGHT => "HTRIGHT",
+        HTTOP => "HTTOP",
+        HTBOTTOM => "HTBOTTOM",
+        _ => "resize",
+    }
+}
+
+fn find_resize_handle(
+    hwnd: Hwnd,
+    rect: NativeRect,
+    first_side: bool,
+    orientation: SplitOrientation,
+) -> Option<(i32, i32)> {
+    let expected = resize_hit_code(first_side, orientation);
+    let cross_positions = [0.50_f64, 0.38, 0.62, 0.28, 0.72];
+
+    for cross in cross_positions {
+        let base = match orientation {
+            SplitOrientation::SideBySide => {
+                let y = rect.top
+                    + ((rect.bottom.saturating_sub(rect.top)) as f64 * cross).round() as i32;
+                let x = if first_side { rect.right } else { rect.left };
+                (x, y)
+            }
+            SplitOrientation::Stacked => {
+                let x = rect.left
+                    + ((rect.right.saturating_sub(rect.left)) as f64 * cross).round() as i32;
+                let y = if first_side { rect.bottom } else { rect.top };
+                (x, y)
+            }
+        };
+
+        for offset in EDGE_SCAN_OFFSETS {
+            let point = match orientation {
+                SplitOrientation::SideBySide => (base.0.saturating_add(offset), base.1),
+                SplitOrientation::Stacked => (base.0, base.1.saturating_add(offset)),
+            };
+            if non_client_hit_test(hwnd, point) == Some(expected) {
+                return Some(point);
+            }
+        }
+    }
+
+    None
+}
+
+fn non_client_hit_test(hwnd: Hwnd, point: (i32, i32)) -> Option<i32> {
+    let lparam = screen_point_lparam(point.0, point.1)?;
+    let mut result = 0_usize;
+    let delivered = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NCHITTEST,
+            0,
+            lparam,
+            SMTO_ABORTIFHUNG,
+            HIT_TEST_TIMEOUT_MS,
+            &mut result,
+        )
+    };
+    (delivered != 0).then_some(result as isize as i32)
+}
+
+fn screen_point_lparam(x: i32, y: i32) -> Option<isize> {
+    if x < i16::MIN as i32
+        || x > i16::MAX as i32
+        || y < i16::MIN as i32
+        || y > i16::MAX as i32
+    {
+        return None;
+    }
+    let low = x as i16 as u16 as u32;
+    let high = y as i16 as u16 as u32;
+    Some(((high << 16) | low) as u32 as isize)
+}
+
+fn drag_resize_handle(
+    hwnd: Hwnd,
+    expected_hit: i32,
+    start: (i32, i32),
+    end: (i32, i32),
+) -> Result<(), String> {
+    if unsafe { GetForegroundWindow() } != hwnd {
+        unsafe {
+            SetForegroundWindow(hwnd);
+        }
+        thread::sleep(FOREGROUND_SETTLE);
+    }
+
+    if non_client_hit_test(hwnd, start) != Some(expected_hit) {
+        return Err(format!(
+            "the selected resize point no longer reports {} before the drag",
+            hit_name(expected_hit)
+        ));
+    }
+
+    drag_divider(start, end)
+}
+
+fn shared_divider_fallback(
+    first: Hwnd,
+    second: Hwnd,
     work_area: [i32; 4],
     orientation: SplitOrientation,
-    candidate_index: usize,
-) -> (i32, i32) {
-    match orientation {
+) -> Option<(i32, i32)> {
+    let first_rect = frame_bounds(first)?;
+    let second_rect = frame_bounds(second)?;
+    Some(match orientation {
         SplitOrientation::SideBySide => {
-            let center = (first.right as i64 + second.left as i64) / 2;
-            let x = match candidate_index {
-                1 => first.right.saturating_sub(1) as i64,
-                2 => second.left.saturating_add(1) as i64,
-                _ => center,
-            } as i32;
+            let x = ((first_rect.right as i64 + second_rect.left as i64) / 2) as i32;
             let y = work_area[1] + work_area[3].saturating_sub(work_area[1]) / 2;
             (x, y)
         }
         SplitOrientation::Stacked => {
-            let center = (first.bottom as i64 + second.top as i64) / 2;
-            let y = match candidate_index {
-                1 => first.bottom.saturating_sub(1) as i64,
-                2 => second.top.saturating_add(1) as i64,
-                _ => center,
-            } as i32;
+            let y = ((first_rect.bottom as i64 + second_rect.top as i64) / 2) as i32;
             let x = work_area[0] + work_area[2].saturating_sub(work_area[0]) / 2;
             (x, y)
         }
-    }
+    })
 }
 
 fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
@@ -392,7 +574,7 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
     };
 
     if unsafe { SetCursorPos(start.0, start.1) } == 0 {
-        return Err("SetCursorPos failed while targeting the Windows snap divider".to_owned());
+        return Err("SetCursorPos failed while targeting the Windows snap resize handle".to_owned());
     }
     thread::sleep(DIVIDER_HOVER_SETTLE);
 
@@ -408,7 +590,7 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
             + ((end.1 as i64 - start.1 as i64) * step as i64) / steps as i64;
         if unsafe { SetCursorPos(x as i32, y as i32) } == 0 {
             let _ = send_mouse_button(false);
-            return Err("SetCursorPos failed during the Windows snap divider drag".to_owned());
+            return Err("SetCursorPos failed during the Windows snap resize drag".to_owned());
         }
         thread::sleep(DIVIDER_STEP_SETTLE);
     }
@@ -443,6 +625,34 @@ fn pair_matches_target(
             (first_rect.bottom - target).abs() <= CUSTOM_TARGET_TOLERANCE
                 && (second_rect.top - target).abs() <= CUSTOM_TARGET_TOLERANCE
         }
+    }
+}
+
+fn pair_mismatch_description(
+    first: Hwnd,
+    second: Hwnd,
+    orientation: SplitOrientation,
+    target: i32,
+) -> String {
+    let arranged = (is_arranged(first), is_arranged(second));
+    let first_rect = frame_bounds(first);
+    let second_rect = frame_bounds(second);
+
+    match (first_rect, second_rect) {
+        (Some(first_rect), Some(second_rect)) => {
+            let (first_edge, second_edge) = match orientation {
+                SplitOrientation::SideBySide => (first_rect.right, second_rect.left),
+                SplitOrientation::Stacked => (first_rect.bottom, second_rect.top),
+            };
+            format!(
+                "Windows left arranged state={:?}/{:?} with edges {first_edge}/{second_edge}, target {target}",
+                arranged.0, arranged.1
+            )
+        }
+        _ => format!(
+            "Windows left arranged state={:?}/{:?} and the final frame bounds could not be read",
+            arranged.0, arranged.1
+        ),
     }
 }
 
@@ -602,28 +812,23 @@ mod tests {
     }
 
     #[test]
-    fn divider_candidate_uses_shared_edge_center_first() {
-        let first = NativeRect {
-            left: 0,
-            top: 0,
-            right: 955,
-            bottom: 1040,
-        };
-        let second = NativeRect {
-            left: 965,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
-        };
+    fn resize_hit_codes_follow_divider_facing_edges() {
         assert_eq!(
-            divider_start_candidate(
-                first,
-                second,
-                [0, 0, 1920, 1040],
-                SplitOrientation::SideBySide,
-                0,
-            ),
-            (960, 520)
+            resize_hit_code(true, SplitOrientation::SideBySide),
+            HTRIGHT
         );
+        assert_eq!(
+            resize_hit_code(false, SplitOrientation::SideBySide),
+            HTLEFT
+        );
+        assert_eq!(resize_hit_code(true, SplitOrientation::Stacked), HTBOTTOM);
+        assert_eq!(resize_hit_code(false, SplitOrientation::Stacked), HTTOP);
+    }
+
+    #[test]
+    fn screen_point_lparam_preserves_negative_monitor_coordinates() {
+        let packed = screen_point_lparam(-120, -30).expect("packed coordinate") as u32;
+        assert_eq!(packed as u16 as i16, -120);
+        assert_eq!((packed >> 16) as u16 as i16, -30);
     }
 }
