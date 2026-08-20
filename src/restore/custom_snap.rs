@@ -133,6 +133,15 @@ struct CurrentWindowRaw {
     monitor: MonitorInfo,
 }
 
+/// Rebuilds custom two-window Snap layouts after the generic placement pass.
+///
+/// A custom split means Windows reported both windows as arranged at capture,
+/// but their divider no longer matched a stock fraction. The generic pass first
+/// puts those windows on the correct monitor/geometry. This stage then matches
+/// the live HWNDs and asks `windows_snap` to create a real native pair and replay
+/// the divider drag. Unsupported multi-window custom grids remain exact floating
+/// geometry for now and are reported explicitly rather than silently claimed as
+/// native Snap restoration.
 pub(super) fn restore(desktop: &SavedDesktop) -> CustomSnapRestoreReport {
     let mut report = CustomSnapRestoreReport::default();
     let customs = saved_custom_windows(desktop);
