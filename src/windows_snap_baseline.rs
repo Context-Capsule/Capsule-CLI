@@ -24,6 +24,7 @@ const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const RESTORE_SETTLE: Duration = Duration::from_millis(90);
 const BASELINE_SETTLE: Duration = Duration::from_millis(110);
 const WORK_AREA_TOLERANCE: i64 = 3;
+const SNAP_ATTEMPTS: usize = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -99,13 +100,54 @@ pub(crate) fn with_target_work_area<T>(
 /// documents SW_RESTORE as the operation that restores an arranged window to
 /// its normal state. We therefore restore, place a small floating rectangle well
 /// inside the intended monitor, verify that it is no longer arranged and is on
-/// that exact monitor, and only then permit the native shortcut.
+/// that exact monitor, and only then permit one native shortcut.
+///
+/// The result is also monitor-verified. If Windows unexpectedly crosses a
+/// monitor boundary or fails to enter arranged state, the HWND is reset to the
+/// safe baseline before one retry. After the final failed attempt it is left
+/// floating on the intended monitor rather than allowing a bad transition to
+/// cascade into the remaining Snap reconstruction.
 pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String> {
-    prepare_floating_baseline(hwnd)?;
-    windows_snap_core::snap(hwnd, direction)
+    let mut failures = Vec::new();
+
+    for attempt in 1..=SNAP_ATTEMPTS {
+        let expected_work = prepare_floating_baseline(hwnd)?;
+        let arranged = windows_snap_core::snap(hwnd, direction)?;
+        let actual_work = monitor_work_area(hwnd);
+
+        if arranged
+            && actual_work
+                .is_some_and(|actual| same_work_area(actual, expected_work))
+        {
+            return Ok(true);
+        }
+
+        let monitor_detail = match actual_work {
+            Some(actual) if same_work_area(actual, expected_work) => {
+                format!("monitor remained {:?}", actual)
+            }
+            Some(actual) => format!(
+                "window moved to work area {:?} instead of {:?}",
+                actual, expected_work
+            ),
+            None => "window monitor could not be read after the shortcut".to_owned(),
+        };
+        failures.push(format!(
+            "attempt {attempt}: arranged={arranged}, {monitor_detail}"
+        ));
+
+        // Contain the failure immediately. This returns the HWND to a verified
+        // unarranged position on the intended monitor before any retry or error.
+        prepare_floating_baseline(hwnd)?;
+    }
+
+    Err(format!(
+        "native snap could not produce the requested arranged state on the intended monitor after {SNAP_ATTEMPTS} verified attempt(s): {}",
+        failures.join(" | ")
+    ))
 }
 
-fn prepare_floating_baseline(hwnd: Hwnd) -> Result<(), String> {
+fn prepare_floating_baseline(hwnd: Hwnd) -> Result<[i32; 4], String> {
     if hwnd.is_null() {
         return Err("window handle is unavailable".to_owned());
     }
@@ -185,7 +227,7 @@ fn prepare_floating_baseline(hwnd: Hwnd) -> Result<(), String> {
         ));
     }
 
-    Ok(())
+    Ok(work_area)
 }
 
 fn target_work_area(hwnd: Hwnd) -> Result<[i32; 4], String> {
