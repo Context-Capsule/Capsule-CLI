@@ -164,13 +164,24 @@ pub fn display_relation(display: Rect, primary: Rect, is_primary: bool) -> Strin
 }
 
 pub fn detect_snap(bounds: NormalizedRect) -> Option<SnapPosition> {
-    // This must be deliberately strict. The old 6% tolerance could turn an
-    // ordinary user-sized Notepad/Explorer window that merely happened to sit
-    // near a half/third layout into an exact Windows snap slot on restore,
-    // making it visibly larger than it was when captured. Real Windows snap
-    // geometry differs from the idealized fractions by only a small frame/DPI
-    // margin, so ~1.2% is enough to absorb borders without classifying normal
-    // windows as snapped.
+    detect_snap_with_arrangement(bounds, take_arrangement_hint())
+}
+
+fn detect_snap_with_arrangement(
+    bounds: NormalizedRect,
+    arranged: Option<bool>,
+) -> Option<SnapPosition> {
+    // A known non-arranged window must never become snapped from geometry
+    // alone. On older Windows where IsWindowArranged is unavailable (`None`),
+    // preserve the previous strict stock-layout geometry fallback.
+    if arranged == Some(false) {
+        return None;
+    }
+
+    // Stock layouts remain deliberately strict. The old 6% tolerance could
+    // turn an ordinary user-sized Notepad/Explorer window into an exact snap
+    // slot on restore. ~1.2% absorbs frame/DPI variance without approximating
+    // arbitrary user-resized arranged layouts to the nearest stock fraction.
     const TOLERANCE: f64 = 0.012;
 
     let patterns = [
@@ -189,7 +200,7 @@ pub fn detect_snap(bounds: NormalizedRect) -> Option<SnapPosition> {
         (SnapPosition::RightTwoThirds, 1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0),
     ];
 
-    patterns
+    if let Some(position) = patterns
         .into_iter()
         .find(|(_, x, y, width, height)| {
             approx(bounds.x, *x, TOLERANCE)
@@ -198,6 +209,27 @@ pub fn detect_snap(bounds: NormalizedRect) -> Option<SnapPosition> {
                 && approx(bounds.height, *height, TOLERANCE)
         })
         .map(|(position, _, _, _, _)| position)
+    {
+        return Some(position);
+    }
+
+    // If Windows itself says the window is arranged, an unmatched rectangle
+    // is not a normal window: it is a snap layout whose divider was resized to
+    // an arbitrary ratio. Preserve its exact normalized rectangle rather than
+    // rounding it into a known fraction.
+    (arranged == Some(true)).then_some(SnapPosition::Custom)
+}
+
+fn take_arrangement_hint() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        crate::windows_snap::take_last_arrangement_check()
+    }
+
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 fn approx(actual: f64, expected: f64, tolerance: f64) -> bool {
@@ -255,62 +287,97 @@ mod tests {
     #[test]
     fn detects_common_snap_layouts() {
         assert_eq!(
-            detect_snap(NormalizedRect {
-                x: 0.0,
-                y: 0.0,
-                width: 0.5,
-                height: 1.0,
-            }),
+            detect_snap_with_arrangement(
+                NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                },
+                None,
+            ),
             Some(SnapPosition::LeftHalf)
         );
         assert_eq!(
-            detect_snap(NormalizedRect {
-                x: 0.334,
-                y: 0.0,
-                width: 0.666,
-                height: 1.0,
-            }),
+            detect_snap_with_arrangement(
+                NormalizedRect {
+                    x: 0.334,
+                    y: 0.0,
+                    width: 0.666,
+                    height: 1.0,
+                },
+                Some(true),
+            ),
             Some(SnapPosition::RightTwoThirds)
         );
     }
 
     #[test]
     fn ordinary_near_half_window_is_not_promoted_to_snap_slot() {
-        assert_eq!(
-            detect_snap(NormalizedRect {
-                x: 0.025,
-                y: 0.02,
-                width: 0.46,
-                height: 0.96,
-            }),
-            None
-        );
+        let bounds = NormalizedRect {
+            x: 0.025,
+            y: 0.02,
+            width: 0.46,
+            height: 0.96,
+        };
+        assert_eq!(detect_snap_with_arrangement(bounds, Some(false)), None);
+        assert_eq!(detect_snap_with_arrangement(bounds, None), None);
     }
 
     #[test]
-    fn small_frame_variance_still_counts_as_snapped() {
+    fn small_frame_variance_still_counts_as_stock_snap() {
         assert_eq!(
-            detect_snap(NormalizedRect {
-                x: 0.004,
-                y: 0.003,
-                width: 0.504,
-                height: 0.994,
-            }),
+            detect_snap_with_arrangement(
+                NormalizedRect {
+                    x: 0.004,
+                    y: 0.003,
+                    width: 0.504,
+                    height: 0.994,
+                },
+                Some(true),
+            ),
             Some(SnapPosition::LeftHalf)
         );
     }
 
     #[test]
-    fn custom_geometry_is_not_forced_into_a_snap_slot() {
+    fn arranged_arbitrary_ratio_becomes_custom_snap() {
         assert_eq!(
-            detect_snap(NormalizedRect {
-                x: 0.12,
-                y: 0.11,
-                width: 0.71,
-                height: 0.77,
-            }),
-            None
+            detect_snap_with_arrangement(
+                NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.217,
+                    height: 1.0,
+                },
+                Some(true),
+            ),
+            Some(SnapPosition::Custom)
         );
+        assert_eq!(
+            detect_snap_with_arrangement(
+                NormalizedRect {
+                    x: 0.217,
+                    y: 0.0,
+                    width: 0.783,
+                    height: 1.0,
+                },
+                Some(true),
+            ),
+            Some(SnapPosition::Custom)
+        );
+    }
+
+    #[test]
+    fn arbitrary_geometry_without_arranged_signal_stays_normal() {
+        let bounds = NormalizedRect {
+            x: 0.12,
+            y: 0.11,
+            width: 0.71,
+            height: 0.77,
+        };
+        assert_eq!(detect_snap_with_arrangement(bounds, Some(false)), None);
+        assert_eq!(detect_snap_with_arrangement(bounds, None), None);
     }
 
     #[test]

@@ -296,20 +296,22 @@ fn normalized_close(actual: f64, expected: f64) -> bool {
 }
 
 fn normal_target_rect(window: &SavedWindow, display: &TargetDisplay) -> SavedRect {
-    let normalized = window
-        .normalized_bounds
-        .and_then(|bounds| normalized_rect(display.work_area, bounds));
-
+    // On the same monitor topology the saved DWM frame rectangle is the most
+    // faithful representation of what the user actually saw. Do not let a
+    // normalized rectangle (which can come from an older DPI-virtualized
+    // capture) enlarge or shrink a normal window such as Notepad.
     if display
         .device_name
         .eq_ignore_ascii_case(&window.display_device)
-        && normalized.is_some_and(|candidate| rect_close(candidate, window.bounds, 32))
         && rect_center_inside(window.bounds, display.bounds)
     {
         return window.bounds;
     }
 
-    normalized.unwrap_or_else(|| fallback_rect(window, display))
+    window
+        .normalized_bounds
+        .and_then(|bounds| normalized_rect(display.work_area, bounds))
+        .unwrap_or_else(|| fallback_rect(window, display))
 }
 
 fn rect_center_inside(rect: SavedRect, area: SavedRect) -> bool {
@@ -566,13 +568,14 @@ mod tests {
         });
         let actual = target_rect(&saved, &display());
         assert_ne!(actual, snap_rect(display().work_area, SnapSlot::LeftHalf));
-        assert_eq!(actual.width(), 862);
-        assert!(actual.height() < display().work_area.height());
+        assert_eq!(actual, saved.bounds);
     }
 
     #[test]
     fn normalized_geometry_tracks_resolution_changes() {
-        let actual = target_rect(&window("normal"), &display());
+        let mut saved = window("normal");
+        saved.display_device = r"\\.\DISPLAY9".to_owned();
+        let actual = target_rect(&saved, &display());
         assert_eq!(
             actual,
             SavedRect {
@@ -593,6 +596,24 @@ mod tests {
             right: 1440,
             bottom: 780,
         };
+        assert_eq!(target_rect(&saved, &display()), saved.bounds);
+    }
+
+    #[test]
+    fn old_dpi_distorted_normalized_geometry_cannot_resize_same_monitor_window() {
+        let mut saved = window("normal");
+        saved.bounds = SavedRect {
+            left: 250,
+            top: 140,
+            right: 950,
+            bottom: 740,
+        };
+        saved.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.10,
+            y: 0.10,
+            width: 0.70,
+            height: 0.75,
+        });
         assert_eq!(target_rect(&saved, &display()), saved.bounds);
     }
 

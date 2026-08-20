@@ -6,10 +6,22 @@ pub use model::{
 };
 
 #[cfg(windows)]
+mod dpi;
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]
 pub fn discover() -> Result<DesktopSnapshot, String> {
+    // DWM extended-frame bounds are returned in physical screen coordinates,
+    // while many USER32 monitor/window APIs are DPI-virtualized for an unaware
+    // caller. Capture must therefore use the same Per-Monitor-V2 coordinate
+    // context as restore or normalized bounds and snap detection can be wrong
+    // on displays whose scaling is not 100%.
+    let _dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2().ok_or_else(|| {
+        "could not switch desktop capture to Per-Monitor-V2 DPI awareness; refusing to save potentially inconsistent window geometry"
+            .to_owned()
+    })?;
+
     let mut snapshot = windows::discover()?;
     annotate_direct_application_owners(&mut snapshot);
     Ok(snapshot)
