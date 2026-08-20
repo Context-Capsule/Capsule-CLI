@@ -1,11 +1,12 @@
-use super::{SavedApplication, SavedDesktop, SavedNormalizedRect, SavedRect, SavedWindow, title_match_score};
+use super::{
+    SavedApplication, SavedDesktop, SavedNormalizedRect, SavedRect, SavedWindow, title_match_score,
+};
 use crate::windows_snap::{self, SplitOrientation};
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
-    mem::{size_of, zeroed},
+    mem::size_of,
     path::Path,
-    ptr,
 };
 
 type Hwnd = *mut c_void;
@@ -108,7 +109,6 @@ struct SavedPair<'a> {
 #[derive(Debug, Clone)]
 struct CurrentWindow {
     hwnd: usize,
-    pid: u32,
     title: String,
     bounds: SavedRect,
     executable_path: Option<String>,
@@ -385,9 +385,6 @@ fn application_match_score(app: &SavedApplication, current: &CurrentWindow) -> O
         return Some(70);
     }
 
-    // Packaged applications can hide their executable identity from a normal
-    // process query. A strong saved/current title relation is a safe fallback
-    // because the generic desktop pass already put the window near its target.
     (title_match_score(&app.name, &current.title) >= 60).then_some(40)
 }
 
@@ -447,7 +444,6 @@ fn enumerate_windows() -> Result<Vec<CurrentWindow>, String> {
                 .clone();
             CurrentWindow {
                 hwnd: window.hwnd,
-                pid: window.pid,
                 title: window.title,
                 bounds: window.bounds,
                 executable_path,
