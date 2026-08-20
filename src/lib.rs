@@ -19,7 +19,13 @@ pub mod vscode;
 
 #[cfg(windows)]
 #[path = "windows_snap.rs"]
+pub(crate) mod windows_snap_core;
+#[cfg(windows)]
+#[path = "windows_snap_baseline.rs"]
 pub(crate) mod windows_snap_legacy;
 #[cfg(windows)]
 #[path = "windows_snap_coord.rs"]
+pub(crate) mod windows_snap_coord;
+#[cfg(windows)]
+#[path = "windows_snap_safe.rs"]
 pub(crate) mod windows_snap;
