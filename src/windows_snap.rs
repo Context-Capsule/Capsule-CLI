@@ -304,10 +304,6 @@ pub(crate) fn restore_resized_pair(
 
     let mut errors = Vec::new();
 
-    // Try the leading window's saved divider-facing edge first. This is the
-    // important portrait path: if Windows seeded top-third + bottom-third,
-    // dragging the top window's real HTBOTTOM handle down to the 2/3 line fills
-    // the middle third while both windows remain arranged.
     for first_side in [true, false] {
         establish_pair(first, second, orientation)?;
 
@@ -320,10 +316,6 @@ pub(crate) fn restore_resized_pair(
                     return Ok(());
                 }
 
-                // Some Snap layouts do not resize the partner automatically.
-                // If the first edge remained arranged, move the partner's
-                // corresponding edge to the same divider instead of assuming a
-                // linked divider exists.
                 if is_arranged(primary) == Some(true) && is_arranged(secondary) == Some(true) {
                     if let Err(error) =
                         drag_saved_edge(secondary, !first_side, orientation, target)
@@ -350,10 +342,6 @@ pub(crate) fn restore_resized_pair(
         }
     }
 
-    // Final fallback for machines/layouts where Windows exposes the shared
-    // splitter hit target between two already adjacent arranged windows but
-    // neither individual frame reports a resize handle exactly where DWM draws
-    // the visible edge.
     establish_pair(first, second, orientation)?;
     if let Some(start) = shared_divider_fallback(first, second, work_area, orientation) {
         let end = match orientation {
@@ -373,9 +361,7 @@ pub(crate) fn restore_resized_pair(
     }
 
     Err(format!(
-        "could not recreate the native custom snap pair at divider coordinate {target}: {}. \
-Synthetic input can be blocked by UIPI; if either target app is elevated, run Context Capsule \
-from an equally elevated terminal",
+        "could not recreate the native custom snap pair at divider coordinate {target}: {}. Synthetic input can be blocked by UIPI; if either target app is elevated, run Context Capsule from an equally elevated terminal",
         errors.join(" | ")
     ))
 }
