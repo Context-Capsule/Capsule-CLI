@@ -1,7 +1,13 @@
 use super::{SavedApplication, SavedDesktop};
 use std::process::{Command, Stdio};
 
-const COLD_BOOTSTRAP_URL: &str = "about:newtab";
+// Use Firefox/Zen's documented `--new-window <url>` contract for the cold
+// bootstrap. `--blank-window` is intentionally not used here: Zen can surface
+// that special window without an ordinary tab, which is exactly the state in
+// which the WebExtension/native-messaging adapter failed to wake reliably.
+// A normal HTTPS URL creates a real tab even if the machine is offline (the tab
+// may show a network error, but it still exists and activates browser add-ons).
+const COLD_BOOTSTRAP_URL: &str = "https://example.com/?context-capsule-bootstrap=1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZenBootstrapReport {
@@ -23,17 +29,19 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         return report;
     };
 
-    match zen_is_running() {
+    match zen_has_visible_window() {
         Ok(true) => {
-            // Preserve the proven warm-restore path. The semantic adapter owns
-            // the actual restore request and completion diagnostics.
+            // Preserve the proven warm-restore path only when an actual visible
+            // Zen window exists. A surviving background Zen process with no
+            // windows is still a cold restore and needs a real tab to wake the
+            // extension/native-messaging adapter.
             report.already_running = true;
             return report;
         }
         Ok(false) => {}
         Err(error) => {
             report.failures.push(format!(
-                "Zen bootstrap: could not inspect whether Zen is already running: {error}"
+                "Zen bootstrap: could not inspect whether Zen has a visible window: {error}"
             ));
             report.skip_semantic_restore = true;
             return report;
@@ -54,14 +62,15 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         return report;
     }
 
-    // A completely empty Zen `--blank-window` can exist without an ordinary tab.
-    // In that state Zen may not activate WebExtensions/native messaging yet, so a
-    // cold Context Capsule restore can wait forever even though the extension is
-    // installed correctly. Keep Zen's independent unsynced blank-window mode, but
-    // give it one disposable about:newtab page. The Firefox adapter already treats
-    // about:newtab as a bootstrap tab and replaces it with the saved tabs.
+    // This path runs only when desktop discovery found no visible Zen window,
+    // so there is no existing visible Zen Space for a new-window launch to
+    // clone or mutate. Starting a standard window with a standard URL gives us
+    // the strongest browser-level guarantee available that a real tab exists.
+    // Once the extension receives the semantic restore request, its
+    // authoritative preparation removes this bootstrap tab/window state and
+    // replaces it with the capsule topology.
     match Command::new(executable)
-        .arg("--blank-window")
+        .arg("--new-window")
         .arg(COLD_BOOTSTRAP_URL)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -80,7 +89,7 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         }
         Err(error) => {
             report.failures.push(format!(
-                "Zen bootstrap: failed to launch '{executable} --blank-window {COLD_BOOTSTRAP_URL}': {error}"
+                "Zen bootstrap: failed to launch '{executable} --new-window {COLD_BOOTSTRAP_URL}': {error}"
             ));
             report.skip_semantic_restore = true;
         }
@@ -89,7 +98,7 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
     report
 }
 
-fn zen_is_running() -> Result<bool, String> {
+fn zen_has_visible_window() -> Result<bool, String> {
     let snapshot = crate::desktop::discover()?;
     Ok(snapshot.applications.iter().any(|application| {
         application
@@ -99,6 +108,7 @@ fn zen_is_running() -> Result<bool, String> {
             .is_some_and(|name| {
                 name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen")
             })
+            && !application.windows.is_empty()
     }))
 }
 
@@ -166,7 +176,8 @@ mod tests {
     }
 
     #[test]
-    fn cold_bootstrap_uses_an_extension_waking_tab() {
-        assert_eq!(COLD_BOOTSTRAP_URL, "about:newtab");
+    fn cold_bootstrap_uses_a_real_standard_url_tab() {
+        assert!(COLD_BOOTSTRAP_URL.starts_with("https://"));
+        assert!(COLD_BOOTSTRAP_URL.contains("context-capsule-bootstrap"));
     }
 }
