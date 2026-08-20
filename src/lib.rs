@@ -18,4 +18,8 @@ pub mod restore_bus;
 pub mod vscode;
 
 #[cfg(windows)]
+#[path = "windows_snap.rs"]
+pub(crate) mod windows_snap_legacy;
+#[cfg(windows)]
+#[path = "windows_snap_coord.rs"]
 pub(crate) mod windows_snap;
