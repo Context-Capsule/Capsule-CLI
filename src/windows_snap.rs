@@ -48,11 +48,6 @@ const EDGE_SCAN_OFFSETS: [i32; 21] = [
 static IS_WINDOW_ARRANGED: OnceLock<Option<IsWindowArrangedFn>> = OnceLock::new();
 
 thread_local! {
-    // Capture asks IsWindowArranged immediately before passing the window's
-    // normalized geometry into the snap classifier. Keep that result
-    // thread-local so the classifier can distinguish a genuinely arranged
-    // custom ratio from the legacy geometry-only fallback used when the API is
-    // unavailable. The value is consumed by the classifier.
     static LAST_ARRANGEMENT_CHECK: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
@@ -193,11 +188,6 @@ unsafe extern "system" {
     ) -> Hresult;
 }
 
-/// Returns whether Windows considers this HWND arranged/snapped.
-///
-/// `IsWindowArranged` exists on modern Windows but deliberately has no import
-/// library. Resolve it dynamically so Context Capsule still runs on systems
-/// where the export is unavailable.
 pub(crate) fn is_arranged(hwnd: Hwnd) -> Option<bool> {
     let result = if hwnd.is_null() {
         None
@@ -211,15 +201,10 @@ pub(crate) fn is_arranged(hwnd: Hwnd) -> Option<bool> {
     result
 }
 
-/// Consumes the most recent IsWindowArranged result on this thread.
 pub(crate) fn take_last_arrangement_check() -> Option<bool> {
     LAST_ARRANGEMENT_CHECK.with(Cell::take)
 }
 
-/// Ask Windows itself to snap the exact target HWND using its documented
-/// keyboard gesture. The caller must first stage the window on the desired
-/// monitor. No key is injected unless the exact HWND becomes foreground and
-/// `IsWindowArranged` is available to verify the result.
 pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String> {
     if hwnd.is_null() {
         return Err("window handle is unavailable".to_owned());
@@ -255,15 +240,6 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
     Ok(is_arranged(hwnd).unwrap_or(false))
 }
 
-/// Recreate a two-window custom Windows Snap split.
-///
-/// Windows 11 can choose different seed zones depending on monitor shape and
-/// orientation. In particular, portrait monitors can seed a top/bottom pair as
-/// thirds rather than as one shared 50/50 divider. Do not assume a particular
-/// seed rectangle. First create a real arranged pair, then ask each window
-/// where its actual non-client resize handle is (`WM_NCHITTEST`) and drag that
-/// snapped edge to the saved divider coordinate. This mirrors what a user does
-/// with the mouse and preserves the real `IsWindowArranged` state.
 pub(crate) fn restore_resized_pair(
     first_hwnd: usize,
     second_hwnd: usize,
