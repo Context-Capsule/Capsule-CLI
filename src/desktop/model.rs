@@ -65,6 +65,10 @@ pub enum SnapPosition {
     RightThird,
     LeftTwoThirds,
     RightTwoThirds,
+    /// Windows reports the window as arranged, but its current rectangle no
+    /// longer matches one of the stock snap fractions. This happens when the
+    /// user drags a divider after snapping (for example 20/80 or 27/73).
+    Custom,
 }
 
 impl SnapPosition {
@@ -83,6 +87,7 @@ impl SnapPosition {
             Self::RightThird => "right-third",
             Self::LeftTwoThirds => "left-two-thirds",
             Self::RightTwoThirds => "right-two-thirds",
+            Self::Custom => "custom",
         }
     }
 }
