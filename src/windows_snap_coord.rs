@@ -176,10 +176,11 @@ impl InputQueueAttachment {
         let mut seen = HashSet::new();
         let mut attached_threads = Vec::new();
         for (thread, required) in candidates {
-            if thread == current_thread || !seen.insert(thread) {
+            if thread == current_thread || seen.contains(&thread) {
                 continue;
             }
             if unsafe { AttachThreadInput(current_thread, thread, 1) } != 0 {
+                seen.insert(thread);
                 attached_threads.push(thread);
             } else if required {
                 let error = unsafe { GetLastError() };
