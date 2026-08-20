@@ -6,6 +6,8 @@ mod activation;
 #[cfg(windows)]
 mod browser_bootstrap;
 #[cfg(windows)]
+mod custom_snap;
+#[cfg(windows)]
 mod dpi;
 #[cfg(windows)]
 mod legacy_explorer;
@@ -247,6 +249,15 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                         .to_owned(),
                 );
             }
+
+            // Generic placement deliberately restores custom snap geometry first.
+            // Once every semantic-owned window exists and is on the right monitor,
+            // rebuild supported custom two-window layouts as genuine Windows Snap
+            // groups by snapping a native pair and replaying the saved divider drag.
+            let custom = custom_snap::restore(desktop);
+            final_desktop.warnings.extend(custom.warnings);
+            final_desktop.failures.extend(custom.failures);
+
             report.desktop = final_desktop;
         }
     }
