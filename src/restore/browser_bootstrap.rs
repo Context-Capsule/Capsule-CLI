@@ -1,6 +1,8 @@
 use super::{SavedApplication, SavedDesktop};
 use std::process::{Command, Stdio};
 
+const COLD_BOOTSTRAP_URL: &str = "about:newtab";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZenBootstrapReport {
     pub already_running: bool,
@@ -52,8 +54,15 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
         return report;
     }
 
+    // A completely empty Zen `--blank-window` can exist without an ordinary tab.
+    // In that state Zen may not activate WebExtensions/native messaging yet, so a
+    // cold Context Capsule restore can wait forever even though the extension is
+    // installed correctly. Keep Zen's independent unsynced blank-window mode, but
+    // give it one disposable about:newtab page. The Firefox adapter already treats
+    // about:newtab as a bootstrap tab and replaces it with the saved tabs.
     match Command::new(executable)
         .arg("--blank-window")
+        .arg(COLD_BOOTSTRAP_URL)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -63,24 +72,15 @@ pub fn ensure_zen_started(saved: &SavedDesktop, dry_run: bool) -> ZenBootstrapRe
             report.launched = true;
 
             // Do not gate semantic restore on a fresh browser.state.update.
-            //
-            // A healthy Firefox/Zen adapter can already be connected while no
-            // visible browser windows exist, or Zen can wake its extension
-            // background context without immediately producing a complete state
-            // capture. The extension's periodic state sync is intentionally much
-            // less frequent than the restore request poll, so requiring a state
-            // file timestamp newer than this launch can reject a healthy adapter.
-            //
             // The restore bus is the authoritative handshake: after bootstrap,
             // the CLI writes a concrete Firefox restore request and waits for the
             // extension to acknowledge completion. If the extension/native host
-            // is actually unavailable, that request times out with the persistent
-            // firefox.log diagnostics. This preserves the stale-state safety goal
-            // without suppressing a valid cold semantic restore.
+            // is actually unavailable, that request times out with persistent
+            // firefox.log diagnostics.
         }
         Err(error) => {
             report.failures.push(format!(
-                "Zen bootstrap: failed to launch '{executable} --blank-window': {error}"
+                "Zen bootstrap: failed to launch '{executable} --blank-window {COLD_BOOTSTRAP_URL}': {error}"
             ));
             report.skip_semantic_restore = true;
         }
@@ -163,5 +163,10 @@ mod tests {
         let malicious = application("Zen Browser", Some(r"C:\Windows\System32\cmd.exe"));
         assert!(is_zen_application(&malicious));
         assert_eq!(safe_zen_executable(&malicious), None);
+    }
+
+    #[test]
+    fn cold_bootstrap_uses_an_extension_waking_tab() {
+        assert_eq!(COLD_BOOTSTRAP_URL, "about:newtab");
     }
 }
