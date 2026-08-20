@@ -36,8 +36,8 @@ const CUSTOM_TARGET_TOLERANCE: i32 = 24;
 static IS_WINDOW_ARRANGED: OnceLock<Option<IsWindowArrangedFn>> = OnceLock::new();
 
 thread_local! {
-    // Capture currently asks IsWindowArranged immediately before passing the
-    // window's normalized geometry into the snap classifier. Keep that result
+    // Capture asks IsWindowArranged immediately before passing the window's
+    // normalized geometry into the snap classifier. Keep that result
     // thread-local so the classifier can distinguish a genuinely arranged
     // custom ratio from the legacy geometry-only fallback used when the API is
     // unavailable. The value is consumed by the classifier.
@@ -118,6 +118,34 @@ struct NativeInput {
     payload: InputPayload,
 }
 
+struct ForegroundRestoreGuard {
+    hwnd: Hwnd,
+}
+
+impl Drop for ForegroundRestoreGuard {
+    fn drop(&mut self) {
+        if !self.hwnd.is_null() && unsafe { GetForegroundWindow() } != self.hwnd {
+            unsafe {
+                SetForegroundWindow(self.hwnd);
+            }
+        }
+    }
+}
+
+struct CursorRestoreGuard {
+    point: Option<Point>,
+}
+
+impl Drop for CursorRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(point) = self.point {
+            unsafe {
+                SetCursorPos(point.x, point.y);
+            }
+        }
+    }
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetForegroundWindow() -> Hwnd;
@@ -163,11 +191,6 @@ pub(crate) fn is_arranged(hwnd: Hwnd) -> Option<bool> {
 }
 
 /// Consumes the most recent IsWindowArranged result on this thread.
-///
-/// This is intentionally narrow: desktop capture invokes `is_arranged` and
-/// then the geometry classifier synchronously on the same thread. Consuming
-/// the value prevents an old arranged result from leaking into an unrelated
-/// later classification.
 pub(crate) fn take_last_arrangement_check() -> Option<bool> {
     LAST_ARRANGEMENT_CHECK.with(Cell::take)
 }
@@ -214,9 +237,9 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
 /// Recreate a two-window custom Windows Snap split.
 ///
 /// There is no generally available cross-process Win32 setter for arbitrary
-/// arranged state. Instead, establish a real native 50/50 pair using Windows'
-/// own snap shortcuts, then emulate the user's divider drag to the saved ratio.
-/// Windows keeps both windows arranged while resizing adjacent snapped windows.
+/// arranged state. Establish a real native 50/50 pair using Windows' own snap
+/// shortcuts, then emulate the user's divider drag to the saved ratio. Windows
+/// keeps both windows arranged while resizing adjacent snapped windows.
 pub(crate) fn restore_resized_pair(
     first_hwnd: usize,
     second_hwnd: usize,
@@ -235,6 +258,10 @@ pub(crate) fn restore_resized_pair(
     if first.is_null() || second.is_null() || first == second {
         return Err("custom snap pair has invalid window handles".to_owned());
     }
+
+    let _foreground_restore = ForegroundRestoreGuard {
+        hwnd: unsafe { GetForegroundWindow() },
+    };
 
     let width = work_area[2].saturating_sub(work_area[0]);
     let height = work_area[3].saturating_sub(work_area[1]);
@@ -306,18 +333,23 @@ fn establish_pair(
     };
 
     if !snap(first, first_direction)? {
-        return Err("Windows did not arrange the first window while creating the custom snap pair"
-            .to_owned());
+        return Err(
+            "Windows did not arrange the first window while creating the custom snap pair"
+                .to_owned(),
+        );
     }
     if !snap(second, second_direction)? {
-        return Err("Windows did not arrange the second window while creating the custom snap pair"
-            .to_owned());
+        return Err(
+            "Windows did not arrange the second window while creating the custom snap pair"
+                .to_owned(),
+        );
     }
     thread::sleep(SNAP_SETTLE);
 
     if is_arranged(first) != Some(true) || is_arranged(second) != Some(true) {
-        return Err("one of the windows left arranged state while creating the custom snap pair"
-            .to_owned());
+        return Err(
+            "one of the windows left arranged state while creating the custom snap pair".to_owned(),
+        );
     }
     Ok(())
 }
@@ -355,14 +387,19 @@ fn divider_start_candidate(
 
 fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
     let mut original = Point::default();
-    let have_original = unsafe { GetCursorPos(&mut original) } != 0;
+    let _cursor_restore = CursorRestoreGuard {
+        point: (unsafe { GetCursorPos(&mut original) } != 0).then_some(original),
+    };
 
     if unsafe { SetCursorPos(start.0, start.1) } == 0 {
         return Err("SetCursorPos failed while targeting the Windows snap divider".to_owned());
     }
     thread::sleep(DIVIDER_HOVER_SETTLE);
 
-    send_mouse_button(true)?;
+    if let Err(error) = send_mouse_button(true) {
+        return Err(error);
+    }
+
     let steps = 18_i32;
     for step in 1..=steps {
         let x = start.0 as i64
@@ -371,11 +408,6 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
             + ((end.1 as i64 - start.1 as i64) * step as i64) / steps as i64;
         if unsafe { SetCursorPos(x as i32, y as i32) } == 0 {
             let _ = send_mouse_button(false);
-            if have_original {
-                unsafe {
-                    SetCursorPos(original.x, original.y);
-                }
-            }
             return Err("SetCursorPos failed during the Windows snap divider drag".to_owned());
         }
         thread::sleep(DIVIDER_STEP_SETTLE);
@@ -383,11 +415,6 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
 
     let release_result = send_mouse_button(false);
     thread::sleep(DIVIDER_RESULT_SETTLE);
-    if have_original {
-        unsafe {
-            SetCursorPos(original.x, original.y);
-        }
-    }
     release_result
 }
 
@@ -522,8 +549,6 @@ fn send_chord(modifiers: &[u16], key: u16) -> Result<(), String> {
         return Ok(());
     }
 
-    // If Windows accepted only part of the batch, make a best-effort key-up
-    // pass so a synthetic Windows/Alt key can never remain logically held.
     let mut releases = Vec::with_capacity(modifiers.len() + 1);
     releases.push(keyboard_input(key, true));
     for modifier in modifiers.iter().rev() {
