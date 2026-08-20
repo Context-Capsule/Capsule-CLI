@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     ffi::c_void,
     mem::{size_of, transmute},
     sync::OnceLock,
@@ -24,6 +25,15 @@ const FOREGROUND_SETTLE: Duration = Duration::from_millis(45);
 const SNAP_SETTLE: Duration = Duration::from_millis(180);
 
 static IS_WINDOW_ARRANGED: OnceLock<Option<IsWindowArrangedFn>> = OnceLock::new();
+
+thread_local! {
+    // Capture currently asks IsWindowArranged immediately before passing the
+    // window's normalized geometry into the snap classifier. Keep that result
+    // thread-local so the classifier can distinguish a genuinely arranged
+    // custom ratio from the legacy geometry-only fallback used when the API is
+    // unavailable. The value is consumed by the classifier.
+    static LAST_ARRANGEMENT_CHECK: Cell<Option<bool>> = const { Cell::new(None) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapDirection {
@@ -96,13 +106,26 @@ unsafe extern "system" {
 /// library. Resolve it dynamically so Context Capsule still runs on systems
 /// where the export is unavailable.
 pub(crate) fn is_arranged(hwnd: Hwnd) -> Option<bool> {
-    if hwnd.is_null() {
-        return None;
-    }
-    match *IS_WINDOW_ARRANGED.get_or_init(resolve_is_window_arranged) {
-        Some(function) => Some(unsafe { function(hwnd) != 0 }),
-        None => None,
-    }
+    let result = if hwnd.is_null() {
+        None
+    } else {
+        match *IS_WINDOW_ARRANGED.get_or_init(resolve_is_window_arranged) {
+            Some(function) => Some(unsafe { function(hwnd) != 0 }),
+            None => None,
+        }
+    };
+    LAST_ARRANGEMENT_CHECK.with(|last| last.set(result));
+    result
+}
+
+/// Consumes the most recent IsWindowArranged result on this thread.
+///
+/// This is intentionally narrow: desktop capture invokes `is_arranged` and
+/// then the geometry classifier synchronously on the same thread. Consuming
+/// the value prevents an old arranged result from leaking into an unrelated
+/// later classification.
+pub(crate) fn take_last_arrangement_check() -> Option<bool> {
+    LAST_ARRANGEMENT_CHECK.with(Cell::take)
 }
 
 /// Ask Windows itself to snap the exact target HWND using its documented
@@ -235,5 +258,12 @@ mod tests {
         let keyboard = unsafe { input.payload.keyboard };
         assert_eq!(keyboard.virtual_key, VK_LEFT);
         assert_eq!(keyboard.flags, 0);
+    }
+
+    #[test]
+    fn arrangement_hint_is_consumed_once() {
+        LAST_ARRANGEMENT_CHECK.with(|last| last.set(Some(true)));
+        assert_eq!(take_last_arrangement_check(), Some(true));
+        assert_eq!(take_last_arrangement_check(), None);
     }
 }
