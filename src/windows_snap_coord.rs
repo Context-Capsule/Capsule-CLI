@@ -14,6 +14,7 @@ pub(crate) use windows_snap_legacy::{
 
 type Hwnd = *mut c_void;
 type Bool = i32;
+type Hresult = i32;
 
 const INPUT_MOUSE: u32 = 0;
 const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
@@ -31,6 +32,15 @@ const HTBOTTOMLEFT: i32 = 16;
 const HTBOTTOMRIGHT: i32 = 17;
 const ACTIVATION_SETTLE: Duration = Duration::from_millis(70);
 const HIT_TEST_TIMEOUT_MS: u32 = 120;
+const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+const SNAP_SETTLE: Duration = Duration::from_millis(220);
+const DIVIDER_HOVER_SETTLE: Duration = Duration::from_millis(90);
+const DIVIDER_STEP_SETTLE: Duration = Duration::from_millis(12);
+const DIVIDER_RESULT_SETTLE: Duration = Duration::from_millis(280);
+const CUSTOM_TARGET_TOLERANCE: i32 = 24;
+const EDGE_SCAN_OFFSETS: [i32; 21] = [
+    0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -8, 8, -10, 10, -12, 12, -16, 16,
+];
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -130,6 +140,16 @@ unsafe extern "system" {
     ) -> isize;
 }
 
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmGetWindowAttribute(
+        hwnd: Hwnd,
+        attribute: u32,
+        value: *mut c_void,
+        value_size: u32,
+    ) -> Hresult;
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentThreadId() -> u32;
@@ -220,9 +240,6 @@ fn activate_target(hwnd: Hwnd) -> Result<(), String> {
         return Ok(());
     }
 
-    // First use the non-invasive activation APIs while the target GUI thread is
-    // attached to our input queue. BringWindowToTop activates a top-level window;
-    // SetActiveWindow/SetFocus are valid across attached queues.
     unsafe {
         BringWindowToTop(hwnd);
         SetActiveWindow(hwnd);
@@ -234,11 +251,6 @@ fn activate_target(hwnd: Hwnd) -> Result<(), String> {
         return Ok(());
     }
 
-    // Windows may still enforce foreground-lock policy even after the normal
-    // activation conditions are satisfied. A real click is the user-level way
-    // Windows defines foreground activation. To avoid changing application
-    // content, click only a point that the target itself reports as non-client
-    // chrome (caption or resize frame), then verify the exact HWND again.
     let point = safe_non_client_activation_point(hwnd).ok_or_else(|| {
         "Windows refused programmatic foreground activation and no safe non-client activation point was found"
             .to_owned()
@@ -395,48 +407,280 @@ fn mouse_input(flags: u32) -> NativeInput {
 pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String> {
     let _attachment = InputQueueAttachment::for_windows(&[hwnd as usize])?;
     activate_target(hwnd)?;
-
-    // The legacy routine still performs its own exact GetForegroundWindow check
-    // before injecting Win+Arrow and verifies IsWindowArranged afterward.
     windows_snap_legacy::snap(hwnd, direction)
 }
 
-fn prime_pair_foreground_queue(hwnd: Hwnd) -> Result<(), String> {
-    if hwnd.is_null() {
-        return Err("window handle is unavailable".to_owned());
+fn establish_pair(
+    first: Hwnd,
+    second: Hwnd,
+    orientation: SplitOrientation,
+) -> Result<(), String> {
+    let (first_direction, second_direction) = match orientation {
+        SplitOrientation::SideBySide => (SnapDirection::LeftHalf, SnapDirection::RightHalf),
+        SplitOrientation::Stacked => (SnapDirection::TopHalf, SnapDirection::BottomHalf),
+    };
+
+    if !snap(first, first_direction)? {
+        return Err(
+            "Windows did not arrange the first window while creating the custom snap pair"
+                .to_owned(),
+        );
+    }
+    if !snap(second, second_direction)? {
+        return Err(
+            "Windows did not arrange the second window while creating the custom snap pair"
+                .to_owned(),
+        );
+    }
+    thread::sleep(SNAP_SETTLE);
+
+    if is_arranged(first) != Some(true) || is_arranged(second) != Some(true) {
+        return Err(
+            "one of the windows left arranged state while creating the custom snap pair".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn resize_hit_code(first_side: bool, orientation: SplitOrientation) -> i32 {
+    match (orientation, first_side) {
+        (SplitOrientation::SideBySide, true) => HTRIGHT,
+        (SplitOrientation::SideBySide, false) => HTLEFT,
+        (SplitOrientation::Stacked, true) => HTBOTTOM,
+        (SplitOrientation::Stacked, false) => HTTOP,
+    }
+}
+
+fn hit_name(hit: i32) -> &'static str {
+    match hit {
+        HTLEFT => "HTLEFT",
+        HTRIGHT => "HTRIGHT",
+        HTTOP => "HTTOP",
+        HTBOTTOM => "HTBOTTOM",
+        _ => "resize",
+    }
+}
+
+fn find_resize_handle(
+    hwnd: Hwnd,
+    rect: NativeRect,
+    first_side: bool,
+    orientation: SplitOrientation,
+) -> Option<(i32, i32)> {
+    let expected = resize_hit_code(first_side, orientation);
+    let cross_positions = [0.50_f64, 0.38, 0.62, 0.28, 0.72];
+
+    for cross in cross_positions {
+        let base = match orientation {
+            SplitOrientation::SideBySide => {
+                let y = rect.top
+                    + ((rect.bottom.saturating_sub(rect.top)) as f64 * cross).round() as i32;
+                let x = if first_side { rect.right } else { rect.left };
+                (x, y)
+            }
+            SplitOrientation::Stacked => {
+                let x = rect.left
+                    + ((rect.right.saturating_sub(rect.left)) as f64 * cross).round() as i32;
+                let y = if first_side { rect.bottom } else { rect.top };
+                (x, y)
+            }
+        };
+
+        for offset in EDGE_SCAN_OFFSETS {
+            let point = match orientation {
+                SplitOrientation::SideBySide => (base.0.saturating_add(offset), base.1),
+                SplitOrientation::Stacked => (base.0, base.1.saturating_add(offset)),
+            };
+            if non_client_hit_test(hwnd, point) == Some(expected) {
+                return Some(point);
+            }
+        }
     }
 
-    // The custom-pair routine changes foreground HWND more than once *inside*
-    // the legacy implementation. Merely making the first HWND foreground is not
-    // enough on Windows sessions with strict foreground locking. Generate one
-    // verified non-client click after all participating GUI threads are attached
-    // so the shared input queue receives genuine input before those transitions.
-    unsafe {
-        BringWindowToTop(hwnd);
-    }
-    let point = safe_non_client_activation_point(hwnd).ok_or_else(|| {
-        "no safe non-client activation point was found for the custom-snap foreground handoff"
-            .to_owned()
+    None
+}
+
+fn drag_saved_edge(
+    hwnd: Hwnd,
+    first_side: bool,
+    orientation: SplitOrientation,
+    target: i32,
+) -> Result<(), String> {
+    let rect = frame_bounds(hwnd)
+        .ok_or_else(|| "could not read the arranged window frame".to_owned())?;
+    let expected_hit = resize_hit_code(first_side, orientation);
+    let start = find_resize_handle(hwnd, rect, first_side, orientation).ok_or_else(|| {
+        format!(
+            "Windows did not expose the expected {} resize handle around the arranged frame",
+            hit_name(expected_hit)
+        )
     })?;
-    click_non_client_point(point)?;
-    thread::sleep(ACTIVATION_SETTLE);
+    let end = match orientation {
+        SplitOrientation::SideBySide => (target, start.1),
+        SplitOrientation::Stacked => (start.0, target),
+    };
+    drag_resize_handle(hwnd, expected_hit, start, end)
+}
 
-    unsafe {
-        BringWindowToTop(hwnd);
-        SetActiveWindow(hwnd);
-        SetFocus(hwnd);
-        SetForegroundWindow(hwnd);
+fn drag_resize_handle(
+    hwnd: Hwnd,
+    expected_hit: i32,
+    start: (i32, i32),
+    end: (i32, i32),
+) -> Result<(), String> {
+    let _attachment = InputQueueAttachment::for_windows(&[hwnd as usize])?;
+    activate_target(hwnd)?;
+
+    if non_client_hit_test(hwnd, start) != Some(expected_hit) {
+        return Err(format!(
+            "the selected resize point no longer reports {} before the drag",
+            hit_name(expected_hit)
+        ));
     }
-    thread::sleep(ACTIVATION_SETTLE);
 
-    if unsafe { GetForegroundWindow() } == hwnd {
+    drag_divider(start, end)
+}
+
+fn shared_divider_fallback(
+    first: Hwnd,
+    second: Hwnd,
+    work_area: [i32; 4],
+    orientation: SplitOrientation,
+) -> Option<(i32, i32)> {
+    let first_rect = frame_bounds(first)?;
+    let second_rect = frame_bounds(second)?;
+    Some(match orientation {
+        SplitOrientation::SideBySide => {
+            let x = ((first_rect.right as i64 + second_rect.left as i64) / 2) as i32;
+            let y = work_area[1] + work_area[3].saturating_sub(work_area[1]) / 2;
+            (x, y)
+        }
+        SplitOrientation::Stacked => {
+            let y = ((first_rect.bottom as i64 + second_rect.top as i64) / 2) as i32;
+            let x = work_area[0] + work_area[2].saturating_sub(work_area[0]) / 2;
+            (x, y)
+        }
+    })
+}
+
+fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
+    let mut original = Point::default();
+    let _cursor_restore = CursorRestoreGuard {
+        point: (unsafe { GetCursorPos(&mut original) } != 0).then_some(original),
+    };
+
+    if unsafe { SetCursorPos(start.0, start.1) } == 0 {
+        return Err("SetCursorPos failed while targeting the Windows snap resize handle".to_owned());
+    }
+    thread::sleep(DIVIDER_HOVER_SETTLE);
+
+    send_mouse_button(true)?;
+
+    let steps = 18_i32;
+    for step in 1..=steps {
+        let x = start.0 as i64
+            + ((end.0 as i64 - start.0 as i64) * step as i64) / steps as i64;
+        let y = start.1 as i64
+            + ((end.1 as i64 - start.1 as i64) * step as i64) / steps as i64;
+        if unsafe { SetCursorPos(x as i32, y as i32) } == 0 {
+            let _ = send_mouse_button(false);
+            return Err("SetCursorPos failed during the Windows snap resize drag".to_owned());
+        }
+        thread::sleep(DIVIDER_STEP_SETTLE);
+    }
+
+    let release_result = send_mouse_button(false);
+    thread::sleep(DIVIDER_RESULT_SETTLE);
+    release_result
+}
+
+fn send_mouse_button(down: bool) -> Result<(), String> {
+    let input = mouse_input(if down {
+        MOUSEEVENTF_LEFTDOWN
+    } else {
+        MOUSEEVENTF_LEFTUP
+    });
+    let sent = unsafe { SendInput(1, &input, size_of::<NativeInput>() as i32) };
+    if sent == 1 {
         Ok(())
     } else {
-        Err(
-            "custom-snap target did not become foreground after verified non-client input; native snap shortcuts were not sent"
-                .to_owned(),
-        )
+        Err(format!(
+            "Windows rejected the synthetic mouse {} event (possibly blocked by UIPI)",
+            if down { "down" } else { "up" }
+        ))
     }
+}
+
+fn pair_matches_target(
+    first: Hwnd,
+    second: Hwnd,
+    orientation: SplitOrientation,
+    target: i32,
+) -> bool {
+    if is_arranged(first) != Some(true) || is_arranged(second) != Some(true) {
+        return false;
+    }
+    let Some(first_rect) = frame_bounds(first) else {
+        return false;
+    };
+    let Some(second_rect) = frame_bounds(second) else {
+        return false;
+    };
+
+    match orientation {
+        SplitOrientation::SideBySide => {
+            (first_rect.right - target).abs() <= CUSTOM_TARGET_TOLERANCE
+                && (second_rect.left - target).abs() <= CUSTOM_TARGET_TOLERANCE
+        }
+        SplitOrientation::Stacked => {
+            (first_rect.bottom - target).abs() <= CUSTOM_TARGET_TOLERANCE
+                && (second_rect.top - target).abs() <= CUSTOM_TARGET_TOLERANCE
+        }
+    }
+}
+
+fn pair_mismatch_description(
+    first: Hwnd,
+    second: Hwnd,
+    orientation: SplitOrientation,
+    target: i32,
+) -> String {
+    let arranged = (is_arranged(first), is_arranged(second));
+    let first_rect = frame_bounds(first);
+    let second_rect = frame_bounds(second);
+
+    match (first_rect, second_rect) {
+        (Some(first_rect), Some(second_rect)) => {
+            let (first_edge, second_edge) = match orientation {
+                SplitOrientation::SideBySide => (first_rect.right, second_rect.left),
+                SplitOrientation::Stacked => (first_rect.bottom, second_rect.top),
+            };
+            format!(
+                "Windows left arranged state={:?}/{:?} with edges {first_edge}/{second_edge}, target {target}",
+                arranged.0, arranged.1
+            )
+        }
+        _ => format!(
+            "Windows left arranged state={:?}/{:?} and the final frame bounds could not be read",
+            arranged.0, arranged.1
+        ),
+    }
+}
+
+fn frame_bounds(hwnd: Hwnd) -> Option<NativeRect> {
+    let mut rect = NativeRect::default();
+    if unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut rect as *mut NativeRect).cast(),
+            size_of::<NativeRect>() as u32,
+        )
+    } >= 0
+    {
+        return Some(rect);
+    }
+    (unsafe { GetWindowRect(hwnd, &mut rect) } != 0).then_some(rect)
 }
 
 pub(crate) fn restore_resized_pair(
@@ -446,17 +690,95 @@ pub(crate) fn restore_resized_pair(
     work_area: [i32; 4],
     divider_fraction: f64,
 ) -> Result<(), String> {
-    let _attachment = InputQueueAttachment::for_windows(&[first_hwnd, second_hwnd])?;
+    if !(0.05..=0.95).contains(&divider_fraction) || !divider_fraction.is_finite() {
+        return Err(format!(
+            "saved custom snap divider fraction {divider_fraction:.4} is outside the safe range"
+        ));
+    }
 
-    prime_pair_foreground_queue(first_hwnd as Hwnd)?;
+    let first = first_hwnd as Hwnd;
+    let second = second_hwnd as Hwnd;
+    if first.is_null() || second.is_null() || first == second {
+        return Err("custom snap pair has invalid window handles".to_owned());
+    }
 
-    windows_snap_legacy::restore_resized_pair(
-        first_hwnd,
-        second_hwnd,
-        orientation,
-        work_area,
-        divider_fraction,
-    )
+    let width = work_area[2].saturating_sub(work_area[0]);
+    let height = work_area[3].saturating_sub(work_area[1]);
+    if width <= 0 || height <= 0 {
+        return Err("custom snap pair has an invalid monitor work area".to_owned());
+    }
+
+    let target = match orientation {
+        SplitOrientation::SideBySide => {
+            work_area[0] + (divider_fraction * width as f64).round() as i32
+        }
+        SplitOrientation::Stacked => {
+            work_area[1] + (divider_fraction * height as f64).round() as i32
+        }
+    };
+
+    let mut errors = Vec::new();
+
+    for first_side in [true, false] {
+        establish_pair(first, second, orientation)?;
+
+        let primary = if first_side { first } else { second };
+        let secondary = if first_side { second } else { first };
+
+        match drag_saved_edge(primary, first_side, orientation, target) {
+            Ok(()) => {
+                if pair_matches_target(first, second, orientation, target) {
+                    return Ok(());
+                }
+
+                if is_arranged(primary) == Some(true) && is_arranged(secondary) == Some(true) {
+                    if let Err(error) =
+                        drag_saved_edge(secondary, !first_side, orientation, target)
+                    {
+                        errors.push(format!(
+                            "{} edge reached the target but the partner edge could not be resized: {error}",
+                            if first_side { "first" } else { "second" }
+                        ));
+                    } else if pair_matches_target(first, second, orientation, target) {
+                        return Ok(());
+                    }
+                }
+
+                errors.push(format!(
+                    "{} edge drag completed, but {}",
+                    if first_side { "first" } else { "second" },
+                    pair_mismatch_description(first, second, orientation, target)
+                ));
+            }
+            Err(error) => errors.push(format!(
+                "{} divider-facing edge: {error}",
+                if first_side { "first" } else { "second" }
+            )),
+        }
+    }
+
+    establish_pair(first, second, orientation)?;
+    if let Some(start) = shared_divider_fallback(first, second, work_area, orientation) {
+        let end = match orientation {
+            SplitOrientation::SideBySide => (target, start.1),
+            SplitOrientation::Stacked => (start.0, target),
+        };
+        match drag_divider(start, end) {
+            Ok(()) if pair_matches_target(first, second, orientation, target) => return Ok(()),
+            Ok(()) => errors.push(format!(
+                "shared-divider fallback completed, but {}",
+                pair_mismatch_description(first, second, orientation, target)
+            )),
+            Err(error) => errors.push(format!("shared-divider fallback: {error}")),
+        }
+    } else {
+        errors.push("shared-divider fallback could not read the arranged window frames".to_owned());
+    }
+
+    Err(format!(
+        "could not recreate the native custom snap pair at divider coordinate {target}: {}. Synthetic input can be blocked by UIPI; if either target app is elevated, run Context Capsule from an equally elevated terminal",
+        errors.join(" | ")
+    ))
 }
 
 #[cfg(test)]
@@ -480,10 +802,10 @@ mod tests {
         assert!(is_safe_activation_hit(HTCAPTION));
         assert!(is_safe_activation_hit(HTLEFT));
         assert!(is_safe_activation_hit(HTBOTTOMRIGHT));
-        assert!(!is_safe_activation_hit(1)); // HTCLIENT
-        assert!(!is_safe_activation_hit(8)); // HTMINBUTTON
-        assert!(!is_safe_activation_hit(9)); // HTMAXBUTTON
-        assert!(!is_safe_activation_hit(20)); // HTCLOSE
+        assert!(!is_safe_activation_hit(1));
+        assert!(!is_safe_activation_hit(8));
+        assert!(!is_safe_activation_hit(9));
+        assert!(!is_safe_activation_hit(20));
     }
 
     #[test]
