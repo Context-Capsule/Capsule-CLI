@@ -23,7 +23,7 @@ const SWP_NOOWNERZORDER: u32 = 0x0200;
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const RESTORE_SETTLE: Duration = Duration::from_millis(90);
 const BASELINE_SETTLE: Duration = Duration::from_millis(110);
-const WORK_AREA_TOLERANCE: i32 = 3;
+const WORK_AREA_TOLERANCE: i64 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -260,7 +260,7 @@ fn same_work_area(actual: [i32; 4], expected: [i32; 4]) -> bool {
     actual
         .iter()
         .zip(expected.iter())
-        .all(|(actual, expected)| actual.saturating_sub(*expected).abs() <= WORK_AREA_TOLERANCE)
+        .all(|(actual, expected)| (*actual as i64 - *expected as i64).abs() <= WORK_AREA_TOLERANCE)
 }
 
 fn rect_center_inside(rect: NativeRect, area: [i32; 4]) -> bool {
