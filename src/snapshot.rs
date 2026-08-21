@@ -97,7 +97,16 @@ pub fn capture_snapshot_with_options(
 
     let docker = serde_json::to_value(&discovery.docker)?;
     let terminals = serde_json::to_value(filtered_terminal_snapshot(&discovery.terminals, &ignored))?;
-    let explorer = serde_json::to_value(explorer::discover())?;
+    let explorer = if ignored.iter().any(|application| is_explorer(application)) {
+        json!({
+            "schema_version": 1,
+            "status": "unavailable",
+            "windows": [],
+            "message": "File Explorer was explicitly excluded from this capsule",
+        })
+    } else {
+        serde_json::to_value(explorer::discover())?
+    };
     let firefox = if ignored.iter().any(|application| is_firefox_family(application)) {
         None
     } else {
@@ -299,6 +308,13 @@ fn is_windows_terminal(application: &ApplicationInfo) -> bool {
         )
 }
 
+fn is_explorer(application: &ApplicationInfo) -> bool {
+    is_named_or_executable(
+        application,
+        &["Explorer", "File Explorer", "explorer.exe"],
+    )
+}
+
 fn display_value(display: &DisplayInfo) -> Value {
     json!({
         "device_name": display.device_name, "bounds": rect_value(display.bounds),
@@ -495,6 +511,28 @@ mod tests {
         assert_eq!(
             stored.snapshot.pointer("/capture_options/ignored_applications/0"),
             Some(&Value::String("Visual Studio Code".to_owned()))
+        );
+    }
+
+    #[test]
+    fn ignored_explorer_suppresses_folder_restore_state() {
+        let explorer = test_application("File Explorer", r"C:\Windows\explorer.exe");
+        let discovery = base_discovery(vec![explorer], TerminalSnapshot::not_requested());
+        let stored = capture_snapshot_with_options(
+            &discovery,
+            &CaptureOptions {
+                ignored_applications: vec!["explorer.exe".to_owned()],
+            },
+        )
+        .expect("capture filtered snapshot");
+        assert_eq!(stored.snapshot.pointer("/explorer/status").and_then(Value::as_str), Some("unavailable"));
+        assert_eq!(
+            stored
+                .snapshot
+                .pointer("/explorer/windows")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 }
