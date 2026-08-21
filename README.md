@@ -13,6 +13,9 @@ cargo run -- inspect --verbose
 # Save the first revision
 cargo run -- save work
 
+# Save while excluding applications from this capsule
+cargo run -- save focused-work --ignore-app Zen --ignore-app "Visual Studio Code"
+
 # Capture the current state as a new immutable revision
 cargo run -- update work
 
@@ -25,14 +28,77 @@ cargo run -- diff work@1 work@2
 # Preview an older revision without changing the machine
 cargo run -- restore work@1 --dry-run
 
-# Restore it
+# Restore it; append/preserve is the default
 cargo run -- restore work@1
+
+# Preview replace mode, including applications that would be closed
+cargo run -- restore work@1 --replace --dry-run
+
+# Restore after closing unrelated running applications
+cargo run -- restore work@1 --replace
 
 # Diagnose the local installation/adapters
 cargo run -- doctor --verbose
 ```
 
 After installing the binary, replace `cargo run --` with `capsule`.
+
+## Save-time application exclusions
+
+`--ignore-app` is repeatable. An excluded application is deliberately left out of the capsule instead of becoming part of the target restore state.
+
+```powershell
+capsule save work --ignore-app Zen
+capsule save work --ignore-app "Visual Studio Code" --ignore-app WindowsTerminal.exe
+capsule save work --ignore-app=Code.exe
+```
+
+Selectors are case-insensitive and can match an application name, executable name, executable path, AppUserModelID, or saved launch target. Context Capsule rejects a selector that matches no currently discovered application rather than silently accepting a typo. Use `capsule apps` or `capsule inspect --apps` to see the application names Context Capsule currently detects.
+
+Exclusions are also applied to application-owned semantic state so an ignored app cannot silently reappear through another adapter:
+
+- ignoring Zen/Firefox suppresses the Firefox/Zen semantic snapshot;
+- ignoring VS Code suppresses its editor semantic snapshot and VS Code-hosted terminal sessions;
+- ignoring Windows Terminal suppresses its terminal sessions and stored Windows Terminal layouts;
+- ignoring File Explorer suppresses folder-window restore state;
+- Docker/Compose resources remain independent of Docker Desktop, so ignoring Docker Desktop does not delete container/Compose state from the capsule.
+
+Resolved ignored application names are stored under `capture_options.ignored_applications` and are shown by `capsule show`.
+
+## Restore modes: append vs replace
+
+Restore remains backward compatible: **append mode is the default**. It preserves unrelated running applications and applies the capsule on top of the current desktop, just as Context Capsule did before replace mode existed.
+
+```powershell
+capsule restore work
+capsule restore work --append
+```
+
+Use `--replace` when the current desktop should be cleaned before restoration:
+
+```powershell
+capsule restore work --replace
+```
+
+`--close-unrelated` is an alias for `--replace`.
+
+Replace mode first discovers the current user applications using the same desktop classifier used for capture. Applications whose strong identity belongs to the capsule are preserved; unrelated discovered user applications receive a normal Windows close request before the existing restore engine runs. Browser/editor/terminal semantic owners are also treated as capsule-owned when their semantic payload exists.
+
+Replace cleanup is intentionally fail-safe:
+
+- it never force-kills applications with `/F`;
+- if an application remains open because of an unsaved-work prompt or shutdown policy, it is reported and left running;
+- the terminal/editor process chain hosting the active `capsule` command is always protected;
+- `explorer.exe` is never terminated as a cleanup side effect because it owns the Windows shell;
+- if Context Capsule cannot establish the replace cleanup inventory at all, restoration does not start, avoiding an accidental append when the user explicitly requested replace behavior.
+
+Use `--dry-run` with `--replace` to see cleanup counts without closing anything:
+
+```powershell
+capsule restore work --replace --dry-run
+```
+
+After cleanup, replace mode invokes the same proven restore engine as append mode. Window placement, native Snap restoration, Zen/Firefox semantic restoration, VS Code restoration, terminal restoration, Explorer restoration, and Docker behavior are not forked into a second restore implementation.
 
 ## Immutable revisions
 
@@ -126,6 +192,8 @@ The Firefox/Zen extension uses the native host for local semantic-state synchron
 
 Context Capsule restore is intentionally conservative:
 
+- append/preserve is the default restore behavior;
+- replace cleanup is explicit and never force-kills an app that refuses a normal close;
 - reuse already-satisfied state instead of duplicating it;
 - do not mutate a changed live Zen window just because it shares a few tabs;
 - do not guess ambiguous legacy terminal ownership;
