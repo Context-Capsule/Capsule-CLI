@@ -21,6 +21,7 @@ use std::{
 
 const VSCODE_ADAPTER_TIMEOUT: Duration = Duration::from_secs(25);
 const FIREFOX_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
+const CHROME_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const TERMINAL_LAUNCH_SPACING: Duration = Duration::from_millis(120);
 #[cfg(windows)]
@@ -42,11 +43,12 @@ pub fn restore(snapshot: &Value, dry_run: bool) -> SemanticRestoreReport {
     let mut report = SemanticRestoreReport::default();
 
     // Docker can be restored without a GUI host, so converge it first. The GUI
-    // adapters are then handled one at a time to avoid a large browser + editor
-    // state restore hitting the machine simultaneously. External terminals are last.
+    // adapters are then handled one at a time to avoid simultaneous large
+    // browser/editor restores. External terminals are last.
     restore_docker(snapshot, dry_run, &mut report);
     restore_vscode(snapshot, dry_run, &mut report);
     restore_firefox(snapshot, dry_run, &mut report);
+    restore_chrome(snapshot, dry_run, &mut report);
     restore_terminals(snapshot, dry_run, &mut report);
 
     report
@@ -74,6 +76,32 @@ fn restore_firefox(snapshot: &Value, dry_run: bool, report: &mut SemanticRestore
         "Firefox",
         saved,
         FIREFOX_ADAPTER_TIMEOUT,
+        report,
+    );
+}
+
+fn restore_chrome(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
+    let Some(saved) = snapshot
+        .pointer("/browsers/chrome")
+        .cloned()
+        .filter(|value| !value.is_null())
+    else {
+        return;
+    };
+
+    if dry_run {
+        report.warnings.push(
+            "Chrome semantic restore: would reconcile saved tabs, tab groups and browser windows"
+                .to_owned(),
+        );
+        return;
+    }
+
+    run_bus_adapter(
+        "chrome",
+        "Chrome",
+        saved,
+        CHROME_ADAPTER_TIMEOUT,
         report,
     );
 }
@@ -162,14 +190,14 @@ fn run_bus_adapter(
         )),
         Ok(None) => {
             let _ = restore_bus::cancel_request(adapter, &request.request_id);
+            let diagnostic_hint = match adapter {
+                "firefox" => "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore",
+                "chrome" => "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore",
+                _ => "",
+            };
             report.failures.push(format!(
-                "{label} semantic restore timed out after {} seconds waiting for its Context Capsule adapter{}",
+                "{label} semantic restore timed out after {} seconds waiting for its Context Capsule adapter{diagnostic_hint}",
                 timeout.as_secs(),
-                if adapter == "firefox" {
-                    "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore"
-                } else {
-                    ""
-                }
             ));
         }
         Err(error) => {
@@ -750,6 +778,21 @@ mod tests {
         let mut wrong = current;
         wrong.working_directory = Some(r"C:\Other".to_owned());
         assert!(!launched_session_matches(&saved, &wrong));
+    }
+
+    #[test]
+    fn chrome_dry_run_is_reported_without_touching_firefox() {
+        let snapshot = json!({
+            "browsers": {
+                "chrome": { "browser": "chrome", "windows": [] },
+                "firefox": null
+            }
+        });
+        let mut report = SemanticRestoreReport::default();
+        restore_chrome(&snapshot, true, &mut report);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].starts_with("Chrome semantic restore:"));
+        assert!(report.failures.is_empty());
     }
 
     #[cfg(windows)]
