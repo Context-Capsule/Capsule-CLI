@@ -51,17 +51,15 @@ impl InputQueueAttachment {
             });
         }
 
+        // A native-messaging/console thread may not own a GUI message queue, in
+        // which case AttachThreadInput can legitimately fail. Do not turn that
+        // into a regression: the extension has already foregrounded the exact
+        // Zen window and the legacy sender previously worked without attachment.
         let attached = unsafe { AttachThreadInput(current_thread, target_thread, 1) } != 0;
-        if !attached {
-            let error = unsafe { GetLastError() };
-            return Err(format!(
-                "could not attach Context Capsule's input queue to the foreground Zen thread (Win32 error {error})"
-            ));
-        }
         Ok(Self {
             current_thread,
             target_thread,
-            attached: true,
+            attached,
         })
     }
 }
@@ -82,14 +80,20 @@ fn establish_foreground_keyboard_target() -> Result<(), String> {
         return Err("Zen split invocation has no foreground window to activate".to_owned());
     }
 
-    let _attachment = InputQueueAttachment::for_window(target)?;
+    let attachment = InputQueueAttachment::for_window(target)?;
     let mut last_error = 0_u32;
     for _ in 0..ACTIVATION_RETRIES {
         unsafe {
             BringWindowToTop(target);
             SetForegroundWindow(target);
-            SetActiveWindow(target);
-            SetFocus(target);
+            // SetActiveWindow/SetFocus are meaningful across threads only when
+            // their input queues are attached. Without attachment, preserve the
+            // browser's existing focus instead of forcing an invalid cross-thread
+            // focus transition.
+            if attachment.attached || attachment.current_thread == attachment.target_thread {
+                SetActiveWindow(target);
+                SetFocus(target);
+            }
         }
         thread::sleep(ACTIVATION_SETTLE);
         if unsafe { GetForegroundWindow() } == target {
