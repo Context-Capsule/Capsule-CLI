@@ -89,9 +89,7 @@ fn normalized_path(value: &str) -> String {
 }
 
 fn file_name(value: &str) -> Option<&str> {
-    value
-        .rsplit(['\\', '/'])
-        .find(|part| !part.is_empty())
+    value.rsplit(['\\', '/']).find(|part| !part.is_empty())
 }
 
 fn current_matches_saved(current: &ApplicationInfo, saved: &SavedApplication) -> bool {
@@ -217,6 +215,19 @@ fn is_firefox_family(application: &ApplicationInfo) -> bool {
     )
 }
 
+fn is_docker_desktop(application: &ApplicationInfo) -> bool {
+    named_or_executable(
+        application,
+        &[
+            "Docker Desktop",
+            "Docker Desktop.exe",
+            "DockerDesktop.exe",
+            "Docker Desktop Backend.exe",
+            "com.docker.backend.exe",
+        ],
+    )
+}
+
 fn is_explorer_shell(application: &ApplicationInfo) -> bool {
     named_or_executable(
         application,
@@ -235,6 +246,18 @@ fn terminal_snapshot_mentions_host(snapshot: &Value, host: &str) -> bool {
         })
 }
 
+fn capsule_has_docker_resources(snapshot: &Value) -> bool {
+    let compose = snapshot
+        .pointer("/docker/compose_projects")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.is_empty());
+    let standalone = snapshot
+        .pointer("/docker/standalone_containers")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.is_empty());
+    compose || standalone
+}
+
 fn owned_by_semantic_resource(snapshot: &Value, application: &ApplicationInfo) -> bool {
     if snapshot
         .pointer("/browsers/firefox")
@@ -248,6 +271,9 @@ fn owned_by_semantic_resource(snapshot: &Value, application: &ApplicationInfo) -
         .is_some_and(|value| !value.is_null())
         && is_vscode(application)
     {
+        return true;
+    }
+    if capsule_has_docker_resources(snapshot) && is_docker_desktop(application) {
         return true;
     }
 
@@ -394,11 +420,13 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
     let mut report = ApplicationCleanupReport::default();
     let saved_desktop = match SavedDesktop::from_capsule(snapshot) {
         Ok(Some(desktop)) => desktop,
-        Ok(None) => SavedDesktop {
-            status: "available".to_owned(),
-            displays: Vec::new(),
-            applications: Vec::new(),
-        },
+        Ok(None) => {
+            report.failures.push(
+                "replace mode requires an available saved desktop application inventory; this capsule does not have one, so Context Capsule refused to guess which running applications are unrelated"
+                    .to_owned(),
+            );
+            return report;
+        }
         Err(error) => {
             report.failures.push(error);
             return report;
@@ -558,5 +586,21 @@ mod tests {
         let current = current("Notes", None, None);
         let saved = saved("notes", None, None);
         assert!(current_matches_saved(&current, &saved));
+    }
+
+    #[test]
+    fn docker_desktop_is_semantically_owned_when_docker_resources_exist() {
+        let docker = current(
+            "Docker Desktop",
+            Some(r"C:\Program Files\Docker\Docker\Docker Desktop.exe"),
+            None,
+        );
+        let snapshot = serde_json::json!({
+            "docker": {
+                "compose_projects": [{ "name": "demo" }],
+                "standalone_containers": []
+            }
+        });
+        assert!(owned_by_semantic_resource(&snapshot, &docker));
     }
 }
