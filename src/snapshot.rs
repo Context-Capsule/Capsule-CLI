@@ -1,4 +1,5 @@
 use crate::{
+    adapters::terminal::{TerminalHost, TerminalSnapshot},
     desktop::{ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate, Rect, WindowInfo},
     discovery::{DiscoverySnapshot, GitState},
     persistence::{PersistenceError, StoredCapsuleSnapshot},
@@ -6,23 +7,129 @@ use crate::{
 use context_capsule::{browser, explorer, vscode};
 use serde_json::{Value, json};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureOptions {
+    pub ignored_applications: Vec<String>,
+}
+
+impl CaptureOptions {
+    fn ignores(&self, application: &ApplicationInfo) -> bool {
+        self.ignored_applications
+            .iter()
+            .any(|selector| application_matches_selector(application, selector))
+    }
+}
+
+pub fn validate_ignored_applications(
+    discovery: &DiscoverySnapshot,
+    selectors: &[String],
+) -> Result<Vec<String>, String> {
+    if selectors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let desktop = discovery.desktop.as_ref().map_err(|error| {
+        format!("cannot apply --ignore-app because desktop discovery is unavailable: {error}")
+    })?;
+    let mut resolved = Vec::new();
+
+    for selector in selectors {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err("--ignore-app requires a non-empty application selector".to_owned());
+        }
+        let matches = desktop
+            .applications
+            .iter()
+            .filter(|application| application_matches_selector(application, selector))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            let available = desktop
+                .applications
+                .iter()
+                .map(|application| application.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "--ignore-app '{selector}' did not match a captured application{}",
+                if available.is_empty() {
+                    String::new()
+                } else {
+                    format!("; currently detected applications: {available}")
+                }
+            ));
+        }
+        for application in matches {
+            if !resolved
+                .iter()
+                .any(|name: &String| name.eq_ignore_ascii_case(&application.name))
+            {
+                resolved.push(application.name.clone());
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
 pub fn capture_snapshot(
     discovery: &DiscoverySnapshot,
 ) -> Result<StoredCapsuleSnapshot, PersistenceError> {
+    capture_snapshot_with_options(discovery, &CaptureOptions::default())
+}
+
+pub fn capture_snapshot_with_options(
+    discovery: &DiscoverySnapshot,
+    options: &CaptureOptions,
+) -> Result<StoredCapsuleSnapshot, PersistenceError> {
+    let ignored = discovery
+        .desktop
+        .as_ref()
+        .ok()
+        .map(|desktop| {
+            desktop
+                .applications
+                .iter()
+                .filter(|application| options.ignores(application))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     let docker = serde_json::to_value(&discovery.docker)?;
-    let terminals = serde_json::to_value(&discovery.terminals)?;
-    let explorer = serde_json::to_value(explorer::discover())?;
-    let firefox = browser::load_recent_firefox_state()
-        .ok()
-        .flatten()
-        .map(serde_json::to_value)
-        .transpose()?;
-    let vscode = vscode::load_recent_vscode_state()
-        .ok()
-        .flatten()
-        .map(serde_json::to_value)
-        .transpose()?;
-    let snapshot = json!({
+    let terminals = serde_json::to_value(filtered_terminal_snapshot(&discovery.terminals, &ignored))?;
+    let explorer = if ignored.iter().any(|application| is_explorer(application)) {
+        json!({
+            "schema_version": 1,
+            "status": "unavailable",
+            "windows": [],
+            "message": "File Explorer was explicitly excluded from this capsule",
+        })
+    } else {
+        serde_json::to_value(explorer::discover())?
+    };
+    let firefox = if ignored.iter().any(|application| is_firefox_family(application)) {
+        None
+    } else {
+        browser::load_recent_firefox_state()
+            .ok()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?
+    };
+    let vscode = if ignored.iter().any(|application| is_vscode(application)) {
+        None
+    } else {
+        vscode::load_recent_vscode_state()
+            .ok()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?
+    };
+    let ignored_names = ignored
+        .iter()
+        .map(|application| application.name.clone())
+        .collect::<Vec<_>>();
+    let mut snapshot = json!({
         "current_directory": discovery.current_directory.to_string_lossy(),
         "system": {
             "platform": discovery.system.platform,
@@ -40,7 +147,7 @@ pub fn capture_snapshot(
             "source": hint.source,
             "value": hint.value,
         })).collect::<Vec<_>>(),
-        "desktop": desktop_value(&discovery.desktop),
+        "desktop": desktop_value(&discovery.desktop, options),
         "explorer": explorer,
         "docker": docker,
         "terminals": terminals,
@@ -48,7 +155,49 @@ pub fn capture_snapshot(
         "editors": { "vscode": vscode },
     });
 
+    // Keep the default payload shape identical to pre-exclusion capsules. The
+    // additive metadata exists only when the user explicitly chose exclusions.
+    if !ignored_names.is_empty() {
+        snapshot.as_object_mut().expect("snapshot is an object").insert(
+            "capture_options".to_owned(),
+            json!({ "ignored_applications": ignored_names }),
+        );
+    }
+
     Ok(StoredCapsuleSnapshot::new(snapshot))
+}
+
+fn filtered_terminal_snapshot(
+    original: &TerminalSnapshot,
+    ignored: &[&ApplicationInfo],
+) -> TerminalSnapshot {
+    let mut filtered = original.clone();
+    let suppress_windows_terminal = ignored.iter().any(|application| is_windows_terminal(application));
+    let suppress_vscode = ignored.iter().any(|application| is_vscode(application));
+    let suppress_cursor = ignored.iter().any(|application| is_cursor(application));
+    let suppress_wezterm = ignored.iter().any(|application| {
+        is_named_or_executable(application, &["wezterm", "wezterm-gui.exe", "wezterm.exe"])
+    });
+    let suppress_alacritty = ignored.iter().any(|application| {
+        is_named_or_executable(application, &["alacritty", "alacritty.exe"])
+    });
+    let suppress_mintty = ignored.iter().any(|application| {
+        is_named_or_executable(application, &["mintty", "mintty.exe"])
+    });
+
+    filtered.sessions.retain(|session| match &session.host {
+        TerminalHost::WindowsTerminal => !suppress_windows_terminal,
+        TerminalHost::VisualStudioCode => !suppress_vscode,
+        TerminalHost::Cursor => !suppress_cursor,
+        TerminalHost::WezTerm => !suppress_wezterm,
+        TerminalHost::Alacritty => !suppress_alacritty,
+        TerminalHost::Mintty => !suppress_mintty,
+        _ => true,
+    });
+    if suppress_windows_terminal {
+        filtered.windows_terminal_layouts.clear();
+    }
+    filtered
 }
 
 fn git_value(state: &GitState) -> Value {
@@ -63,16 +212,113 @@ fn git_value(state: &GitState) -> Value {
     }
 }
 
-fn desktop_value(result: &Result<DesktopSnapshot, String>) -> Value {
+fn desktop_value(result: &Result<DesktopSnapshot, String>, options: &CaptureOptions) -> Value {
     match result {
         Ok(desktop) => json!({
             "status": "available",
             "displays": desktop.displays.iter().map(display_value).collect::<Vec<_>>(),
-            "applications": desktop.applications.iter().map(application_value).collect::<Vec<_>>(),
+            "applications": desktop.applications.iter()
+                .filter(|application| !options.ignores(application))
+                .map(application_value)
+                .collect::<Vec<_>>(),
             "ignored": desktop.ignored.iter().map(ignored_value).collect::<Vec<_>>(),
         }),
         Err(message) => json!({ "status": "unavailable", "message": message }),
     }
+}
+
+fn normalized(value: &str) -> String {
+    value.trim().replace('/', "\\").to_ascii_lowercase()
+}
+
+fn executable_basename(value: &str) -> Option<&str> {
+    value
+        .rsplit(['\\', '/'])
+        .find(|part| !part.is_empty())
+}
+
+fn executable_stem(value: &str) -> Option<&str> {
+    let basename = executable_basename(value)?;
+    basename.rsplit_once('.').map(|(stem, _)| stem).or(Some(basename))
+}
+
+fn application_matches_selector(application: &ApplicationInfo, selector: &str) -> bool {
+    let selector = normalized(selector);
+    if normalized(&application.name) == selector {
+        return true;
+    }
+
+    let mut identities = Vec::new();
+    if let Some(path) = application.executable_path.as_deref() {
+        identities.push(path);
+    }
+    if let Some(aumid) = application.app_user_model_id.as_deref() {
+        identities.push(aumid);
+    }
+    if let Some(launch) = application.launch.as_ref() {
+        identities.push(launch.target.as_str());
+    }
+
+    identities.into_iter().any(|identity| {
+        if normalized(identity) == selector {
+            return true;
+        }
+        executable_basename(identity)
+            .is_some_and(|name| normalized(name) == selector)
+            || executable_stem(identity)
+                .is_some_and(|name| normalized(name) == selector)
+    })
+}
+
+fn app_executable_name(application: &ApplicationInfo) -> Option<&str> {
+    application
+        .executable_path
+        .as_deref()
+        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .and_then(executable_basename)
+}
+
+fn is_named_or_executable(application: &ApplicationInfo, values: &[&str]) -> bool {
+    values.iter().any(|value| application.name.eq_ignore_ascii_case(value))
+        || app_executable_name(application).is_some_and(|name| {
+            values.iter().any(|value| name.eq_ignore_ascii_case(value))
+        })
+}
+
+fn is_firefox_family(application: &ApplicationInfo) -> bool {
+    is_named_or_executable(
+        application,
+        &["zen", "Zen Browser", "zen.exe", "firefox", "Mozilla Firefox", "firefox.exe"],
+    )
+}
+
+fn is_vscode(application: &ApplicationInfo) -> bool {
+    is_named_or_executable(
+        application,
+        &["Visual Studio Code", "VS Code", "Code", "Code.exe"],
+    )
+}
+
+fn is_cursor(application: &ApplicationInfo) -> bool {
+    is_named_or_executable(application, &["Cursor", "Cursor.exe"])
+}
+
+fn is_windows_terminal(application: &ApplicationInfo) -> bool {
+    application
+        .app_user_model_id
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("windowsterminal"))
+        || is_named_or_executable(
+            application,
+            &["Windows Terminal", "WindowsTerminal.exe", "wt.exe"],
+        )
+}
+
+fn is_explorer(application: &ApplicationInfo) -> bool {
+    is_named_or_executable(
+        application,
+        &["Explorer", "File Explorer", "explorer.exe"],
+    )
 }
 
 fn display_value(display: &DisplayInfo) -> Value {
@@ -130,16 +376,40 @@ mod tests {
     use crate::{
         adapters::{
             docker::{DockerSnapshot, DockerStatus},
-            terminal::TerminalSnapshot,
+            terminal::{
+                ShellKind, TerminalEnvironment, TerminalHistoryPolicy, TerminalSession,
+                TerminalSource, TerminalStatus, WorkingDirectorySource,
+            },
         },
+        desktop::{ApplicationClassification, LaunchSpec, LaunchStrategy},
         discovery::GitState,
         system::SystemInfo,
     };
     use std::path::PathBuf;
 
-    #[test]
-    fn snapshot_envelope_is_versioned_and_contains_resource_slots() {
-        let discovery = DiscoverySnapshot {
+    fn test_application(name: &str, executable_path: &str) -> ApplicationInfo {
+        ApplicationInfo {
+            primary_pid: 1,
+            pids: vec![1],
+            parent_pid: None,
+            name: name.to_owned(),
+            executable_path: Some(executable_path.to_owned()),
+            app_user_model_id: None,
+            file_version: None,
+            classification: ApplicationClassification::UserApplication,
+            confidence: 100,
+            classification_reason: "test".to_owned(),
+            launch: Some(LaunchSpec {
+                strategy: LaunchStrategy::Executable,
+                target: executable_path.to_owned(),
+            }),
+            windows: Vec::new(),
+            discovered_as_background: false,
+        }
+    }
+
+    fn base_discovery(applications: Vec<ApplicationInfo>, terminals: TerminalSnapshot) -> DiscoverySnapshot {
+        DiscoverySnapshot {
             current_directory: PathBuf::from("/workspace"),
             system: SystemInfo {
                 platform: "test".to_owned(),
@@ -149,7 +419,11 @@ mod tests {
             git: GitState::NotRepository,
             tools: Vec::new(),
             version_hints: Vec::new(),
-            desktop: Err("not requested".to_owned()),
+            desktop: Ok(DesktopSnapshot {
+                displays: Vec::new(),
+                applications,
+                ignored: Vec::new(),
+            }),
             docker: DockerSnapshot {
                 status: DockerStatus::Available,
                 context: Some("test".to_owned()),
@@ -157,8 +431,13 @@ mod tests {
                 compose_projects: Vec::new(),
                 standalone_containers: Vec::new(),
             },
-            terminals: TerminalSnapshot::not_requested(),
-        };
+            terminals,
+        }
+    }
+
+    #[test]
+    fn snapshot_envelope_is_versioned_and_contains_resource_slots() {
+        let discovery = base_discovery(Vec::new(), TerminalSnapshot::not_requested());
         let stored = capture_snapshot(&discovery).expect("capture snapshot");
         assert_eq!(stored.schema_version, 1);
         assert_eq!(stored.snapshot["docker"]["status"], "available");
@@ -168,5 +447,105 @@ mod tests {
         assert!(stored.snapshot.get("explorer").is_some());
         assert!(stored.snapshot.pointer("/browsers/firefox").is_some());
         assert!(stored.snapshot.pointer("/editors/vscode").is_some());
+        assert!(stored.snapshot.get("capture_options").is_none());
+    }
+
+    #[test]
+    fn ignore_selector_matches_name_executable_and_stem_cross_platform() {
+        let app = test_application("Visual Studio Code", r"C:\Users\test\Code.exe");
+        assert!(application_matches_selector(&app, "Visual Studio Code"));
+        assert!(application_matches_selector(&app, "Code.exe"));
+        assert!(application_matches_selector(&app, "code"));
+        assert!(application_matches_selector(&app, r"C:\Users\test\Code.exe"));
+        assert!(!application_matches_selector(&app, "Visual Studio"));
+    }
+
+    #[test]
+    fn ignored_application_is_removed_from_desktop_and_owned_terminal_state() {
+        let vscode = test_application("Visual Studio Code", r"C:\Program Files\Microsoft VS Code\Code.exe");
+        let terminals = TerminalSnapshot {
+            status: TerminalStatus::Available,
+            message: None,
+            windows_terminal_layouts: Vec::new(),
+            sessions: vec![TerminalSession {
+                sources: vec![TerminalSource::WindowsProcess],
+                host: TerminalHost::VisualStudioCode,
+                shell: ShellKind::PowerShell,
+                shell_executable: None,
+                environment: TerminalEnvironment::Windows,
+                pid: None,
+                parent_pid: None,
+                tty: None,
+                profile: None,
+                title: None,
+                working_directory: None,
+                working_directory_source: WorkingDirectorySource::Unknown,
+                startup_command: None,
+                foreground_command: None,
+                restart: None,
+            }],
+            warnings: Vec::new(),
+            history: TerminalHistoryPolicy {
+                captured: false,
+                reason: "test".to_owned(),
+            },
+        };
+        let discovery = base_discovery(vec![vscode], terminals);
+        let stored = capture_snapshot_with_options(
+            &discovery,
+            &CaptureOptions {
+                ignored_applications: vec!["Code.exe".to_owned()],
+            },
+        )
+        .expect("capture filtered snapshot");
+
+        assert_eq!(
+            stored
+                .snapshot
+                .pointer("/desktop/applications")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            stored
+                .snapshot
+                .pointer("/terminals/sessions")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            stored.snapshot.pointer("/capture_options/ignored_applications/0"),
+            Some(&Value::String("Visual Studio Code".to_owned()))
+        );
+        assert!(
+            stored
+                .snapshot
+                .pointer("/editors/vscode")
+                .is_some_and(Value::is_null)
+        );
+    }
+
+    #[test]
+    fn ignored_explorer_suppresses_folder_restore_state() {
+        let explorer = test_application("File Explorer", r"C:\Windows\explorer.exe");
+        let discovery = base_discovery(vec![explorer], TerminalSnapshot::not_requested());
+        let stored = capture_snapshot_with_options(
+            &discovery,
+            &CaptureOptions {
+                ignored_applications: vec!["explorer.exe".to_owned()],
+            },
+        )
+        .expect("capture filtered snapshot");
+        assert_eq!(stored.snapshot.pointer("/explorer/status").and_then(Value::as_str), Some("unavailable"));
+        assert_eq!(
+            stored
+                .snapshot
+                .pointer("/explorer/windows")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
     }
 }

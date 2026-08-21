@@ -5,24 +5,59 @@ use crate::{
     },
     discovery,
     persistence::{CapsuleStore, StoredCapsuleSnapshot},
-    snapshot,
+    snapshot::{self, CaptureOptions},
 };
-use context_capsule::restore::{self, RestoreOptions};
+use context_capsule::{
+    cleanup,
+    restore::{self, RestoreOptions},
+};
 use serde_json::Value;
 use std::process::ExitCode;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveArguments {
+    name: String,
+    force: bool,
+    ignored_applications: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RestoreMode {
+    #[default]
+    Append,
+    Replace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreArguments {
+    name: String,
+    dry_run: bool,
+    mode: RestoreMode,
+}
+
 pub fn save(arguments: Vec<String>) -> ExitCode {
-    let (name, force) = match parse_save_arguments(arguments) {
+    let parsed = match parse_save_arguments(arguments) {
         Ok(parsed) => parsed,
         Err(error) => return usage_error(error),
     };
+    let name = parsed.name;
 
     println!("Discovering workspace for capsule '{name}'...");
     let discovery = match discovery::discover(true, true, true, true) {
         Ok(snapshot) => snapshot,
         Err(error) => return command_error(format!("discovery failed: {error}")),
     };
-    let stored = match snapshot::capture_snapshot(&discovery) {
+    let ignored_names = match snapshot::validate_ignored_applications(
+        &discovery,
+        &parsed.ignored_applications,
+    ) {
+        Ok(names) => names,
+        Err(error) => return usage_error(error),
+    };
+    let capture_options = CaptureOptions {
+        ignored_applications: parsed.ignored_applications,
+    };
+    let stored = match snapshot::capture_snapshot_with_options(&discovery, &capture_options) {
         Ok(snapshot) => snapshot,
         Err(error) => return command_error(error.to_string()),
     };
@@ -32,26 +67,50 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     };
     let database_path = store.path().display().to_string();
 
-    if let Err(error) = store.save(&name, &stored, force) {
+    if let Err(error) = store.save(&name, &stored, parsed.force) {
         return command_error(error.to_string());
     }
 
-    let applications = discovery
-        .desktop
-        .as_ref()
-        .map(|desktop| desktop.applications.len())
+    let applications = stored
+        .snapshot
+        .pointer("/desktop/applications")
+        .and_then(Value::as_array)
+        .map(Vec::len)
         .unwrap_or(0);
+    let terminal_sessions = stored
+        .snapshot
+        .pointer("/terminals/sessions")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let wsl_sessions = stored
+        .snapshot
+        .pointer("/terminals/sessions")
+        .and_then(Value::as_array)
+        .map(|sessions| {
+            sessions
+                .iter()
+                .filter(|session| {
+                    session
+                        .pointer("/environment/kind")
+                        .and_then(Value::as_str)
+                        == Some("wsl")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
     println!("Saved capsule '{name}'.");
     println!("  applications: {applications}");
+    if !ignored_names.is_empty() {
+        println!("  ignored applications: {}", ignored_names.len());
+        for ignored in &ignored_names {
+            println!("    - {ignored}");
+        }
+    }
     println!("  developer tools: {}", discovery.tools.len());
-    println!(
-        "  terminal sessions: {}",
-        discovery.terminals.session_count()
-    );
-    println!(
-        "  WSL terminal sessions: {}",
-        discovery.terminals.wsl_session_count()
-    );
+    println!("  terminal sessions: {terminal_sessions}");
+    println!("  WSL terminal sessions: {wsl_sessions}");
     println!(
         "  running containers: {}",
         discovery.docker.running_container_count()
@@ -72,10 +131,11 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
 }
 
 pub fn restore(arguments: Vec<String>) -> ExitCode {
-    let (name, dry_run) = match parse_restore_arguments(arguments) {
+    let parsed = match parse_restore_arguments(arguments) {
         Ok(parsed) => parsed,
         Err(error) => return usage_error(error),
     };
+    let name = parsed.name;
 
     let store = match CapsuleStore::open_default() {
         Ok(store) => store,
@@ -86,13 +146,57 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         Err(error) => return command_error(error.to_string()),
     };
 
-    if dry_run {
+    if parsed.dry_run {
         println!("Planning restore for capsule '{name}' (dry run)...");
     } else {
         println!("Restoring capsule '{name}'...");
     }
+    println!(
+        "  mode: {}",
+        match parsed.mode {
+            RestoreMode::Append => "append (preserve unrelated running applications)",
+            RestoreMode::Replace => "replace (close unrelated running applications first)",
+        }
+    );
 
-    let report = restore::restore_snapshot(&stored.snapshot, RestoreOptions { dry_run });
+    if parsed.mode == RestoreMode::Replace {
+        let cleanup = cleanup::close_unrelated_applications(&stored.snapshot, parsed.dry_run);
+        println!("Application cleanup:");
+        println!("  detected user applications: {}", cleanup.applications_detected);
+        println!("  belonging to capsule:       {}", cleanup.applications_in_capsule);
+        if parsed.dry_run {
+            println!("  would close:                {}", cleanup.applications_planned_to_close);
+        } else {
+            println!("  close requests sent:        {}", cleanup.close_requests_sent);
+            println!("  closed:                     {}", cleanup.applications_closed);
+            if cleanup.applications_remaining > 0 {
+                println!("  still running:              {}", cleanup.applications_remaining);
+            }
+        }
+        if cleanup.applications_protected > 0 {
+            println!("  protected hosts/shells:     {}", cleanup.applications_protected);
+        }
+        for warning in &cleanup.warnings {
+            println!("  warning: {warning}");
+        }
+        for failure in &cleanup.failures {
+            eprintln!("  failed: {failure}");
+        }
+        if !cleanup.success() {
+            eprintln!("Replace-mode cleanup could not be established; restore was not started.");
+            return ExitCode::from(1);
+        }
+    }
+
+    // Keep the proven restore engine unchanged. Append mode reaches exactly the
+    // same call it did before this feature; replace mode differs only by the
+    // opt-in cleanup pass above.
+    let report = restore::restore_snapshot(
+        &stored.snapshot,
+        RestoreOptions {
+            dry_run: parsed.dry_run,
+        },
+    );
     let desktop = &report.desktop;
     println!("Desktop:");
     println!("  applications in capsule: {}", desktop.applications_total);
@@ -100,7 +204,7 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         "  already running:         {}",
         desktop.applications_already_running
     );
-    if dry_run {
+    if parsed.dry_run {
         println!(
             "  would launch:            {}",
             desktop.applications_planned_to_launch
@@ -139,7 +243,7 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
     }
 
     if report.success() {
-        if dry_run {
+        if parsed.dry_run {
             println!("Dry run complete; no applications or windows were changed.");
         } else {
             println!("Restore pass complete.");
@@ -493,6 +597,18 @@ fn print_capsule_summary(name: &str, stored: &StoredCapsuleSnapshot) {
     println!("  applications: {app_count}");
     println!("  terminal sessions: {terminal_count}");
 
+    if let Some(ignored) = stored
+        .snapshot
+        .pointer("/capture_options/ignored_applications")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty())
+    {
+        println!("  ignored applications: {}", ignored.len());
+        for application in ignored.iter().filter_map(Value::as_str) {
+            println!("    - {application}");
+        }
+    }
+
     match stored.docker() {
         Ok(docker) => {
             println!("  running containers: {}", docker.running_container_count());
@@ -504,32 +620,75 @@ fn print_capsule_summary(name: &str, stored: &StoredCapsuleSnapshot) {
     println!("  use 'capsule show {name} --json' for the complete stored snapshot");
 }
 
-fn parse_save_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
+fn parse_save_arguments(arguments: Vec<String>) -> Result<SaveArguments, String> {
     let mut name = None;
     let mut force = false;
+    let mut ignored_applications = Vec::new();
+    let mut index = 0;
 
-    for argument in arguments {
+    while index < arguments.len() {
+        let argument = &arguments[index];
         match argument.as_str() {
             "--force" | "-f" => force = true,
+            "--ignore-app" => {
+                index += 1;
+                let Some(selector) = arguments.get(index) else {
+                    return Err("--ignore-app requires an application name, executable, path, or AUMID".to_owned());
+                };
+                if selector.trim().is_empty() || selector.starts_with('-') {
+                    return Err("--ignore-app requires an application name, executable, path, or AUMID".to_owned());
+                }
+                ignored_applications.push(selector.clone());
+            }
+            value if value.starts_with("--ignore-app=") => {
+                let selector = value.trim_start_matches("--ignore-app=").trim();
+                if selector.is_empty() {
+                    return Err("--ignore-app requires a non-empty selector".to_owned());
+                }
+                ignored_applications.push(selector.to_owned());
+            }
             value if value.starts_with('-') => {
                 return Err(format!("unknown save option '{value}'"));
             }
             value if name.is_none() => name = Some(value.to_owned()),
             value => return Err(format!("unexpected save argument '{value}'")),
         }
+        index += 1;
     }
 
-    name.map(|name| (name, force))
-        .ok_or_else(|| "usage: capsule save <name> [--force]".to_owned())
+    name.map(|name| SaveArguments {
+        name,
+        force,
+        ignored_applications,
+    })
+    .ok_or_else(|| {
+        "usage: capsule save <name> [--force] [--ignore-app <application>]...".to_owned()
+    })
 }
 
-fn parse_restore_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
+fn parse_restore_arguments(arguments: Vec<String>) -> Result<RestoreArguments, String> {
     let mut name = None;
     let mut dry_run = false;
+    let mut mode = RestoreMode::Append;
+    let mut explicit_mode: Option<RestoreMode> = None;
 
     for argument in arguments {
         match argument.as_str() {
             "--dry-run" => dry_run = true,
+            "--append" => {
+                if explicit_mode == Some(RestoreMode::Replace) {
+                    return Err("--append cannot be combined with --replace/--close-unrelated".to_owned());
+                }
+                mode = RestoreMode::Append;
+                explicit_mode = Some(RestoreMode::Append);
+            }
+            "--replace" | "--close-unrelated" => {
+                if explicit_mode == Some(RestoreMode::Append) {
+                    return Err("--replace/--close-unrelated cannot be combined with --append".to_owned());
+                }
+                mode = RestoreMode::Replace;
+                explicit_mode = Some(RestoreMode::Replace);
+            }
             value if value.starts_with('-') => {
                 return Err(format!("unknown restore option '{value}'"));
             }
@@ -538,8 +697,14 @@ fn parse_restore_arguments(arguments: Vec<String>) -> Result<(String, bool), Str
         }
     }
 
-    name.map(|name| (name, dry_run))
-        .ok_or_else(|| "usage: capsule restore <name> [--dry-run]".to_owned())
+    name.map(|name| RestoreArguments {
+        name,
+        dry_run,
+        mode,
+    })
+    .ok_or_else(|| {
+        "usage: capsule restore <name> [--dry-run] [--append | --replace]".to_owned()
+    })
 }
 
 fn parse_show_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
@@ -576,28 +741,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn save_parser_requires_one_name_and_supports_force() {
+    fn save_parser_requires_one_name_and_supports_force_and_repeated_ignores() {
         assert_eq!(
-            parse_save_arguments(vec!["demo".to_owned(), "--force".to_owned()]).unwrap(),
-            ("demo".to_owned(), true)
+            parse_save_arguments(vec![
+                "demo".to_owned(),
+                "--force".to_owned(),
+                "--ignore-app".to_owned(),
+                "Zen".to_owned(),
+                "--ignore-app=Code.exe".to_owned(),
+            ])
+            .unwrap(),
+            SaveArguments {
+                name: "demo".to_owned(),
+                force: true,
+                ignored_applications: vec!["Zen".to_owned(), "Code.exe".to_owned()],
+            }
         );
         assert!(parse_save_arguments(Vec::new()).is_err());
         assert!(parse_save_arguments(vec!["a".to_owned(), "b".to_owned()]).is_err());
+        assert!(parse_save_arguments(vec!["demo".to_owned(), "--ignore-app".to_owned()]).is_err());
     }
 
     #[test]
-    fn restore_parser_supports_dry_run() {
+    fn restore_parser_defaults_to_append_and_supports_replace_and_dry_run() {
         assert_eq!(
             parse_restore_arguments(vec!["demo".to_owned(), "--dry-run".to_owned()]).unwrap(),
-            ("demo".to_owned(), true)
+            RestoreArguments {
+                name: "demo".to_owned(),
+                dry_run: true,
+                mode: RestoreMode::Append,
+            }
         );
         assert_eq!(
-            parse_restore_arguments(vec!["demo".to_owned()]).unwrap(),
-            ("demo".to_owned(), false)
+            parse_restore_arguments(vec!["demo".to_owned(), "--replace".to_owned()]).unwrap(),
+            RestoreArguments {
+                name: "demo".to_owned(),
+                dry_run: false,
+                mode: RestoreMode::Replace,
+            }
+        );
+        assert_eq!(
+            parse_restore_arguments(vec!["demo".to_owned(), "--close-unrelated".to_owned()])
+                .unwrap()
+                .mode,
+            RestoreMode::Replace
+        );
+        assert_eq!(
+            parse_restore_arguments(vec!["demo".to_owned()]).unwrap().mode,
+            RestoreMode::Append
         );
         assert!(parse_restore_arguments(Vec::new()).is_err());
         assert!(parse_restore_arguments(vec!["demo".to_owned(), "--bad".to_owned()]).is_err());
         assert!(parse_restore_arguments(vec!["one".to_owned(), "two".to_owned()]).is_err());
+        assert!(
+            parse_restore_arguments(vec![
+                "demo".to_owned(),
+                "--append".to_owned(),
+                "--replace".to_owned(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

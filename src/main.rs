@@ -571,9 +571,9 @@ fn print_usage() {
     println!("Context Capsule CLI\n");
     println!("Usage:");
     println!("  capsule inspect [options]");
-    println!("  capsule save <name> [--force]");
+    println!("  capsule save <name> [--force] [--ignore-app <application>]...");
     println!("  capsule update <name>");
-    println!("  capsule restore <name[@revision]> [--dry-run]");
+    println!("  capsule restore <name[@revision]> [--dry-run] [--append | --replace]");
     println!("  capsule list");
     println!("  capsule history <name>");
     println!("  capsule show <name[@revision]> [--json]");
@@ -588,9 +588,9 @@ fn print_usage() {
     println!(
         "  inspect    Discover current workspace, tools, terminals, applications, windows, displays and Docker"
     );
-    println!("  save       Capture a new capsule; --force creates a new immutable revision if it exists");
+    println!("  save       Capture a new capsule; repeat --ignore-app to exclude selected applications");
     println!("  update     Capture the current workspace as the next revision of an existing capsule");
-    println!("  restore    Restore the current or an explicit @revision capsule state");
+    println!("  restore    Restore a capsule; append is default, --replace closes unrelated applications first");
     println!("  list       List saved capsules");
     println!("  history    List immutable revisions for a capsule");
     println!("  show       Show a saved capsule or revision; --json prints the complete stored payload");
@@ -600,6 +600,12 @@ fn print_usage() {
     println!("  docker     Inspect Docker or restore Docker resources from a saved capsule");
     println!("  terminal   Inspect semantic terminal and WSL session metadata");
     println!("  apps       Compatibility alias for 'capsule inspect --apps'");
+    println!();
+    println!("Save/restore options:");
+    println!("      --ignore-app <app>  Omit a discovered application from a saved capsule; repeatable");
+    println!("      --append            Preserve unrelated running applications during restore (default)");
+    println!("      --replace           Close unrelated running applications before restore");
+    println!("      --close-unrelated   Alias for --replace");
     println!();
     print_inspect_usage();
 }
