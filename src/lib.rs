@@ -18,6 +18,9 @@ pub mod restore_bus;
 pub mod vscode;
 
 #[cfg(windows)]
+pub(crate) mod zen_shortcuts;
+
+#[cfg(windows)]
 #[path = "windows_snap.rs"]
 pub(crate) mod windows_snap_core;
 #[cfg(windows)]
