@@ -7,6 +7,7 @@ extern crate self as context_capsule;
 
 pub mod adapters;
 pub mod browser;
+pub mod cleanup;
 pub mod desktop;
 pub mod diagnostics;
 pub mod diff;
