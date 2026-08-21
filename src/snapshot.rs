@@ -4,7 +4,7 @@ use crate::{
     discovery::{DiscoverySnapshot, GitState},
     persistence::{PersistenceError, StoredCapsuleSnapshot},
 };
-use context_capsule::{browser, explorer, vscode};
+use context_capsule::{browser, chrome, explorer, vscode};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -116,6 +116,15 @@ pub fn capture_snapshot_with_options(
             .map(serde_json::to_value)
             .transpose()?
     };
+    let chrome = if ignored.iter().any(|application| is_chrome(application)) {
+        None
+    } else {
+        chrome::load_recent_chrome_state()
+            .ok()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()?
+    };
     let vscode = if ignored.iter().any(|application| is_vscode(application)) {
         None
     } else {
@@ -154,6 +163,16 @@ pub fn capture_snapshot_with_options(
         "browsers": { "firefox": firefox },
         "editors": { "vscode": vscode },
     });
+
+    // Chrome is purely additive. When no live Chrome adapter exists, keep the
+    // historical browsers object exactly as it was before Chrome support.
+    if let Some(chrome) = chrome {
+        snapshot
+            .pointer_mut("/browsers")
+            .and_then(Value::as_object_mut)
+            .expect("browsers is an object")
+            .insert("chrome".to_owned(), chrome);
+    }
 
     // Keep the default payload shape identical to pre-exclusion capsules. The
     // additive metadata exists only when the user explicitly chose exclusions.
@@ -289,6 +308,13 @@ fn is_firefox_family(application: &ApplicationInfo) -> bool {
     is_named_or_executable(
         application,
         &["zen", "Zen Browser", "zen.exe", "firefox", "Mozilla Firefox", "firefox.exe"],
+    )
+}
+
+fn is_chrome(application: &ApplicationInfo) -> bool {
+    is_named_or_executable(
+        application,
+        &["chrome", "Google Chrome", "chrome.exe"],
     )
 }
 
@@ -458,6 +484,13 @@ mod tests {
         assert!(application_matches_selector(&app, "code"));
         assert!(application_matches_selector(&app, r"C:\Users\test\Code.exe"));
         assert!(!application_matches_selector(&app, "Visual Studio"));
+    }
+
+    #[test]
+    fn chrome_identity_is_detected_without_affecting_firefox_family() {
+        let chrome = test_application("Google Chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        assert!(is_chrome(&chrome));
+        assert!(!is_firefox_family(&chrome));
     }
 
     #[test]
