@@ -18,6 +18,7 @@ const VK_MENU: u16 = 0x12;
 const VK_LWIN: u16 = 0x5B;
 const FOREGROUND_RETRIES: usize = 8;
 const FOREGROUND_SETTLE: Duration = Duration::from_millis(60);
+const SHORTCUT_STEP_SETTLE: Duration = Duration::from_millis(12);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -262,6 +263,40 @@ fn virtual_key_from_keycode(keycode: &str) -> Option<u16> {
     })
 }
 
+fn send_input_step(inputs: &[Input], source: &str) -> Result<(), String> {
+    let count = u32::try_from(inputs.len()).map_err(|_| "too many keyboard events".to_owned())?;
+    if count == 0 {
+        return Ok(());
+    }
+    let sent = unsafe {
+        SendInput(
+            count,
+            inputs.as_ptr(),
+            i32::try_from(std::mem::size_of::<Input>()).unwrap_or(i32::MAX),
+        )
+    };
+    if sent != count {
+        let error = unsafe { GetLastError() };
+        return Err(format!(
+            "Zen split shortcut from {source} was not fully injected ({sent}/{count} INPUT events, Win32 error {error}). Synthetic input can be blocked by UIPI; run Zen and Context Capsule at matching elevation"
+        ));
+    }
+    Ok(())
+}
+
+fn release_modifiers_best_effort(modifiers: &[u16]) {
+    for virtual_key in modifiers.iter().rev() {
+        let input = [keyboard_input(*virtual_key, true)];
+        unsafe {
+            SendInput(
+                1,
+                input.as_ptr(),
+                i32::try_from(std::mem::size_of::<Input>()).unwrap_or(i32::MAX),
+            );
+        }
+    }
+}
+
 fn send_shortcut(shortcut: &ResolvedShortcut) -> Result<(), String> {
     // On Windows Zen treats Accel as Ctrl. Keep declared Control as Ctrl too;
     // duplicate modifiers are collapsed before generating INPUT records.
@@ -279,30 +314,34 @@ fn send_shortcut(shortcut: &ResolvedShortcut) -> Result<(), String> {
         modifiers.push(VK_LWIN);
     }
 
-    let mut inputs = Vec::with_capacity(modifiers.len() * 2 + 2);
+    // Deliver the chord with a short human-like cadence instead of putting the
+    // entire key-down/key-up burst in one SendInput call. Gecko/Zen's chrome
+    // key handlers then observe the modifier state before the command key. If a
+    // step fails, release every modifier best-effort so Context Capsule never
+    // leaves Ctrl/Alt/Shift/Win logically held down.
     for virtual_key in &modifiers {
-        inputs.push(keyboard_input(*virtual_key, false));
-    }
-    inputs.push(keyboard_input(shortcut.virtual_key, false));
-    inputs.push(keyboard_input(shortcut.virtual_key, true));
-    for virtual_key in modifiers.iter().rev() {
-        inputs.push(keyboard_input(*virtual_key, true));
+        if let Err(error) = send_input_step(&[keyboard_input(*virtual_key, false)], shortcut.source) {
+            release_modifiers_best_effort(&modifiers);
+            return Err(error);
+        }
+        thread::sleep(SHORTCUT_STEP_SETTLE);
     }
 
-    let count = u32::try_from(inputs.len()).map_err(|_| "too many keyboard events".to_owned())?;
-    let sent = unsafe {
-        SendInput(
-            count,
-            inputs.as_ptr(),
-            i32::try_from(std::mem::size_of::<Input>()).unwrap_or(i32::MAX),
-        )
-    };
-    if sent != count {
-        let error = unsafe { GetLastError() };
-        return Err(format!(
-            "Zen split shortcut from {} was not fully injected ({sent}/{count} INPUT events, Win32 error {error}). Synthetic input can be blocked by UIPI; run Zen and Context Capsule at matching elevation",
-            shortcut.source
-        ));
+    let command = [
+        keyboard_input(shortcut.virtual_key, false),
+        keyboard_input(shortcut.virtual_key, true),
+    ];
+    if let Err(error) = send_input_step(&command, shortcut.source) {
+        release_modifiers_best_effort(&modifiers);
+        return Err(error);
+    }
+    thread::sleep(SHORTCUT_STEP_SETTLE);
+
+    for virtual_key in modifiers.iter().rev() {
+        if let Err(error) = send_input_step(&[keyboard_input(*virtual_key, true)], shortcut.source) {
+            release_modifiers_best_effort(&modifiers);
+            return Err(error);
+        }
     }
     Ok(())
 }
