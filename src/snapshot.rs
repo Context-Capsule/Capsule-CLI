@@ -6,7 +6,6 @@ use crate::{
 };
 use context_capsule::{browser, explorer, vscode};
 use serde_json::{Value, json};
-use std::path::Path;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaptureOptions {
@@ -161,11 +160,17 @@ fn filtered_terminal_snapshot(
     let suppress_windows_terminal = ignored.iter().any(|application| is_windows_terminal(application));
     let suppress_vscode = ignored.iter().any(|application| is_vscode(application));
     let suppress_cursor = ignored.iter().any(|application| is_cursor(application));
-    let suppress_wezterm = ignored.iter().any(|application| is_named_or_executable(application, &["wezterm", "wezterm-gui.exe", "wezterm.exe"]));
-    let suppress_alacritty = ignored.iter().any(|application| is_named_or_executable(application, &["alacritty", "alacritty.exe"]));
-    let suppress_mintty = ignored.iter().any(|application| is_named_or_executable(application, &["mintty", "mintty.exe"]));
+    let suppress_wezterm = ignored.iter().any(|application| {
+        is_named_or_executable(application, &["wezterm", "wezterm-gui.exe", "wezterm.exe"])
+    });
+    let suppress_alacritty = ignored.iter().any(|application| {
+        is_named_or_executable(application, &["alacritty", "alacritty.exe"])
+    });
+    let suppress_mintty = ignored.iter().any(|application| {
+        is_named_or_executable(application, &["mintty", "mintty.exe"])
+    });
 
-    filtered.sessions.retain(|session| match session.host {
+    filtered.sessions.retain(|session| match &session.host {
         TerminalHost::WindowsTerminal => !suppress_windows_terminal,
         TerminalHost::VisualStudioCode => !suppress_vscode,
         TerminalHost::Cursor => !suppress_cursor,
@@ -212,11 +217,14 @@ fn normalized(value: &str) -> String {
 }
 
 fn executable_basename(value: &str) -> Option<&str> {
-    Path::new(value).file_name()?.to_str()
+    value
+        .rsplit(['\\', '/'])
+        .find(|part| !part.is_empty())
 }
 
 fn executable_stem(value: &str) -> Option<&str> {
-    Path::new(value).file_stem()?.to_str()
+    let basename = executable_basename(value)?;
+    basename.rsplit_once('.').map(|(stem, _)| stem).or(Some(basename))
 }
 
 fn application_matches_selector(application: &ApplicationInfo, selector: &str) -> bool {
@@ -420,18 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn ignore_selector_matches_name_executable_and_stem() {
-        let app = test_application("Visual Studio Code", r"C:\\Users\\test\\Code.exe");
+    fn ignore_selector_matches_name_executable_and_stem_cross_platform() {
+        let app = test_application("Visual Studio Code", r"C:\Users\test\Code.exe");
         assert!(application_matches_selector(&app, "Visual Studio Code"));
         assert!(application_matches_selector(&app, "Code.exe"));
         assert!(application_matches_selector(&app, "code"));
-        assert!(application_matches_selector(&app, r"C:\\Users\\test\\Code.exe"));
+        assert!(application_matches_selector(&app, r"C:\Users\test\Code.exe"));
         assert!(!application_matches_selector(&app, "Visual Studio"));
     }
 
     #[test]
     fn ignored_application_is_removed_from_desktop_and_owned_terminal_state() {
-        let vscode = test_application("Visual Studio Code", r"C:\\Program Files\\Microsoft VS Code\\Code.exe");
+        let vscode = test_application("Visual Studio Code", r"C:\Program Files\Microsoft VS Code\Code.exe");
         let terminals = TerminalSnapshot {
             status: TerminalStatus::Available,
             message: None,
