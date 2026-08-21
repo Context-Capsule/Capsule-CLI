@@ -13,6 +13,10 @@ path = "src/capsule_main.rs"
 name = "capsule-firefox-host"
 path = "src/bin/firefox_host.rs"
 
+[[bin]]
+name = "capsule-chrome-host"
+path = "src/bin/chrome_host.rs"
+
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
