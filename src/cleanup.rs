@@ -3,7 +3,50 @@ use crate::{
     restore::{SavedApplication, SavedDesktop},
 };
 use serde_json::Value;
-use std::path::Path;
+
+#[cfg(windows)]
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::c_void,
+    mem::{size_of, zeroed},
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
+
+#[cfg(windows)]
+type Handle = *mut c_void;
+#[cfg(windows)]
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+#[cfg(windows)]
+const MAX_PATH: usize = 260;
+#[cfg(windows)]
+const CLOSE_SETTLE: Duration = Duration::from_millis(1_500);
+
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessEntry32W {
+    size: u32,
+    usage: u32,
+    process_id: u32,
+    default_heap_id: usize,
+    module_id: u32,
+    threads: u32,
+    parent_process_id: u32,
+    priority_class_base: i32,
+    flags: u32,
+    exe_file: [u16; MAX_PATH],
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+    fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+    fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+    fn CloseHandle(handle: Handle) -> i32;
+    fn GetCurrentProcessId() -> u32;
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplicationCleanupReport {
@@ -46,7 +89,9 @@ fn normalized_path(value: &str) -> String {
 }
 
 fn file_name(value: &str) -> Option<&str> {
-    Path::new(value).file_name()?.to_str()
+    value
+        .rsplit(['\\', '/'])
+        .find(|part| !part.is_empty())
 }
 
 fn current_matches_saved(current: &ApplicationInfo, saved: &SavedApplication) -> bool {
@@ -136,15 +181,40 @@ fn is_cursor(application: &ApplicationInfo) -> bool {
     named_or_executable(application, &["Cursor", "Cursor.exe"])
 }
 
+fn is_wezterm(application: &ApplicationInfo) -> bool {
+    named_or_executable(
+        application,
+        &["WezTerm", "wezterm-gui.exe", "wezterm.exe"],
+    )
+}
+
+fn is_alacritty(application: &ApplicationInfo) -> bool {
+    named_or_executable(application, &["Alacritty", "alacritty.exe"])
+}
+
+fn is_mintty(application: &ApplicationInfo) -> bool {
+    named_or_executable(application, &["Mintty", "mintty.exe"])
+}
+
 fn is_firefox_family(application: &ApplicationInfo) -> bool {
     named_or_executable(
         application,
-        &["Zen", "Zen Browser", "zen.exe", "Firefox", "Mozilla Firefox", "firefox.exe"],
+        &[
+            "Zen",
+            "Zen Browser",
+            "zen.exe",
+            "Firefox",
+            "Mozilla Firefox",
+            "firefox.exe",
+        ],
     )
 }
 
 fn is_explorer_shell(application: &ApplicationInfo) -> bool {
-    named_or_executable(application, &["Explorer", "File Explorer", "explorer.exe"])
+    named_or_executable(
+        application,
+        &["Explorer", "File Explorer", "explorer.exe"],
+    )
 }
 
 fn terminal_snapshot_mentions_host(snapshot: &Value, host: &str) -> bool {
@@ -173,15 +243,15 @@ fn owned_by_semantic_resource(snapshot: &Value, application: &ApplicationInfo) -
     {
         return true;
     }
-    if terminal_snapshot_mentions_host(snapshot, "windows-terminal")
-        && is_windows_terminal(application)
-    {
-        return true;
-    }
-    if terminal_snapshot_mentions_host(snapshot, "visual-studio-code") && is_vscode(application) {
-        return true;
-    }
-    terminal_snapshot_mentions_host(snapshot, "cursor") && is_cursor(application)
+
+    (terminal_snapshot_mentions_host(snapshot, "windows-terminal")
+        && is_windows_terminal(application))
+        || (terminal_snapshot_mentions_host(snapshot, "visual-studio-code")
+            && is_vscode(application))
+        || (terminal_snapshot_mentions_host(snapshot, "cursor") && is_cursor(application))
+        || (terminal_snapshot_mentions_host(snapshot, "wez-term") && is_wezterm(application))
+        || (terminal_snapshot_mentions_host(snapshot, "alacritty") && is_alacritty(application))
+        || (terminal_snapshot_mentions_host(snapshot, "mintty") && is_mintty(application))
 }
 
 fn belongs_to_capsule(
@@ -196,137 +266,124 @@ fn belongs_to_capsule(
 }
 
 #[cfg(windows)]
-fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanupReport {
-    use std::{
-        collections::{HashMap, HashSet},
-        ffi::c_void,
-        mem::{size_of, zeroed},
-        process::{Command, Stdio},
-        thread,
-        time::Duration,
-    };
-
-    type Handle = *mut c_void;
-    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-    const MAX_PATH: usize = 260;
-    const CLOSE_SETTLE: Duration = Duration::from_millis(1_500);
-
-    #[repr(C)]
-    struct ProcessEntry32W {
-        size: u32,
-        usage: u32,
-        process_id: u32,
-        default_heap_id: usize,
-        module_id: u32,
-        threads: u32,
-        parent_process_id: u32,
-        priority_class_base: i32,
-        flags: u32,
-        exe_file: [u16; MAX_PATH],
+fn process_parents() -> HashMap<u32, u32> {
+    let mut result = HashMap::new();
+    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if handle as isize == -1 {
+        return result;
     }
 
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
-        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
-        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
-        fn CloseHandle(handle: Handle) -> i32;
-        fn GetCurrentProcessId() -> u32;
-    }
-
-    fn process_parents() -> HashMap<u32, u32> {
-        let mut result = HashMap::new();
-        let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if handle as isize == -1 {
-            return result;
-        }
-
-        let mut entry: ProcessEntry32W = unsafe { zeroed() };
+    let mut entry: ProcessEntry32W = unsafe { zeroed() };
+    entry.size = size_of::<ProcessEntry32W>() as u32;
+    let mut ok = unsafe { Process32FirstW(handle, &mut entry) } != 0;
+    while ok {
+        result.insert(entry.process_id, entry.parent_process_id);
+        entry = unsafe { zeroed() };
         entry.size = size_of::<ProcessEntry32W>() as u32;
-        let mut ok = unsafe { Process32FirstW(handle, &mut entry) } != 0;
-        while ok {
-            result.insert(entry.process_id, entry.parent_process_id);
-            entry = unsafe { zeroed() };
-            entry.size = size_of::<ProcessEntry32W>() as u32;
-            ok = unsafe { Process32NextW(handle, &mut entry) } != 0;
-        }
-        unsafe {
-            CloseHandle(handle);
-        }
-        result
+        ok = unsafe { Process32NextW(handle, &mut entry) } != 0;
     }
-
-    fn protected_process_chain() -> HashSet<u32> {
-        let parents = process_parents();
-        let mut protected = HashSet::new();
-        let mut current = unsafe { GetCurrentProcessId() };
-        while current != 0 && protected.insert(current) {
-            current = parents.get(&current).copied().unwrap_or(0);
-        }
-        protected
+    unsafe {
+        CloseHandle(handle);
     }
+    result
+}
 
-    fn hosts_current_command(application: &ApplicationInfo, protected_pids: &HashSet<u32>) -> bool {
-        if application
-            .pids
-            .iter()
-            .any(|pid| protected_pids.contains(pid))
-        {
+#[cfg(windows)]
+fn protected_process_chain() -> HashSet<u32> {
+    let parents = process_parents();
+    let mut protected = HashSet::new();
+    let mut current = unsafe { GetCurrentProcessId() };
+    while current != 0 && protected.insert(current) {
+        current = parents.get(&current).copied().unwrap_or(0);
+    }
+    protected
+}
+
+#[cfg(windows)]
+fn hosts_current_command(application: &ApplicationInfo, protected_pids: &HashSet<u32>) -> bool {
+    if application
+        .pids
+        .iter()
+        .any(|pid| protected_pids.contains(pid))
+    {
+        return true;
+    }
+    if std::env::var_os("WT_SESSION").is_some() && is_windows_terminal(application) {
+        return true;
+    }
+    if let Ok(program) = std::env::var("TERM_PROGRAM") {
+        let program = program.to_ascii_lowercase();
+        if program.contains("vscode") && is_vscode(application) {
             return true;
         }
-        if std::env::var_os("WT_SESSION").is_some() && is_windows_terminal(application) {
+        if program.contains("cursor") && is_cursor(application) {
             return true;
         }
-        if let Ok(program) = std::env::var("TERM_PROGRAM") {
-            let program = program.to_ascii_lowercase();
-            if program.contains("vscode") && is_vscode(application) {
-                return true;
-            }
-            if program.contains("cursor") && is_cursor(application) {
-                return true;
-            }
-            if program.contains("wezterm")
-                && named_or_executable(application, &["WezTerm", "wezterm-gui.exe", "wezterm.exe"])
-            {
-                return true;
-            }
+        if program.contains("wezterm") && is_wezterm(application) {
+            return true;
         }
-        false
+    }
+    false
+}
+
+#[cfg(windows)]
+fn request_close(application: &ApplicationInfo) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut pids = application.pids.clone();
+    pids.sort_unstable();
+    pids.dedup();
+    if pids.is_empty() {
+        pids.push(application.primary_pid);
     }
 
-    fn request_close(application: &ApplicationInfo) -> Vec<String> {
-        let mut errors = Vec::new();
-        let mut pids = application.pids.clone();
-        pids.sort_unstable();
-        pids.dedup();
-        if pids.is_empty() {
-            pids.push(application.primary_pid);
-        }
-
-        // `/F` is deliberately omitted. Replace mode is explicit, but Context
-        // Capsule still gives applications a normal close path so unsaved-work
-        // dialogs can protect user data instead of being bypassed.
-        for pid in pids {
-            let output = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            match output {
-                Ok(output) if output.status.success() => {}
-                Ok(output) => {
-                    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                    if !message.is_empty() {
-                        errors.push(format!("PID {pid}: {message}"));
-                    }
+    // `/F` is deliberately omitted. Replace mode is explicit, but Context
+    // Capsule still gives applications a normal close path so unsaved-work
+    // dialogs can protect user data instead of being bypassed.
+    for pid in pids {
+        let pid_text = pid.to_string();
+        let output = Command::new("taskkill")
+            .args(["/PID", pid_text.as_str(), "/T"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                if !message.is_empty() {
+                    errors.push(format!("PID {pid}: {message}"));
                 }
-                Err(error) => errors.push(format!("PID {pid}: could not run taskkill: {error}")),
             }
+            Err(error) => errors.push(format!("PID {pid}: could not run taskkill: {error}")),
         }
-        errors
     }
+    errors
+}
 
+#[cfg(windows)]
+fn current_matches_application(left: &ApplicationInfo, right: &ApplicationInfo) -> bool {
+    if let (Some(left_aumid), Some(right_aumid)) = (
+        left.app_user_model_id.as_deref(),
+        right.app_user_model_id.as_deref(),
+    ) {
+        if left_aumid.eq_ignore_ascii_case(right_aumid) {
+            return true;
+        }
+    }
+    if let (Some(left_path), Some(right_path)) = (
+        left.executable_path.as_deref(),
+        right.executable_path.as_deref(),
+    ) {
+        if normalized_path(left_path) == normalized_path(right_path) {
+            return true;
+        }
+    }
+    left.name.eq_ignore_ascii_case(&right.name)
+}
+
+#[cfg(windows)]
+fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanupReport {
     let mut report = ApplicationCleanupReport::default();
     let saved_desktop = match SavedDesktop::from_capsule(snapshot) {
         Ok(Some(desktop)) => desktop,
@@ -425,27 +482,6 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
     report
 }
 
-#[cfg(windows)]
-fn current_matches_application(left: &ApplicationInfo, right: &ApplicationInfo) -> bool {
-    if let (Some(left_aumid), Some(right_aumid)) = (
-        left.app_user_model_id.as_deref(),
-        right.app_user_model_id.as_deref(),
-    ) {
-        if left_aumid.eq_ignore_ascii_case(right_aumid) {
-            return true;
-        }
-    }
-    if let (Some(left_path), Some(right_path)) = (
-        left.executable_path.as_deref(),
-        right.executable_path.as_deref(),
-    ) {
-        if normalized_path(left_path) == normalized_path(right_path) {
-            return true;
-        }
-    }
-    left.name.eq_ignore_ascii_case(&right.name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,15 +527,15 @@ mod tests {
 
     #[test]
     fn cleanup_uses_same_strong_executable_identity_as_restore() {
-        let current = current("Editor", Some(r"C:\\Apps\\Editor.exe"), None);
+        let current = current("Editor", Some(r"C:\Apps\Editor.exe"), None);
         let saved = saved("Renamed Editor", Some(r"c:/apps/editor.exe"), None);
         assert!(current_matches_saved(&current, &saved));
     }
 
     #[test]
     fn strong_identity_mismatch_does_not_fall_back_to_name() {
-        let current = current("Editor", Some(r"C:\\Apps\\Editor-v2.exe"), None);
-        let saved = saved("Editor", Some(r"C:\\Apps\\Editor.exe"), None);
+        let current = current("Editor", Some(r"C:\Apps\Editor-v2.exe"), None);
+        let saved = saved("Editor", Some(r"C:\Apps\Editor.exe"), None);
         assert!(!current_matches_saved(&current, &saved));
     }
 
