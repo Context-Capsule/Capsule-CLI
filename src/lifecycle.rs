@@ -2,9 +2,10 @@ use crate::{
     diagnostics::{self, DoctorStatus},
     diff::{self, DiffChange, DiffKind},
     discovery, logging,
-    persistence::{CapsuleStore, parse_capsule_reference},
-    snapshot,
+    persistence::{CapsuleStore, StoredCapsuleSnapshot, parse_capsule_reference},
+    snapshot::{self, CaptureOptions},
 };
+use serde_json::{Value, json};
 use std::process::ExitCode;
 
 pub fn update(arguments: Vec<String>) -> ExitCode {
@@ -25,16 +26,41 @@ pub fn update(arguments: Vec<String>) -> ExitCode {
     if let Err(error) = store.history(&reference.name) {
         return command_error(error.to_string());
     }
+    let previous = match store.load(&reference.name) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return command_error(error.to_string()),
+    };
+    let inherited_ignored = ignored_applications(&previous.snapshot);
 
     println!("Discovering workspace for capsule '{}'...", reference.name);
     let discovery = match discovery::discover(true, true, true, true) {
         Ok(snapshot) => snapshot,
         Err(error) => return command_error(format!("discovery failed: {error}")),
     };
-    let stored = match snapshot::capture_snapshot(&discovery) {
+    let mut stored = match snapshot::capture_snapshot_with_options(
+        &discovery,
+        &CaptureOptions {
+            ignored_applications: inherited_ignored.clone(),
+        },
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => return command_error(error.to_string()),
     };
+    preserve_inherited_exclusions(&mut stored, &inherited_ignored);
+
+    let application_count = stored
+        .snapshot
+        .pointer("/desktop/applications")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let terminal_count = stored
+        .snapshot
+        .pointer("/terminals/sessions")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
     let summary = match store.save(&reference.name, &stored, true) {
         Ok(summary) => summary,
         Err(error) => return command_error(error.to_string()),
@@ -45,33 +71,101 @@ pub fn update(arguments: Vec<String>) -> ExitCode {
         summary.name, summary.current_revision
     );
     println!("  revisions retained: {}", summary.revision_count);
-    println!(
-        "  applications: {}",
-        discovery
-            .desktop
-            .as_ref()
-            .map(|desktop| desktop.applications.len())
-            .unwrap_or(0)
-    );
+    println!("  applications: {application_count}");
+    if !inherited_ignored.is_empty() {
+        println!("  inherited ignored applications: {}", inherited_ignored.len());
+        for application in &inherited_ignored {
+            println!("    - {application}");
+        }
+    }
     println!("  developer tools: {}", discovery.tools.len());
-    println!("  terminal sessions: {}", discovery.terminals.session_count());
+    println!("  terminal sessions: {terminal_count}");
     println!("  running containers: {}", discovery.docker.running_container_count());
     logging::info(
         "cli",
         format!(
-            "capsule update completed; revision={} revisions={} applications={} terminals={} containers={}",
+            "capsule update completed; revision={} revisions={} applications={} terminals={} containers={} ignored_applications={}",
             summary.current_revision,
             summary.revision_count,
-            discovery
-                .desktop
-                .as_ref()
-                .map(|desktop| desktop.applications.len())
-                .unwrap_or(0),
-            discovery.terminals.session_count(),
-            discovery.docker.running_container_count()
+            application_count,
+            terminal_count,
+            discovery.docker.running_container_count(),
+            inherited_ignored.len(),
         ),
     );
     ExitCode::SUCCESS
+}
+
+fn ignored_applications(snapshot: &Value) -> Vec<String> {
+    snapshot
+        .pointer("/capture_options/ignored_applications")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ignored_name_matches(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
+fn preserve_inherited_exclusions(stored: &mut StoredCapsuleSnapshot, ignored: &[String]) {
+    if ignored.is_empty() {
+        return;
+    }
+
+    if let Some(root) = stored.snapshot.as_object_mut() {
+        root.insert(
+            "capture_options".to_owned(),
+            json!({ "ignored_applications": ignored }),
+        );
+    }
+
+    let suppress_firefox = ignored.iter().any(|name| {
+        ignored_name_matches(
+            name,
+            &[
+                "Zen",
+                "Zen Browser",
+                "zen.exe",
+                "Firefox",
+                "Mozilla Firefox",
+                "firefox.exe",
+            ],
+        )
+    });
+    if suppress_firefox {
+        if let Some(browsers) = stored
+            .snapshot
+            .get_mut("browsers")
+            .and_then(Value::as_object_mut)
+        {
+            browsers.insert("firefox".to_owned(), Value::Null);
+        }
+    }
+
+    let suppress_vscode = ignored.iter().any(|name| {
+        ignored_name_matches(
+            name,
+            &["Visual Studio Code", "VS Code", "Code", "Code.exe"],
+        )
+    });
+    if suppress_vscode {
+        if let Some(editors) = stored
+            .snapshot
+            .get_mut("editors")
+            .and_then(Value::as_object_mut)
+        {
+            editors.insert("vscode".to_owned(), Value::Null);
+        }
+    }
 }
 
 pub fn history(arguments: Vec<String>) -> ExitCode {
@@ -330,5 +424,28 @@ mod tests {
         );
         assert!(parse_single_name("update", Vec::new()).is_err());
         assert!(parse_single_name("history", vec!["a".to_owned(), "b".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn inherited_exclusions_are_read_and_preserved() {
+        let snapshot = json!({
+            "capture_options": {
+                "ignored_applications": ["Zen Browser", "Visual Studio Code"]
+            }
+        });
+        let ignored = ignored_applications(&snapshot);
+        assert_eq!(ignored, vec!["Zen Browser", "Visual Studio Code"]);
+
+        let mut stored = StoredCapsuleSnapshot::new(json!({
+            "browsers": { "firefox": { "schema_version": 1 } },
+            "editors": { "vscode": { "schema_version": 1 } }
+        }));
+        preserve_inherited_exclusions(&mut stored, &ignored);
+        assert!(stored.snapshot.pointer("/browsers/firefox").is_some_and(Value::is_null));
+        assert!(stored.snapshot.pointer("/editors/vscode").is_some_and(Value::is_null));
+        assert_eq!(
+            stored.snapshot.pointer("/capture_options/ignored_applications/0"),
+            Some(&Value::String("Zen Browser".to_owned()))
+        );
     }
 }
