@@ -129,7 +129,7 @@ pub fn capture_snapshot_with_options(
         .iter()
         .map(|application| application.name.clone())
         .collect::<Vec<_>>();
-    let snapshot = json!({
+    let mut snapshot = json!({
         "current_directory": discovery.current_directory.to_string_lossy(),
         "system": {
             "platform": discovery.system.platform,
@@ -147,9 +147,6 @@ pub fn capture_snapshot_with_options(
             "source": hint.source,
             "value": hint.value,
         })).collect::<Vec<_>>(),
-        "capture_options": {
-            "ignored_applications": ignored_names,
-        },
         "desktop": desktop_value(&discovery.desktop, options),
         "explorer": explorer,
         "docker": docker,
@@ -157,6 +154,15 @@ pub fn capture_snapshot_with_options(
         "browsers": { "firefox": firefox },
         "editors": { "vscode": vscode },
     });
+
+    // Keep the default payload shape identical to pre-exclusion capsules. The
+    // additive metadata exists only when the user explicitly chose exclusions.
+    if !ignored_names.is_empty() {
+        snapshot.as_object_mut().expect("snapshot is an object").insert(
+            "capture_options".to_owned(),
+            json!({ "ignored_applications": ignored_names }),
+        );
+    }
 
     Ok(StoredCapsuleSnapshot::new(snapshot))
 }
@@ -441,6 +447,7 @@ mod tests {
         assert!(stored.snapshot.get("explorer").is_some());
         assert!(stored.snapshot.pointer("/browsers/firefox").is_some());
         assert!(stored.snapshot.pointer("/editors/vscode").is_some());
+        assert!(stored.snapshot.get("capture_options").is_none());
     }
 
     #[test]
@@ -511,6 +518,12 @@ mod tests {
         assert_eq!(
             stored.snapshot.pointer("/capture_options/ignored_applications/0"),
             Some(&Value::String("Visual Studio Code".to_owned()))
+        );
+        assert!(
+            stored
+                .snapshot
+                .pointer("/editors/vscode")
+                .is_some_and(Value::is_null)
         );
     }
 
