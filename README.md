@@ -13,9 +13,6 @@ cargo run -- inspect --verbose
 # Save the first revision
 cargo run -- save work
 
-# Save while excluding applications from this capsule
-cargo run -- save focused-work --ignore-app Zen --ignore-app "Visual Studio Code"
-
 # Capture the current state as a new immutable revision
 cargo run -- update work
 
@@ -28,14 +25,8 @@ cargo run -- diff work@1 work@2
 # Preview an older revision without changing the machine
 cargo run -- restore work@1 --dry-run
 
-# Restore it; append/preserve is the default
+# Restore it
 cargo run -- restore work@1
-
-# Preview replace mode, including applications that would be closed
-cargo run -- restore work@1 --replace --dry-run
-
-# Restore after closing unrelated running applications
-cargo run -- restore work@1 --replace
 
 # Diagnose the local installation/adapters
 cargo run -- doctor --verbose
@@ -45,7 +36,7 @@ After installing the binary, replace `cargo run --` with `capsule`.
 
 ## Save-time application exclusions
 
-`--ignore-app` is repeatable. An excluded application is deliberately left out of the capsule instead of becoming part of the target restore state.
+Applications can be excluded from a capsule with repeatable `--ignore-app` options:
 
 ```powershell
 capsule save work --ignore-app Zen
@@ -63,7 +54,7 @@ Exclusions are also applied to application-owned semantic state so an ignored ap
 - ignoring File Explorer suppresses folder-window restore state;
 - Docker/Compose resources remain independent of Docker Desktop, so ignoring Docker Desktop does not delete container/Compose state from the capsule.
 
-Resolved ignored application names are stored under `capture_options.ignored_applications` and are shown by `capsule show`.
+Resolved ignored application names are stored under `capture_options.ignored_applications` and are shown by `capsule show`. `capsule update <name>` inherits those exclusions into the next revision.
 
 ## Restore modes: append vs replace
 
@@ -82,17 +73,22 @@ capsule restore work --replace
 
 `--close-unrelated` is an alias for `--replace`.
 
-Replace mode first discovers the current user applications using the same desktop classifier used for capture. Applications whose strong identity belongs to the capsule are preserved; unrelated discovered user applications receive a normal Windows close request before the existing restore engine runs. Browser/editor/terminal semantic owners are also treated as capsule-owned when their semantic payload exists.
+Replace mode first discovers the current user applications using the same desktop classifier used for capture. Applications whose strong identity belongs to the capsule are preserved. Unrelated applications receive a normal Windows close request first; Context Capsule then re-discovers the desktop and force-terminates unrelated non-shell applications that are still alive. The final desktop is verified before the normal restore engine is allowed to start.
 
-Replace cleanup is intentionally fail-safe:
+Explorer is handled specially because File Explorer folder windows share the same `explorer.exe` process as the Windows desktop shell. Replace mode sends `WM_CLOSE` directly to unrelated Explorer folder windows while explicitly leaving the `Program Manager` shell window and `explorer.exe` process alive.
 
-- it never force-kills applications with `/F`;
-- if an application remains open because of an unsaved-work prompt or shutdown policy, it is reported and left running;
+Packaged/UWP applications whose user-facing window is owned by `ApplicationFrameHost.exe` are also included in replace cleanup. Context Capsule compares those visible surfaces with the capsule's saved ignored-window inventory, closes newly introduced surfaces with `WM_CLOSE`, and never kills the shared Application Frame Host process itself.
+
+Replace cleanup is intentionally strict:
+
 - the terminal/editor process chain hosting the active `capsule` command is always protected;
-- `explorer.exe` is never terminated as a cleanup side effect because it owns the Windows shell;
-- if Context Capsule cannot establish the replace cleanup inventory at all, restoration does not start, avoiding an accidental append when the user explicitly requested replace behavior.
+- Docker Desktop is preserved when the capsule contains Docker/Compose resources;
+- `explorer.exe` itself is never terminated as a cleanup side effect;
+- unrelated normal applications that ignore graceful shutdown are force-terminated because `--replace` explicitly requests a clean application set;
+- if an unrelated application or packaged-app window is still present after cleanup, replace mode fails and restoration does not continue as an accidental append;
+- if Context Capsule cannot establish or verify the cleanup inventory, restoration does not start.
 
-Use `--dry-run` with `--replace` to see cleanup counts without closing anything:
+`--replace` can therefore discard unsaved work in an unrelated application if that application refuses the initial graceful close. Use the dry run first when the current desktop may contain work you want to keep:
 
 ```powershell
 capsule restore work --replace --dry-run
@@ -190,11 +186,9 @@ The Firefox/Zen extension uses the native host for local semantic-state synchron
 
 ## Safety model
 
-Context Capsule restore is intentionally conservative:
+Context Capsule restore is intentionally conservative by default:
 
-- append/preserve is the default restore behavior;
-- replace cleanup is explicit and never force-kills an app that refuses a normal close;
-- reuse already-satisfied state instead of duplicating it;
+- append mode reuses already-satisfied state instead of duplicating it;
 - do not mutate a changed live Zen window just because it shares a few tabs;
 - do not guess ambiguous legacy terminal ownership;
 - preserve old capsule revisions instead of destructively overwriting them;
@@ -202,4 +196,4 @@ Context Capsule restore is intentionally conservative:
 - avoid replaying shell history as commands;
 - prefer partial restore plus warnings to arbitrary reconstruction.
 
-Use `--dry-run` before restoration when you want to inspect the plan first.
+Replace mode is the explicit exception: its purpose is to remove unrelated applications before restoring the capsule, and it may force-close an unrelated app after a graceful close attempt. Use `--replace --dry-run` before restoration when you want to inspect that cleanup plan first.
