@@ -18,6 +18,10 @@ pub mod restore_bus;
 pub mod vscode;
 
 #[cfg(windows)]
+#[path = "zen_shortcuts.rs"]
+pub(crate) mod zen_shortcuts_core;
+#[cfg(windows)]
+#[path = "zen_shortcuts_hardened.rs"]
 pub(crate) mod zen_shortcuts;
 
 #[cfg(windows)]
