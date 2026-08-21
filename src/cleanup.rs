@@ -95,53 +95,60 @@ fn file_name(value: &str) -> Option<&str> {
 }
 
 fn current_matches_saved(current: &ApplicationInfo, saved: &SavedApplication) -> bool {
-    let mut strong_identity = false;
+    let mut saved_has_strong_identity = false;
+    let mut observed_comparable_identity = false;
 
     if let Some(saved_aumid) = saved.app_user_model_id.as_deref() {
-        strong_identity = true;
-        if current
-            .app_user_model_id
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case(saved_aumid))
-        {
-            return true;
+        saved_has_strong_identity = true;
+        if let Some(current_aumid) = current.app_user_model_id.as_deref() {
+            observed_comparable_identity = true;
+            if current_aumid.eq_ignore_ascii_case(saved_aumid) {
+                return true;
+            }
         }
     }
 
     if let Some(saved_path) = saved.executable_path.as_deref() {
-        strong_identity = true;
-        if current.executable_path.as_deref().is_some_and(|value| {
-            normalized_path(value) == normalized_path(saved_path)
-        }) {
-            return true;
+        saved_has_strong_identity = true;
+        if let Some(current_path) = current.executable_path.as_deref() {
+            observed_comparable_identity = true;
+            if normalized_path(current_path) == normalized_path(saved_path) {
+                return true;
+            }
         }
     }
 
     if let Some(launch) = saved.launch.as_ref() {
         match launch.strategy.as_str() {
             "app-user-model-id" => {
-                strong_identity = true;
-                if current
-                    .app_user_model_id
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(&launch.target))
-                {
-                    return true;
+                saved_has_strong_identity = true;
+                if let Some(current_aumid) = current.app_user_model_id.as_deref() {
+                    observed_comparable_identity = true;
+                    if current_aumid.eq_ignore_ascii_case(&launch.target) {
+                        return true;
+                    }
                 }
             }
             "executable" => {
-                strong_identity = true;
-                if current.executable_path.as_deref().is_some_and(|value| {
-                    normalized_path(value) == normalized_path(&launch.target)
-                }) {
-                    return true;
+                saved_has_strong_identity = true;
+                if let Some(current_path) = current.executable_path.as_deref() {
+                    observed_comparable_identity = true;
+                    if normalized_path(current_path) == normalized_path(&launch.target) {
+                        return true;
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    !strong_identity && current.name.eq_ignore_ascii_case(&saved.name)
+    // A real comparable strong-identity mismatch is authoritative. If Windows
+    // could not expose the comparable metadata at all, however, fail safe to a
+    // name match instead of classifying a plausible capsule app as unrelated.
+    if saved_has_strong_identity && observed_comparable_identity {
+        return false;
+    }
+    current.name.eq_ignore_ascii_case(&saved.name)
 }
 
 fn current_executable_name(application: &ApplicationInfo) -> Option<&str> {
@@ -526,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_uses_same_strong_executable_identity_as_restore() {
+    fn cleanup_uses_strong_executable_identity_when_available() {
         let current = current("Editor", Some(r"C:\Apps\Editor.exe"), None);
         let saved = saved("Renamed Editor", Some(r"c:/apps/editor.exe"), None);
         assert!(current_matches_saved(&current, &saved));
@@ -537,6 +544,13 @@ mod tests {
         let current = current("Editor", Some(r"C:\Apps\Editor-v2.exe"), None);
         let saved = saved("Editor", Some(r"C:\Apps\Editor.exe"), None);
         assert!(!current_matches_saved(&current, &saved));
+    }
+
+    #[test]
+    fn missing_current_strong_metadata_fails_safe_to_name() {
+        let current = current("Editor", None, None);
+        let saved = saved("Editor", Some(r"C:\Apps\Editor.exe"), None);
+        assert!(current_matches_saved(&current, &saved));
     }
 
     #[test]
