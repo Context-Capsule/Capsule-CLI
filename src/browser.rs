@@ -96,6 +96,8 @@ struct NativeRequest {
     #[serde(default)]
     capsule_name: Option<String>,
     #[serde(default)]
+    split_orientation: Option<String>,
+    #[serde(default)]
     restore_request_id: Option<String>,
     #[serde(default)]
     restore_changed: Option<usize>,
@@ -327,6 +329,24 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
             logging::info("firefox", "native independent blank browser window requested");
             Ok(success_response("browser.window.blank.created"))
         }
+        "browser.zen.split.invoke" => {
+            let orientation = request
+                .split_orientation
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    BrowserError::Invalid(
+                        "browser.zen.split.invoke requires split_orientation".to_owned(),
+                    )
+                })?;
+            invoke_zen_split(orientation)?;
+            logging::info(
+                "firefox",
+                format!("native Zen split shortcut invoked; orientation={orientation}"),
+            );
+            Ok(success_response("browser.zen.split.invoked"))
+        }
         other => Err(BrowserError::Invalid(format!(
             "unknown native request type '{other}'"
         ))),
@@ -434,6 +454,18 @@ fn create_blank_browser_window() -> Result<(), BrowserError> {
 fn create_blank_browser_window() -> Result<(), BrowserError> {
     Err(BrowserError::Command(
         "Zen blank-window native fallback is currently implemented for Windows only".to_owned(),
+    ))
+}
+
+#[cfg(windows)]
+fn invoke_zen_split(orientation: &str) -> Result<(), BrowserError> {
+    crate::zen_shortcuts::invoke_split_shortcut(orientation).map_err(BrowserError::Command)
+}
+
+#[cfg(not(windows))]
+fn invoke_zen_split(_orientation: &str) -> Result<(), BrowserError> {
+    Err(BrowserError::Command(
+        "Zen split shortcut invocation is currently implemented for Windows only".to_owned(),
     ))
 }
 
