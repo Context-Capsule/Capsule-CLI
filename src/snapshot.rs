@@ -1,3 +1,8 @@
+#[path = "display_setup.rs"]
+mod display_setup;
+#[path = "terminal_context.rs"]
+mod terminal_context;
+
 use crate::{
     adapters::terminal::{TerminalHost, TerminalSnapshot},
     desktop::{ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate, Rect, WindowInfo},
@@ -96,7 +101,6 @@ pub fn capture_snapshot_with_options(
         .unwrap_or_default();
 
     let docker = serde_json::to_value(&discovery.docker)?;
-    let terminals = serde_json::to_value(filtered_terminal_snapshot(&discovery.terminals, &ignored))?;
     let explorer = if ignored.iter().any(|application| is_explorer(application)) {
         json!({
             "schema_version": 1,
@@ -134,6 +138,13 @@ pub fn capture_snapshot_with_options(
             .map(serde_json::to_value)
             .transpose()?
     };
+
+    let filtered_terminals = filtered_terminal_snapshot(&discovery.terminals, &ignored);
+    let prepared_terminals =
+        terminal_context::prepare_for_capture(&filtered_terminals, vscode.is_some());
+    let terminals = serde_json::to_value(&prepared_terminals)?;
+    let display_setup = display_setup::capture(&discovery.desktop);
+
     let ignored_names = ignored
         .iter()
         .map(|application| application.name.clone())
@@ -157,6 +168,7 @@ pub fn capture_snapshot_with_options(
             "value": hint.value,
         })).collect::<Vec<_>>(),
         "desktop": desktop_value(&discovery.desktop, options),
+        "display_setup": display_setup,
         "explorer": explorer,
         "docker": docker,
         "terminals": terminals,
@@ -470,6 +482,8 @@ mod tests {
         assert_eq!(stored.snapshot["terminals"]["status"], "not-requested");
         assert_eq!(stored.snapshot["terminals"]["history"]["captured"], false);
         assert_eq!(stored.snapshot["git"]["status"], "not-repository");
+        assert_eq!(stored.snapshot["display_setup"]["status"], "available");
+        assert_eq!(stored.snapshot["display_setup"]["display_count"], 0);
         assert!(stored.snapshot.get("explorer").is_some());
         assert!(stored.snapshot.pointer("/browsers/firefox").is_some());
         assert!(stored.snapshot.pointer("/editors/vscode").is_some());
