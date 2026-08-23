@@ -9,11 +9,22 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  statuses: write
+
 jobs:
   check:
-    runs-on: [self-hosted, Windows, X64, POTUS]
+    runs-on: [self-hosted, Windows, X64]
 
     steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') {
+            throw "Expected self-hosted runner POTUS, got '${{ runner.name }}'"
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -136,10 +147,32 @@ jobs:
             }
           }
 
+      - name: Publish Rust check status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{
+            state = $state
+            context = 'ci/potus-rust-check'
+            description = "POTUS Rust check: $($env:JOB_STATUS)"
+          } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
+
   windows-discovery:
-    runs-on: [self-hosted, Windows, X64, POTUS]
+    runs-on: [self-hosted, Windows, X64]
 
     steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') {
+            throw "Expected self-hosted runner POTUS, got '${{ runner.name }}'"
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -243,12 +276,34 @@ jobs:
       - name: Compatibility apps command
         run: cargo run -- apps
 
+      - name: Publish Windows discovery status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{
+            state = $state
+            context = 'ci/potus-windows-discovery'
+            description = "POTUS Windows discovery: $($env:JOB_STATUS)"
+          } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
+
   docker-integration:
-    runs-on: [self-hosted, Windows, X64, POTUS]
+    runs-on: [self-hosted, Windows, X64]
     env:
       CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-docker.db
 
     steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') {
+            throw "Expected self-hosted runner POTUS, got '${{ runner.name }}'"
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -335,3 +390,18 @@ jobs:
           finally {
             docker compose -f $composePath -p capsule-compose-ci down --remove-orphans 2>$null | Out-Null
           }
+
+      - name: Publish Docker integration status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{
+            state = $state
+            context = 'ci/potus-docker-integration'
+            description = "POTUS Docker integration: $($env:JOB_STATUS)"
+          } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
