@@ -36,24 +36,58 @@ jobs:
         shell: bash
         run: cargo fmt --all
 
+      - name: Make Windows self-hosted jobs compatible with Windows PowerShell
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow_paths = [
+              Path('.github/workflows/rust.yml'),
+              Path('.github/workflows/restore-engine.yml'),
+              Path('.github/workflows/firefox-native-host.yml'),
+              Path('.github/workflows/chrome-native-host.yml'),
+              Path('.github/workflows/zen-native-messaging-e2e.yml'),
+          ]
+
+          for path in workflow_paths:
+              text = path.read_text(encoding='utf-8')
+              text = text.replace('shell: pwsh', 'shell: powershell')
+              marker = '    runs-on: [self-hosted, Windows, X64]\n'
+              replacement = (
+                  marker
+                  + '    defaults:\n'
+                  + '      run:\n'
+                  + '        shell: powershell\n'
+              )
+              if marker in text and '        shell: powershell\n    steps:' not in text:
+                  text = text.replace(marker, replacement)
+              path.write_text(text, encoding='utf-8')
+          PY
+
       - name: Verify formatting result
         shell: bash
         run: cargo fmt --all -- --check
 
-      - name: Commit formatting if needed
+      - name: Commit mechanical fixes if needed
         shell: bash
         run: |
           set -euo pipefail
           if git diff --quiet; then
-            echo 'Rust sources are already formatted.'
+            echo 'Sources and workflows are already normalized.'
             exit 0
           fi
 
-          echo 'Files changed by rustfmt:'
+          echo 'Mechanical changes:'
           git diff --name-only
           git diff --check
           git config user.name 'Context Capsule CI'
           git config user.email 'actions@users.noreply.github.com'
-          git add src tests
-          git commit -m 'style: apply cargo fmt'
+          git add src tests \
+            .github/workflows/rust.yml \
+            .github/workflows/restore-engine.yml \
+            .github/workflows/firefox-native-host.yml \
+            .github/workflows/chrome-native-host.yml \
+            .github/workflows/zen-native-messaging-e2e.yml
+          git commit -m 'style: apply rustfmt and Windows CI shell compatibility'
           git push origin "HEAD:${GITHUB_REF_NAME}"
