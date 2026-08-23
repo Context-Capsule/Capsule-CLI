@@ -6,7 +6,7 @@ use crate::{
             TerminalSnapshot, TerminalStatus,
         },
     },
-    restore_bus,
+    restore_bus, terminal_context,
 };
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
@@ -331,7 +331,7 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
         return;
     }
 
-    let current = terminal::discover();
+    let current = terminal_context::enrich_for_matching(&terminal::discover());
     let mut used = HashSet::new();
     let mut missing: Vec<(TerminalSession, RestartPlan)> = Vec::new();
     let mut cursor_warning_added = false;
@@ -531,7 +531,7 @@ fn paths_equivalent(left: &str, right: &str) -> bool {
 
 #[cfg(windows)]
 fn matching_terminal_count(saved: &TerminalSession) -> usize {
-    terminal::discover()
+    terminal_context::enrich_for_matching(&terminal::discover())
         .sessions
         .iter()
         .filter(|current| terminal_session_matches(saved, current))
@@ -551,7 +551,7 @@ fn wait_for_terminal_launch(
         needs_fresh_console_window(saved, plan) && direct_shell_process(&plan.executable);
 
     loop {
-        let current = terminal::discover();
+        let current = terminal_context::enrich_for_matching(&terminal::discover());
         if direct_shell {
             if current.sessions.iter().any(|session| {
                 session.pid == Some(spawned_pid) && launched_session_matches(saved, session)
