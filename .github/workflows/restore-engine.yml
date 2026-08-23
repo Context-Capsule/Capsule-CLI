@@ -5,11 +5,15 @@ on:
     branches:
       - main
       - 'agent/**'
+      - 'feature/**'
     paths:
       - 'src/restore/**'
       - 'src/commands.rs'
       - 'src/main.rs'
       - 'src/lib.rs'
+      - 'src/snapshot.rs'
+      - 'src/terminal_context.rs'
+      - 'src/display_setup.rs'
       - 'tests/restore_geometry.rs'
       - 'tests/restore_snapshot_schema.rs'
       - 'tests/restore_windows_process.rs'
@@ -20,58 +24,76 @@ on:
       - 'src/commands.rs'
       - 'src/main.rs'
       - 'src/lib.rs'
+      - 'src/snapshot.rs'
+      - 'src/terminal_context.rs'
+      - 'src/display_setup.rs'
       - 'tests/restore_geometry.rs'
       - 'tests/restore_snapshot_schema.rs'
       - 'tests/restore_windows_process.rs'
       - '.github/workflows/restore-engine.yml'
+  workflow_dispatch:
 
 jobs:
   validate:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, Windows, X64, POTUS]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
       - name: Format
         run: cargo fmt --all -- --check
+
       - name: Check all targets
         run: cargo check --all-targets
+
       - name: Restore unit tests
         run: cargo test restore
+
+      - name: Terminal ownership and CWD regression tests
+        run: cargo test terminal_context::tests -- --nocapture
+
+      - name: Display topology regression tests
+        run: cargo test display_setup::tests -- --nocapture
+
       - name: Restore geometry integration tests
         run: cargo test --test restore_geometry
+
       - name: Persisted restore schema tests
         run: cargo test --test restore_snapshot_schema
+
       - name: Windows already-running process idempotence
-        if: runner.os == 'Windows'
         run: cargo test --test restore_windows_process
+
       - name: CLI restore parser tests
         run: cargo test restore_parser
+
       - name: Build capsule
         run: cargo build --bin capsule
 
-      - name: Safe save -> restore dry-run lifecycle (Windows)
-        if: runner.os == 'Windows'
+      - name: Safe save -> restore dry-run lifecycle
         shell: pwsh
         env:
           CONTEXT_CAPSULE_DB: ${{ runner.temp }}\restore-engine.db
         run: |
-          cargo run --quiet -- save restore-engine-ci
+          Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
+
+          $saveOutput = cargo run --quiet -- save restore-engine-ci | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'save failed' }
+          if ($saveOutput -match '(?m)^\s*Docker:') {
+            throw 'save emitted the Docker-unavailable warning that should be suppressed'
+          }
+
+          $jsonText = cargo run --quiet -- show restore-engine-ci --json | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'show --json failed' }
+          $stored = $jsonText | ConvertFrom-Json
+          if (-not $stored.snapshot.display_setup) {
+            throw 'saved capsule is missing display_setup'
+          }
+          if ($stored.snapshot.display_setup.schema_version -ne 1) {
+            throw 'display_setup schema version mismatch'
+          }
+
           cargo run --quiet -- restore restore-engine-ci --dry-run
           if ($LASTEXITCODE -ne 0) { throw 'restore dry run failed' }
-
-      - name: Safe save -> restore dry-run lifecycle (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        env:
-          CONTEXT_CAPSULE_DB: ${{ runner.temp }}/restore-engine.db
-        run: |
-          set -euo pipefail
-          cargo run --quiet -- save restore-engine-ci
-          cargo run --quiet -- restore restore-engine-ci --dry-run
