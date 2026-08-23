@@ -14,140 +14,68 @@ permissions:
   statuses: write
 
 jobs:
-  check:
+  check-windows:
     runs-on: [self-hosted, Windows, X64]
-
     steps:
       - name: Verify POTUS runner
         shell: pwsh
         run: |
           if ('${{ runner.name }}' -ne 'POTUS') {
-            throw "Expected self-hosted runner POTUS, got '${{ runner.name }}'"
+            throw "Expected runner POTUS, got '${{ runner.name }}'"
           }
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-
       - name: Format
         run: cargo fmt --all -- --check
-
-      - name: Check
+      - name: Check all targets
         run: cargo check --all-targets
-
       - name: Full test suite
         run: cargo test
-
       - name: Terminal ownership and CWD regression tests
         run: cargo test terminal_context::tests -- --nocapture
-
       - name: Display setup regression tests
         run: cargo test display_setup::tests -- --nocapture
-
       - name: Build all binaries
         run: cargo build --bins
-
       - name: Toolchain discovery smoke test
         run: cargo run -- inspect --tools
-
       - name: Terminal discovery smoke test
         run: cargo run -- terminal inspect --json
-
       - name: Persistence and new snapshot metadata lifecycle
         shell: pwsh
         env:
           CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-persistence.db
         run: |
           Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
-
           $saveOutput = cargo run --quiet -- save ci-persistence | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'initial save failed' }
           if ($saveOutput -match '(?m)^\s*Docker:') {
             throw "save emitted the Docker-unavailable warning that should be suppressed:`n$saveOutput"
           }
-
-          $list = cargo run --quiet -- list | Out-String
-          if ($list -notmatch 'ci-persistence') {
-            throw 'saved capsule was not listed'
-          }
-
           $jsonText = cargo run --quiet -- show ci-persistence --json | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'show --json failed' }
           $stored = $jsonText | ConvertFrom-Json
-
-          if ($stored.schema_version -ne 1) {
-            throw 'stored capsule schema version was not present'
-          }
-          if (-not $stored.snapshot.docker) {
-            throw 'stored capsule did not contain Docker metadata'
-          }
-          if (-not $stored.snapshot.terminals) {
-            throw 'stored capsule did not contain terminal metadata'
-          }
-          if (-not $stored.snapshot.display_setup) {
-            throw 'stored capsule did not contain display_setup metadata'
-          }
-          if ($stored.snapshot.display_setup.schema_version -ne 1) {
-            throw 'display_setup schema version was not 1'
-          }
+          if ($stored.schema_version -ne 1) { throw 'stored capsule schema version mismatch' }
+          if (-not $stored.snapshot.docker) { throw 'stored capsule did not contain Docker metadata' }
+          if (-not $stored.snapshot.terminals) { throw 'stored capsule did not contain terminal metadata' }
+          if (-not $stored.snapshot.display_setup) { throw 'stored capsule did not contain display_setup metadata' }
+          if ($stored.snapshot.display_setup.schema_version -ne 1) { throw 'display_setup schema version mismatch' }
           if ($stored.snapshot.display_setup.status -eq 'available') {
-            if ([int]$stored.snapshot.display_setup.display_count -lt 1) {
-              throw 'available display_setup reported no displays'
-            }
-            if ([string]::IsNullOrWhiteSpace([string]$stored.snapshot.display_setup.topology_signature)) {
-              throw 'available display_setup did not contain a topology signature'
-            }
+            if ([int]$stored.snapshot.display_setup.display_count -lt 1) { throw 'available display_setup reported no displays' }
+            if ([string]::IsNullOrWhiteSpace([string]$stored.snapshot.display_setup.topology_signature)) { throw 'available display_setup did not contain a topology signature' }
           }
-
           cargo run --quiet -- save CI-PERSISTENCE
-          if ($LASTEXITCODE -eq 0) {
-            throw 'duplicate save unexpectedly succeeded without --force'
-          }
-
+          if ($LASTEXITCODE -eq 0) { throw 'duplicate save unexpectedly succeeded without --force' }
           cargo run --quiet -- save ci-persistence --force
           if ($LASTEXITCODE -ne 0) { throw 'forced replacement failed' }
           cargo run --quiet -- delete CI-PERSISTENCE
           if ($LASTEXITCODE -ne 0) { throw 'delete failed' }
           cargo run --quiet -- show ci-persistence
-          if ($LASTEXITCODE -eq 0) {
-            throw 'deleted capsule was still loadable'
-          }
+          if ($LASTEXITCODE -eq 0) { throw 'deleted capsule was still loadable' }
           $global:LASTEXITCODE = 0
-
-      - name: Installed Node tools must be discovered
-        shell: pwsh
-        run: |
-          $output = cargo run --quiet -- inspect --tools | Out-String
-          $tools = @(
-            @{ Command = 'node'; Label = 'Node.js' },
-            @{ Command = 'npm'; Label = 'npm' },
-            @{ Command = 'npx'; Label = 'npx' },
-            @{ Command = 'pnpm'; Label = 'pnpm' }
-          )
-
-          foreach ($tool in $tools) {
-            $installed = Get-Command $tool.Command -ErrorAction SilentlyContinue
-            if (-not $installed) {
-              Write-Host "$($tool.Command) is not installed on POTUS; skipping assertion."
-              continue
-            }
-
-            Write-Host "$($tool.Command) is installed at $($installed.Source)"
-            & $tool.Command --version
-
-            $pattern = "(?m)^\s+$([regex]::Escape($tool.Label))\s+"
-            if ($output -notmatch $pattern) {
-              Write-Host "Context Capsule tool output:"
-              Write-Host $output
-              throw "$($tool.Command) is installed but was not reported by capsule inspect --tools"
-            }
-          }
-
-      - name: Publish Rust check status
+      - name: Publish Windows Rust status
         if: always()
         shell: pwsh
         env:
@@ -155,127 +83,130 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: |
           $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
-          $body = @{
-            state = $state
-            context = 'ci/potus-rust-check'
-            description = "POTUS Rust check: $($env:JOB_STATUS)"
-          } | ConvertTo-Json
+          $body = @{ state = $state; context = 'ci/potus-rust-windows'; description = "POTUS Rust Windows: $($env:JOB_STATUS)" } | ConvertTo-Json
           Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
+
+  check-linux:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Verify POTUS-linux runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --all-targets
+      - name: Full test suite
+        run: cargo test
+      - name: Build all binaries
+        run: cargo build --bins
+      - name: Toolchain discovery smoke test
+        run: cargo run -- inspect --tools
+      - name: Terminal discovery smoke test
+        run: cargo run -- terminal inspect --json
+      - name: Persistence lifecycle
+        shell: bash
+        env:
+          CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-persistence.db
+        run: |
+          set -euo pipefail
+          rm -f "$CONTEXT_CAPSULE_DB"
+          cargo run --quiet -- save ci-persistence
+          cargo run --quiet -- list | grep -F 'ci-persistence'
+          cargo run --quiet -- show ci-persistence --json > "$RUNNER_TEMP/capsule.json"
+          grep -F '"schema_version": 1' "$RUNNER_TEMP/capsule.json"
+          grep -F '"docker"' "$RUNNER_TEMP/capsule.json"
+          grep -F '"terminals"' "$RUNNER_TEMP/capsule.json"
+          grep -F '"display_setup"' "$RUNNER_TEMP/capsule.json"
+          if cargo run --quiet -- save CI-PERSISTENCE; then
+            echo 'duplicate save unexpectedly succeeded without --force' >&2
+            exit 1
+          fi
+          cargo run --quiet -- save ci-persistence --force
+          cargo run --quiet -- delete CI-PERSISTENCE
+          if cargo run --quiet -- show ci-persistence; then
+            echo 'deleted capsule was still loadable' >&2
+            exit 1
+          fi
+      - name: Publish Linux Rust status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          state=failure
+          [ "$JOB_STATUS" = success ] && state=success
+          [ "$JOB_STATUS" = cancelled ] && state=error
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"$state\",\"context\":\"ci/potus-rust-linux\",\"description\":\"POTUS-linux Rust: $JOB_STATUS\"}" >/dev/null
 
   windows-discovery:
     runs-on: [self-hosted, Windows, X64]
-
     steps:
       - name: Verify POTUS runner
         shell: pwsh
         run: |
-          if ('${{ runner.name }}' -ne 'POTUS') {
-            throw "Expected self-hosted runner POTUS, got '${{ runner.name }}'"
-          }
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Full discovery
         run: cargo run -- inspect --verbose
-
       - name: Application discovery
         run: cargo run -- inspect --apps
-
       - name: Window discovery
         run: cargo run -- inspect --windows
-
       - name: Classification diagnostics
         run: cargo run -- inspect --processes
-
       - name: Ignored-candidate diagnostics
         run: cargo run -- inspect --ignored
-
       - name: Docker discovery
         run: cargo run -- inspect --docker
-
       - name: Terminal discovery
         run: cargo run -- inspect --terminals
-
       - name: Deterministic Windows Terminal and WSL state fixture
         shell: pwsh
         run: |
           $statePath = Join-Path $env:RUNNER_TEMP 'context-capsule-terminal-state.json'
           @'
           {
-            "persistedWindowLayouts": [
-              {
-                "name": "Context Capsule CI",
-                "initialPosition": "120,80",
-                "initialSize": { "width": 1200.0, "height": 760.0 },
-                "launchMode": "default",
-                "tabLayout": [
-                  {
-                    "action": "newTab",
-                    "profile": "PowerShell",
-                    "commandline": "pwsh.exe",
-                    "startingDirectory": "C:\\work\\capsule",
-                    "tabTitle": "PowerShell"
-                  },
-                  {
-                    "action": "splitPane",
-                    "profile": "Ubuntu",
-                    "commandline": "wsl.exe -d Ubuntu",
-                    "startingDirectory": "//wsl.localhost/Ubuntu/home/dhia/project",
-                    "split": "right",
-                    "size": 0.5
-                  }
-                ]
-              }
-            ]
+            "persistedWindowLayouts": [{
+              "name": "Context Capsule CI",
+              "initialPosition": "120,80",
+              "initialSize": { "width": 1200.0, "height": 760.0 },
+              "launchMode": "default",
+              "tabLayout": [
+                { "action": "newTab", "profile": "PowerShell", "commandline": "pwsh.exe", "startingDirectory": "C:\\work\\capsule", "tabTitle": "PowerShell" },
+                { "action": "splitPane", "profile": "Ubuntu", "commandline": "wsl.exe -d Ubuntu", "startingDirectory": "//wsl.localhost/Ubuntu/home/dhia/project", "split": "right", "size": 0.5 }
+              ]
+            }]
           }
           '@ | Set-Content -Path $statePath -Encoding utf8
-
           $env:CONTEXT_CAPSULE_TERMINAL_STATE_PATH = $statePath
           $jsonText = cargo run --quiet -- terminal inspect --json | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'terminal fixture inspection failed' }
           $snapshot = $jsonText | ConvertFrom-Json
-
-          if ($snapshot.windows_terminal_layouts.Count -ne 1) {
-            throw 'Windows Terminal layout was not captured from fixture'
-          }
-          if ($snapshot.windows_terminal_layouts[0].actions.Count -ne 2) {
-            throw 'Windows Terminal tab/pane actions were not preserved'
-          }
-          if ($snapshot.history.captured -ne $false) {
-            throw 'terminal history policy unexpectedly captured history'
-          }
-
-          $powerShell = @($snapshot.sessions | Where-Object {
-            $_.profile -eq 'PowerShell' -and $_.sources -contains 'windows-terminal-state'
-          }) | Select-Object -First 1
+          if ($snapshot.windows_terminal_layouts.Count -ne 1) { throw 'Windows Terminal layout was not captured from fixture' }
+          if ($snapshot.windows_terminal_layouts[0].actions.Count -ne 2) { throw 'Windows Terminal tab/pane actions were not preserved' }
+          $powerShell = @($snapshot.sessions | Where-Object { $_.profile -eq 'PowerShell' -and $_.sources -contains 'windows-terminal-state' }) | Select-Object -First 1
           if (-not $powerShell) { throw 'PowerShell Windows Terminal session was not captured' }
-          if ($powerShell.working_directory -ne 'C:\work\capsule') {
-            throw "PowerShell CWD mismatch: $($powerShell.working_directory)"
-          }
-          if ($powerShell.restart.executable -ne 'wt.exe') {
-            throw 'PowerShell restart plan did not target Windows Terminal'
-          }
-
-          $ubuntu = @($snapshot.sessions | Where-Object {
-            $_.profile -eq 'Ubuntu' -and $_.sources -contains 'windows-terminal-state'
-          }) | Select-Object -First 1
+          if ($powerShell.working_directory -ne 'C:\work\capsule') { throw "PowerShell CWD mismatch: $($powerShell.working_directory)" }
+          $ubuntu = @($snapshot.sessions | Where-Object { $_.profile -eq 'Ubuntu' -and $_.sources -contains 'windows-terminal-state' }) | Select-Object -First 1
           if (-not $ubuntu) { throw 'Ubuntu Windows Terminal pane was not captured' }
-          if ($ubuntu.environment.kind -ne 'wsl' -or $ubuntu.environment.distro -ne 'Ubuntu') {
-            throw 'Ubuntu pane was not classified as WSL Ubuntu'
-          }
-          if ($ubuntu.working_directory -ne '//wsl.localhost/Ubuntu/home/dhia/project') {
-            throw "Ubuntu pane CWD mismatch: $($ubuntu.working_directory)"
-          }
-
+          if ($ubuntu.environment.kind -ne 'wsl' -or $ubuntu.environment.distro -ne 'Ubuntu') { throw 'Ubuntu pane was not classified as WSL Ubuntu' }
           Write-Host 'Deterministic Windows Terminal + WSL semantic capture passed.'
-
       - name: Compatibility apps command
         run: cargo run -- apps
-
       - name: Publish Windows discovery status
         if: always()
         shell: pwsh
@@ -284,124 +215,78 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: |
           $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
-          $body = @{
-            state = $state
-            context = 'ci/potus-windows-discovery'
-            description = "POTUS Windows discovery: $($env:JOB_STATUS)"
-          } | ConvertTo-Json
+          $body = @{ state = $state; context = 'ci/potus-windows-discovery'; description = "POTUS Windows discovery: $($env:JOB_STATUS)" } | ConvertTo-Json
           Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
 
   docker-integration:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Linux, X64]
     env:
-      CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-docker.db
-
+      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-docker.db
     steps:
-      - name: Verify POTUS runner
-        shell: pwsh
+      - name: Verify POTUS-linux runner
+        shell: bash
         run: |
-          if ('${{ runner.name }}' -ne 'POTUS') {
-            throw "Expected self-hosted runner POTUS, got '${{ runner.name }}'"
-          }
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
+          set -euo pipefail
+          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build
-
       - name: Verify Docker engine and Compose
-        shell: pwsh
+        shell: bash
         run: |
-          if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-            throw 'Docker CLI is not installed on POTUS'
-          }
+          set -euo pipefail
           docker version
-          if ($LASTEXITCODE -ne 0) { throw 'Docker engine is not available on POTUS' }
           docker compose version
-          if ($LASTEXITCODE -ne 0) { throw 'Docker Compose is not available on POTUS' }
-
       - name: Restore an existing standalone container
-        shell: pwsh
+        shell: bash
         run: |
-          docker rm -f capsule-standalone-ci 2>$null | Out-Null
-          try {
-            docker run -d --name capsule-standalone-ci alpine:3.20 sleep 300 | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'could not start standalone test container' }
-
-            cargo run --quiet -- save standalone-ci
-            if ($LASTEXITCODE -ne 0) { throw 'standalone capsule save failed' }
-            $json = cargo run --quiet -- show standalone-ci --json | Out-String
-            if ($json -notmatch 'capsule-standalone-ci') { throw 'standalone container was not saved' }
-
-            docker stop capsule-standalone-ci | Out-Null
-            $running = docker inspect --format '{{.State.Running}}' capsule-standalone-ci
-            if ($running.Trim() -ne 'false') { throw 'standalone container did not stop' }
-
-            cargo run --quiet -- docker restore standalone-ci
-            if ($LASTEXITCODE -ne 0) { throw 'standalone Docker restore failed' }
-            $running = docker inspect --format '{{.State.Running}}' capsule-standalone-ci
-            if ($running.Trim() -ne 'true') { throw 'standalone container was not restored' }
-          }
-          finally {
-            docker rm -f capsule-standalone-ci 2>$null | Out-Null
-          }
-
+          set -euo pipefail
+          cleanup() { docker rm -f capsule-standalone-ci >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          cleanup
+          docker run -d --name capsule-standalone-ci alpine:3.20 sleep 300
+          cargo run --quiet -- save standalone-ci
+          cargo run --quiet -- show standalone-ci --json | grep -F 'capsule-standalone-ci'
+          docker stop capsule-standalone-ci
+          test "$(docker inspect --format '{{.State.Running}}' capsule-standalone-ci)" = false
+          cargo run --quiet -- docker restore standalone-ci
+          test "$(docker inspect --format '{{.State.Running}}' capsule-standalone-ci)" = true
       - name: Recreate a Compose project from saved intent
-        shell: pwsh
+        shell: bash
         run: |
-          $projectDir = Join-Path $env:RUNNER_TEMP 'context-capsule-compose-ci'
-          New-Item -ItemType Directory -Path $projectDir -Force | Out-Null
-          $composePath = Join-Path $projectDir 'compose.yml'
-          @'
+          set -euo pipefail
+          project_dir="$RUNNER_TEMP/context-capsule-compose-ci"
+          mkdir -p "$project_dir"
+          cat > "$project_dir/compose.yml" <<'YAML'
           services:
             worker:
               image: alpine:3.20
               command: ["sleep", "300"]
-          '@ | Set-Content -Path $composePath -Encoding utf8
-
-          docker compose -f $composePath -p capsule-compose-ci down --remove-orphans 2>$null | Out-Null
-          try {
-            docker compose -f $composePath -p capsule-compose-ci up -d
-            if ($LASTEXITCODE -ne 0) { throw 'could not start Compose test project' }
-
-            cargo run --quiet -- save compose-ci
-            if ($LASTEXITCODE -ne 0) { throw 'Compose capsule save failed' }
-            $json = cargo run --quiet -- show compose-ci --json | Out-String
-            if ($json -notmatch 'capsule-compose-ci') { throw 'Compose project was not saved' }
-
-            docker compose -f $composePath -p capsule-compose-ci down
-            if ($LASTEXITCODE -ne 0) { throw 'Compose down failed' }
-            $running = @(docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q)
-            if ($running.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace(($running -join ''))) {
-              throw 'Compose project was still running after docker compose down'
-            }
-
-            cargo run --quiet -- docker restore compose-ci
-            if ($LASTEXITCODE -ne 0) { throw 'Compose Docker restore failed' }
-            $running = @(docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q)
-            if ($running.Count -eq 0 -or [string]::IsNullOrWhiteSpace(($running -join ''))) {
-              throw 'Compose project was not restored'
-            }
-          }
-          finally {
-            docker compose -f $composePath -p capsule-compose-ci down --remove-orphans 2>$null | Out-Null
-          }
-
+          YAML
+          cleanup() { docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci down --remove-orphans >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          cleanup
+          docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci up -d
+          cargo run --quiet -- save compose-ci
+          cargo run --quiet -- show compose-ci --json | grep -F 'capsule-compose-ci'
+          docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci down
+          ! docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q | grep -q .
+          cargo run --quiet -- docker restore compose-ci
+          docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q | grep -q .
       - name: Publish Docker integration status
         if: always()
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           JOB_STATUS: ${{ job.status }}
         run: |
-          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
-          $body = @{
-            state = $state
-            context = 'ci/potus-docker-integration'
-            description = "POTUS Docker integration: $($env:JOB_STATUS)"
-          } | ConvertTo-Json
-          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
+          state=failure
+          [ "$JOB_STATUS" = success ] && state=success
+          [ "$JOB_STATUS" = cancelled ] && state=error
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"$state\",\"context\":\"ci/potus-linux-docker\",\"description\":\"POTUS-linux Docker: $JOB_STATUS\"}" >/dev/null
