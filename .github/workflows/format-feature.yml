@@ -15,79 +15,76 @@ concurrency:
 
 jobs:
   rustfmt:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Windows, X64]
+    defaults:
+      run:
+        shell: powershell
     steps:
-      - name: Verify POTUS-linux runner
-        shell: bash
+      - name: Verify POTUS runner and Rust tools
         run: |
-          set -euo pipefail
-          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+          Get-Command cargo -ErrorAction Stop | Format-List Source
+          Get-Command rustup -ErrorAction Stop | Format-List Source
+          rustup component add rustfmt
+          if ($LASTEXITCODE -ne 0) { throw 'could not install/enable rustfmt' }
 
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
       - name: Apply canonical Rust formatting
-        shell: bash
-        run: cargo fmt --all
+        run: |
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
 
       - name: Make Windows self-hosted jobs compatible with Windows PowerShell
-        shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          $workflowPaths = @(
+            '.github/workflows/rust.yml',
+            '.github/workflows/restore-engine.yml',
+            '.github/workflows/firefox-native-host.yml',
+            '.github/workflows/chrome-native-host.yml',
+            '.github/workflows/zen-native-messaging-e2e.yml'
+          )
 
-          workflow_paths = [
-              Path('.github/workflows/rust.yml'),
-              Path('.github/workflows/restore-engine.yml'),
-              Path('.github/workflows/firefox-native-host.yml'),
-              Path('.github/workflows/chrome-native-host.yml'),
-              Path('.github/workflows/zen-native-messaging-e2e.yml'),
-          ]
-
-          for path in workflow_paths:
-              text = path.read_text(encoding='utf-8')
-              text = text.replace('shell: pwsh', 'shell: powershell')
-              marker = '    runs-on: [self-hosted, Windows, X64]\n'
-              replacement = (
-                  marker
-                  + '    defaults:\n'
-                  + '      run:\n'
-                  + '        shell: powershell\n'
-              )
-              if marker in text and '        shell: powershell\n    steps:' not in text:
-                  text = text.replace(marker, replacement)
-              path.write_text(text, encoding='utf-8')
-          PY
+          foreach ($path in $workflowPaths) {
+            $text = Get-Content $path -Raw
+            $text = $text.Replace('shell: pwsh', 'shell: powershell')
+            $marker = "    runs-on: [self-hosted, Windows, X64]`n"
+            if (-not $text.Contains($marker)) {
+              $marker = "    runs-on: [self-hosted, Windows, X64]`r`n"
+            }
+            if ($text.Contains($marker)) {
+              $newline = if ($marker.Contains("`r`n")) { "`r`n" } else { "`n" }
+              $replacement = $marker + "    defaults:$newline      run:$newline        shell: powershell$newline"
+              $text = $text.Replace($marker, $replacement)
+            }
+            Set-Content -Path $path -Value $text -Encoding utf8
+          }
 
       - name: Verify formatting result
-        shell: bash
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'repository is still not rustfmt-clean' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'mechanical edits introduced whitespace errors' }
 
       - name: Commit mechanical fixes if needed
-        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          if git diff --quiet; then
-            echo 'Sources and workflows are already normalized.'
+          git status --short
+          git diff --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'Sources and workflows are already normalized.'
             exit 0
-          fi
-
-          echo 'Mechanical changes:'
-          git diff --name-only
-          git diff --check
+          }
+          $global:LASTEXITCODE = 0
           git config user.name 'Context Capsule CI'
           git config user.email 'actions@users.noreply.github.com'
-          git add src tests \
-            .github/workflows/rust.yml \
-            .github/workflows/restore-engine.yml \
-            .github/workflows/firefox-native-host.yml \
-            .github/workflows/chrome-native-host.yml \
-            .github/workflows/zen-native-messaging-e2e.yml
+          git add src tests .github/workflows/rust.yml .github/workflows/restore-engine.yml .github/workflows/firefox-native-host.yml .github/workflows/chrome-native-host.yml .github/workflows/zen-native-messaging-e2e.yml
           git commit -m 'style: apply rustfmt and Windows CI shell compatibility'
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          if ($LASTEXITCODE -ne 0) { throw 'format commit failed' }
+          git push origin "HEAD:${env:GITHUB_REF_NAME}"
+          if ($LASTEXITCODE -ne 0) { throw 'format commit push failed' }
