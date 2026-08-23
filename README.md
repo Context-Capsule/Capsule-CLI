@@ -115,6 +115,54 @@ Exclusions are also applied to application-owned semantic state so an ignored ap
 
 Resolved ignored application names are stored under `capture_options.ignored_applications` and are shown by `capsule show`. `capsule update <name>` inherits those exclusions into the next revision.
 
+## Terminal ownership and working directories
+
+The shell process hosting the active `capsule save` or `capsule update` command is capture infrastructure, not workspace state. On Windows, Context Capsule walks the current command's process ancestry and removes that hosting shell from the generic terminal snapshot before it is stored. This applies even when the shell is exposed through an intermediate console/PTTY host.
+
+VS Code integrated terminals are owned by the VS Code semantic adapter. When a recent VS Code semantic snapshot is available, generic process-derived VS Code terminal entries are not stored as independent restart plans; the editor snapshot retains the integrated terminal name, shell, arguments, active state and CWD. This prevents the terminal used to invoke Context Capsule from reappearing as a second standalone console during restore.
+
+For standalone Windows shells such as `cmd.exe`, PowerShell and `pwsh`, Context Capsule attempts a bounded read of the live process current directory. If Windows permits the query, the path is stored both as the terminal's `working_directory` and as `restart.working_directory`. Restore already launches direct shell restart plans with `Command::current_dir`, so the shell is recreated in the saved directory rather than the platform default directory.
+
+The process-CWD probe is fail-open: permission, bitness or process-lifetime failures leave the CWD unknown instead of failing the capsule save. Restore-time terminal matching uses the same CWD enrichment, so an already-open shell in the correct directory is reused while a same-type shell in a different directory does not incorrectly satisfy the saved session.
+
+Capsules saved before this behavior cannot retroactively recover a standalone shell CWD that was never stored; save or update the capsule with a current build to capture it.
+
+## Saved display setup
+
+Every new save/update now stores a versioned `display_setup` snapshot in addition to the existing per-window/per-display desktop placement metadata. It records:
+
+- display count and primary display;
+- each display's pixel bounds and work area;
+- scale percentage and orientation;
+- relation to the primary display;
+- the union/virtual desktop bounds;
+- a geometry-oriented topology signature that is stable across discovery ordering;
+- a device-and-geometry signature for stricter future comparisons.
+
+Example shape:
+
+```json
+{
+  "display_setup": {
+    "schema_version": 1,
+    "status": "available",
+    "display_count": 2,
+    "primary_device": "DISPLAY1",
+    "virtual_bounds": {
+      "left": -1920,
+      "top": 0,
+      "right": 2560,
+      "bottom": 1440
+    },
+    "topology_signature": "...",
+    "device_signature": "...",
+    "displays": []
+  }
+}
+```
+
+Restore does not yet reject or remap a capsule based on these signatures. The metadata is intentionally captured now so a later restoreability phase can compare the current monitor topology with the saved topology and decide when exact window placement is impossible or needs a fallback mapping.
+
 ## Restore modes: append vs replace
 
 Restore remains backward compatible: **append mode is the default**. It preserves unrelated running applications and applies the capsule on top of the current desktop, just as Context Capsule did before replace mode existed.
