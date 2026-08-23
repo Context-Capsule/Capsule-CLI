@@ -6,6 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   zen-native-messaging:
     runs-on: [self-hosted, Windows, X64]
@@ -105,3 +113,14 @@ jobs:
           .\target\debug\capsule-firefox-host.exe --status | Tee-Object -Variable hostStatus
           if (($hostStatus -join "`n") -notmatch 'adapter: live') { throw 'native host received state but --status did not report a live adapter' }
           Write-Host 'Zen -> WebExtension -> Windows NativeMessagingHosts -> Rust host integration passed.'
+
+      - name: Publish Zen E2E status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{ state = $state; context = 'ci/potus-zen-e2e'; description = "POTUS Zen E2E: $($env:JOB_STATUS)" } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
