@@ -1,0 +1,59 @@
+name: Format Feature Branch
+
+on:
+  push:
+    branches:
+      - feature/chrome-browser-adapter-20260822
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: format-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustfmt:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Verify POTUS-linux runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply canonical Rust formatting
+        shell: bash
+        run: cargo fmt --all
+
+      - name: Verify formatting result
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Commit formatting if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo 'Rust sources are already formatted.'
+            exit 0
+          fi
+
+          echo 'Files changed by rustfmt:'
+          git diff --name-only
+          git diff --check
+          git config user.name 'Context Capsule CI'
+          git config user.email 'actions@users.noreply.github.com'
+          git add src tests
+          git commit -m 'style: apply cargo fmt'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
