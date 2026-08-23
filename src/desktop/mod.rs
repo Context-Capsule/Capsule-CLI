@@ -2,7 +2,8 @@ mod classify;
 mod model;
 
 pub use model::{
-    ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate, Rect, WindowInfo,
+    ApplicationClassification, ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate,
+    LaunchSpec, LaunchStrategy, Rect, WindowInfo,
 };
 
 #[cfg(windows)]
