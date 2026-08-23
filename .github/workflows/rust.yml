@@ -13,6 +13,10 @@ permissions:
   contents: read
   statuses: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check-windows:
     runs-on: [self-hosted, Windows, X64]
