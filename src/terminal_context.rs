@@ -36,6 +36,21 @@ pub fn prepare_for_capture(
     }
 }
 
+/// Enrich live terminal discovery with the same process CWD metadata used at
+/// capture time. Restore matching needs this so a saved cmd.exe in C:\work is
+/// not confused with another cmd.exe in a different directory, nor duplicated
+/// merely because the older generic process discovery reported an unknown CWD.
+pub(crate) fn enrich_for_matching(snapshot: &TerminalSnapshot) -> TerminalSnapshot {
+    let mut prepared = snapshot.clone();
+
+    #[cfg(windows)]
+    for session in &mut prepared.sessions {
+        enrich_working_directory(session, &process_working_directory);
+    }
+
+    prepared
+}
+
 fn prepare_with<F>(
     snapshot: &TerminalSnapshot,
     vscode_semantic_available: bool,
@@ -469,5 +484,19 @@ mod tests {
                 .and_then(|plan| plan.working_directory.as_deref()),
             Some(r"C:\work\project")
         );
+    }
+
+    #[test]
+    fn matching_enrichment_preserves_session_identity_and_adds_cwd() {
+        let value = snapshot(vec![session(TerminalHost::ConsoleHost, 20, "cmd.exe")]);
+        let mut prepared = value.clone();
+        for session in &mut prepared.sessions {
+            enrich_working_directory(session, &|pid| {
+                (pid == 20).then(|| r"C:\work\project".to_owned())
+            });
+        }
+        assert_eq!(prepared.sessions.len(), value.sessions.len());
+        assert_eq!(prepared.sessions[0].pid, value.sessions[0].pid);
+        assert_eq!(prepared.sessions[0].working_directory.as_deref(), Some(r"C:\work\project"));
     }
 }
