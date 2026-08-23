@@ -2,13 +2,19 @@ name: Zen Native Messaging E2E
 
 on:
   push:
-    branches: [main, 'agent/**']
+    branches: [main, 'agent/**', 'feature/**']
   pull_request:
+  workflow_dispatch:
 
 jobs:
   zen-native-messaging:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64]
     steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
@@ -20,9 +26,7 @@ jobs:
         run: |
           npm install --no-save --no-package-lock web-ext@10.6.0
           $webExt = Join-Path $PWD 'node_modules\.bin\web-ext.cmd'
-          if (-not (Test-Path $webExt)) {
-            throw 'web-ext.cmd was not installed'
-          }
+          if (-not (Test-Path $webExt)) { throw 'web-ext.cmd was not installed' }
           & $webExt --version
           "WEB_EXT_BIN=$webExt" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -46,17 +50,11 @@ jobs:
         run: |
           $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/zen-browser/desktop/releases/latest' -Headers @{ 'User-Agent' = 'Context-Capsule-CI' }
           $asset = $release.assets | Where-Object { $_.name -eq 'zen.installer.exe' } | Select-Object -First 1
-          if (-not $asset) {
-            throw 'latest Zen release has no zen.installer.exe'
-          }
-
+          if (-not $asset) { throw 'latest Zen release has no zen.installer.exe' }
           $installer = Join-Path $env:RUNNER_TEMP 'zen.installer.exe'
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer
           $install = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
-          if ($install.ExitCode -notin @(0, 3010, 1641)) {
-            throw "Zen installer failed with exit code $($install.ExitCode)"
-          }
-
+          if ($install.ExitCode -notin @(0, 3010, 1641)) { throw "Zen installer failed with exit code $($install.ExitCode)" }
           $zen = @(
             "$env:ProgramW6432\Zen Browser\zen.exe",
             "$env:ProgramFiles\Zen Browser\zen.exe",
@@ -64,11 +62,7 @@ jobs:
             "$env:LOCALAPPDATA\Zen Browser\zen.exe",
             "$env:LOCALAPPDATA\Programs\Zen Browser\zen.exe"
           ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-
-          if (-not $zen) {
-            throw 'Zen installed but zen.exe was not found'
-          }
-
+          if (-not $zen) { throw 'Zen installed but zen.exe was not found' }
           Write-Host "Using Zen: $zen"
           (Get-Item $zen).VersionInfo | Format-List FileVersion,ProductVersion
           "ZEN_EXE=$zen" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -80,17 +74,8 @@ jobs:
           $stdout = Join-Path $env:RUNNER_TEMP 'zen-native-probe.stdout.log'
           $stderr = Join-Path $env:RUNNER_TEMP 'zen-native-probe.stderr.log'
           Remove-Item $stdout,$stderr -Force -ErrorAction SilentlyContinue
-
           $arguments = "run --source-dir `"$PWD\tests\native_probe`" --firefox `"$env:ZEN_EXE`" --no-input"
-          $process = Start-Process `
-            -FilePath $env:WEB_EXT_BIN `
-            -ArgumentList $arguments `
-            -WorkingDirectory $PWD `
-            -RedirectStandardOutput $stdout `
-            -RedirectStandardError $stderr `
-            -PassThru `
-            -WindowStyle Hidden
-
+          $process = Start-Process -FilePath $env:WEB_EXT_BIN -ArgumentList $arguments -WorkingDirectory $PWD -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
           $deadline = (Get-Date).AddSeconds(90)
           $passed = $false
           try {
@@ -98,14 +83,9 @@ jobs:
               Start-Sleep -Milliseconds 500
               if (Test-Path $env:CONTEXT_CAPSULE_FIREFOX_STATE_PATH) {
                 $state = Get-Content $env:CONTEXT_CAPSULE_FIREFOX_STATE_PATH -Raw
-                if ($state -match [regex]::Escape('https://zen-native-host-ci.example/')) {
-                  $passed = $true
-                  break
-                }
+                if ($state -match [regex]::Escape('https://zen-native-host-ci.example/')) { $passed = $true; break }
               }
-              if ($process.HasExited) {
-                break
-              }
+              if ($process.HasExited) { break }
             }
           }
           finally {
@@ -114,22 +94,14 @@ jobs:
               $global:LASTEXITCODE = 0
             }
           }
-
           Write-Host '----- web-ext stdout -----'
           if (Test-Path $stdout) { Get-Content $stdout -Raw | Write-Host }
           Write-Host '----- web-ext stderr -----'
           if (Test-Path $stderr) { Get-Content $stderr -Raw | Write-Host }
-
           if (-not $passed) {
-            if ($process.HasExited) {
-              throw "web-ext/Zen exited before native state arrived. Exit code: $($process.ExitCode)"
-            }
+            if ($process.HasExited) { throw "web-ext/Zen exited before native state arrived. Exit code: $($process.ExitCode)" }
             throw 'Zen never delivered the WebExtension native message to the Context Capsule Rust host'
           }
-
           .\target\debug\capsule-firefox-host.exe --status | Tee-Object -Variable hostStatus
-          if (($hostStatus -join "`n") -notmatch 'adapter: live') {
-            throw 'native host received state but --status did not report a live adapter'
-          }
-
+          if (($hostStatus -join "`n") -notmatch 'adapter: live') { throw 'native host received state but --status did not report a live adapter' }
           Write-Host 'Zen -> WebExtension -> Windows NativeMessagingHosts -> Rust host integration passed.'
