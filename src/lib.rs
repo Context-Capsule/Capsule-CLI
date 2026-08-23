@@ -17,6 +17,7 @@ pub mod logging;
 pub mod persistence;
 pub mod restore;
 pub mod restore_bus;
+pub(crate) mod terminal_context;
 pub mod vscode;
 
 #[cfg(windows)]
