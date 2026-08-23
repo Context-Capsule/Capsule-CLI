@@ -1,0 +1,139 @@
+name: Chrome Native Host
+
+on:
+  push:
+    branches: [main, 'agent/**', 'feature/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  native-host-windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo check --all-targets
+      - run: cargo test chrome -- --nocapture
+      - run: cargo build --bin capsule-chrome-host
+      - name: Register, diagnose, and unregister Chrome host
+        shell: pwsh
+        env:
+          CONTEXT_CAPSULE_CHROME_MANIFEST_PATH: ${{ runner.temp }}\com.contextcapsule.chrome.json
+        run: |
+          .\target\debug\capsule-chrome-host.exe --install
+          .\target\debug\capsule-chrome-host.exe --doctor
+          if (-not (Test-Path $env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH)) { throw 'Chrome native messaging manifest was not created' }
+          $manifest = Get-Content $env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH -Raw | ConvertFrom-Json
+          if ($manifest.name -ne 'com.contextcapsule.chrome') { throw 'Chrome native host name mismatch' }
+          if ($manifest.allowed_origins.Count -ne 1 -or $manifest.allowed_origins[0] -ne 'chrome-extension://gmffhdppfaeonombpbbgnldagfeabiof/') { throw 'Chrome extension origin mismatch' }
+          $registryPath = 'Registry::HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\com.contextcapsule.chrome'
+          if (-not (Test-Path $registryPath)) { throw 'Chrome native messaging registry key was not created' }
+          $registeredManifest = (Get-Item $registryPath).GetValue('')
+          if ($registeredManifest -ne $env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH) { throw "registry points to '$registeredManifest' instead of '$env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH'" }
+          .\target\debug\capsule-chrome-host.exe --uninstall
+          if (Test-Path $registryPath) { throw 'Chrome native messaging registry key remained after uninstall' }
+      - name: Publish Chrome Windows status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{ state = $state; context = 'ci/potus-chrome-host'; description = "POTUS Chrome host: $($env:JOB_STATUS)" } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
+
+  protocol-integration-linux:
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      HOME: ${{ runner.temp }}/context-capsule-chrome-home
+      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-chrome.db
+      CONTEXT_CAPSULE_CHROME_STATE_PATH: ${{ runner.temp }}/context-capsule-chrome-state.json
+      CONTEXT_CAPSULE_CHROME_MANIFEST_PATH: ${{ runner.temp }}/context-capsule-chrome-manifest.json
+    steps:
+      - name: Verify POTUS-linux runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --bins
+      - name: Install and diagnose Chrome native host manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          ./target/debug/capsule-chrome-host --install
+          ./target/debug/capsule-chrome-host --doctor
+          test -f "$CONTEXT_CAPSULE_CHROME_MANIFEST_PATH"
+          grep -F 'com.contextcapsule.chrome' "$CONTEXT_CAPSULE_CHROME_MANIFEST_PATH"
+          grep -F 'chrome-extension://gmffhdppfaeonombpbbgnldagfeabiof/' "$CONTEXT_CAPSULE_CHROME_MANIFEST_PATH"
+      - name: Exercise framed ping and live-state update
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, struct, subprocess
+          host = './target/debug/capsule-chrome-host'
+          snapshot = {
+              'schema_version': 1,
+              'browser': 'chrome',
+              'extension_version': 'ci',
+              'captured_at_unix_ms': 1,
+              'skipped_private_windows': 0,
+              'windows': [{
+                  'key': 'window-0', 'focused': True, 'state': 'normal',
+                  'left': 0, 'top': 0, 'width': 1200, 'height': 800,
+                  'tabs': [{
+                      'index': 0, 'url': 'https://chrome-native-host-ci.example/', 'title': 'Chrome CI',
+                      'pinned': False, 'active': True, 'discarded': False,
+                      'muted': False, 'restorable': True
+                  }],
+                  'groups': []
+              }]
+          }
+          requests = [
+              {'protocol_version': 1, 'request_id': 'ping', 'type': 'ping'},
+              {'protocol_version': 1, 'request_id': 'state', 'type': 'browser.state.update', 'snapshot': snapshot},
+          ]
+          payload = b''.join(struct.pack('<I', len(raw)) + raw for raw in [json.dumps(r).encode() for r in requests])
+          proc = subprocess.run([host], input=payload, stdout=subprocess.PIPE, check=True)
+          data = proc.stdout
+          responses = []
+          while data:
+              size = struct.unpack('<I', data[:4])[0]
+              responses.append(json.loads(data[4:4+size]))
+              data = data[4+size:]
+          assert responses[0]['type'] == 'pong' and responses[0]['ok']
+          assert responses[1]['type'] == 'browser.state.updated' and responses[1]['ok']
+          PY
+      - name: Save live Chrome state into SQLite capsule
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/debug/capsule save chrome-ci
+          ./target/debug/capsule show chrome-ci --json > "$RUNNER_TEMP/chrome-capsule.json"
+          grep -F '"chrome"' "$RUNNER_TEMP/chrome-capsule.json"
+          grep -F 'https://chrome-native-host-ci.example/' "$RUNNER_TEMP/chrome-capsule.json"
+      - name: Publish Chrome Linux protocol status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          state=failure
+          [ "$JOB_STATUS" = success ] && state=success
+          [ "$JOB_STATUS" = cancelled ] && state=error
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -d "{\"state\":\"$state\",\"context\":\"ci/potus-linux-chrome-protocol\",\"description\":\"POTUS-linux Chrome protocol: $JOB_STATUS\"}" >/dev/null
