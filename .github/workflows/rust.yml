@@ -5,14 +5,13 @@ on:
     branches:
       - main
       - 'agent/**'
+      - 'feature/**'
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, Windows, X64, POTUS]
 
     steps:
       - name: Checkout
@@ -29,8 +28,17 @@ jobs:
       - name: Check
         run: cargo check --all-targets
 
-      - name: Test
+      - name: Full test suite
         run: cargo test
+
+      - name: Terminal ownership and CWD regression tests
+        run: cargo test terminal_context::tests -- --nocapture
+
+      - name: Display setup regression tests
+        run: cargo test display_setup::tests -- --nocapture
+
+      - name: Build all binaries
+        run: cargo build --bins
 
       - name: Toolchain discovery smoke test
         run: cargo run -- inspect --tools
@@ -38,54 +46,50 @@ jobs:
       - name: Terminal discovery smoke test
         run: cargo run -- terminal inspect --json
 
-      - name: Persistence CLI lifecycle (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        env:
-          CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-persistence.db
-        run: |
-          set -euo pipefail
-          cargo run --quiet -- save ci-persistence
-          cargo run --quiet -- list | grep -F 'ci-persistence'
-          cargo run --quiet -- show ci-persistence --json > "$RUNNER_TEMP/capsule.json"
-          grep -F '"schema_version": 1' "$RUNNER_TEMP/capsule.json"
-          grep -F '"docker"' "$RUNNER_TEMP/capsule.json"
-          grep -F '"terminals"' "$RUNNER_TEMP/capsule.json"
-
-          if cargo run --quiet -- save CI-PERSISTENCE; then
-            echo 'duplicate save unexpectedly succeeded without --force' >&2
-            exit 1
-          fi
-
-          cargo run --quiet -- save ci-persistence --force
-          cargo run --quiet -- delete CI-PERSISTENCE
-          if cargo run --quiet -- show ci-persistence; then
-            echo 'deleted capsule was still loadable' >&2
-            exit 1
-          fi
-
-      - name: Persistence CLI lifecycle (Windows)
-        if: runner.os == 'Windows'
+      - name: Persistence and new snapshot metadata lifecycle
         shell: pwsh
         env:
           CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-persistence.db
         run: |
-          cargo run --quiet -- save ci-persistence
+          Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
+
+          $saveOutput = cargo run --quiet -- save ci-persistence | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'initial save failed' }
+          if ($saveOutput -match '(?m)^\s*Docker:') {
+            throw "save emitted the Docker-unavailable warning that should be suppressed:`n$saveOutput"
+          }
 
           $list = cargo run --quiet -- list | Out-String
           if ($list -notmatch 'ci-persistence') {
             throw 'saved capsule was not listed'
           }
 
-          $json = cargo run --quiet -- show ci-persistence --json | Out-String
-          if ($json -notmatch '"schema_version"\s*:\s*1') {
+          $jsonText = cargo run --quiet -- show ci-persistence --json | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'show --json failed' }
+          $stored = $jsonText | ConvertFrom-Json
+
+          if ($stored.schema_version -ne 1) {
             throw 'stored capsule schema version was not present'
           }
-          if ($json -notmatch '"docker"') {
+          if (-not $stored.snapshot.docker) {
             throw 'stored capsule did not contain Docker metadata'
           }
-          if ($json -notmatch '"terminals"') {
+          if (-not $stored.snapshot.terminals) {
             throw 'stored capsule did not contain terminal metadata'
+          }
+          if (-not $stored.snapshot.display_setup) {
+            throw 'stored capsule did not contain display_setup metadata'
+          }
+          if ($stored.snapshot.display_setup.schema_version -ne 1) {
+            throw 'display_setup schema version was not 1'
+          }
+          if ($stored.snapshot.display_setup.status -eq 'available') {
+            if ([int]$stored.snapshot.display_setup.display_count -lt 1) {
+              throw 'available display_setup reported no displays'
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$stored.snapshot.display_setup.topology_signature)) {
+              throw 'available display_setup did not contain a topology signature'
+            }
           }
 
           cargo run --quiet -- save CI-PERSISTENCE
@@ -101,10 +105,9 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             throw 'deleted capsule was still loadable'
           }
-          $LASTEXITCODE = 0
+          $global:LASTEXITCODE = 0
 
       - name: Installed Node tools must be discovered
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $output = cargo run --quiet -- inspect --tools | Out-String
@@ -118,7 +121,7 @@ jobs:
           foreach ($tool in $tools) {
             $installed = Get-Command $tool.Command -ErrorAction SilentlyContinue
             if (-not $installed) {
-              Write-Host "$($tool.Command) is not installed on this runner; skipping assertion."
+              Write-Host "$($tool.Command) is not installed on POTUS; skipping assertion."
               continue
             }
 
@@ -134,7 +137,7 @@ jobs:
           }
 
   windows-discovery:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, POTUS]
 
     steps:
       - name: Checkout
@@ -241,9 +244,9 @@ jobs:
         run: cargo run -- apps
 
   docker-integration:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64, POTUS]
     env:
-      CONTEXT_CAPSULE_DB: /tmp/context-capsule-docker.db
+      CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-docker.db
 
     steps:
       - name: Checkout
@@ -256,58 +259,79 @@ jobs:
         run: cargo build
 
       - name: Verify Docker engine and Compose
+        shell: pwsh
         run: |
+          if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            throw 'Docker CLI is not installed on POTUS'
+          }
           docker version
+          if ($LASTEXITCODE -ne 0) { throw 'Docker engine is not available on POTUS' }
           docker compose version
+          if ($LASTEXITCODE -ne 0) { throw 'Docker Compose is not available on POTUS' }
 
       - name: Restore an existing standalone container
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          cleanup() {
-            docker rm -f capsule-standalone-ci >/dev/null 2>&1 || true
+          docker rm -f capsule-standalone-ci 2>$null | Out-Null
+          try {
+            docker run -d --name capsule-standalone-ci alpine:3.20 sleep 300 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'could not start standalone test container' }
+
+            cargo run --quiet -- save standalone-ci
+            if ($LASTEXITCODE -ne 0) { throw 'standalone capsule save failed' }
+            $json = cargo run --quiet -- show standalone-ci --json | Out-String
+            if ($json -notmatch 'capsule-standalone-ci') { throw 'standalone container was not saved' }
+
+            docker stop capsule-standalone-ci | Out-Null
+            $running = docker inspect --format '{{.State.Running}}' capsule-standalone-ci
+            if ($running.Trim() -ne 'false') { throw 'standalone container did not stop' }
+
+            cargo run --quiet -- docker restore standalone-ci
+            if ($LASTEXITCODE -ne 0) { throw 'standalone Docker restore failed' }
+            $running = docker inspect --format '{{.State.Running}}' capsule-standalone-ci
+            if ($running.Trim() -ne 'true') { throw 'standalone container was not restored' }
           }
-          trap cleanup EXIT
-          cleanup
-
-          docker run -d --name capsule-standalone-ci alpine:3.20 sleep 300
-          cargo run --quiet -- save standalone-ci
-          cargo run --quiet -- show standalone-ci --json | grep -F 'capsule-standalone-ci'
-
-          docker stop capsule-standalone-ci
-          test "$(docker inspect --format '{{.State.Running}}' capsule-standalone-ci)" = 'false'
-
-          cargo run --quiet -- docker restore standalone-ci
-          test "$(docker inspect --format '{{.State.Running}}' capsule-standalone-ci)" = 'true'
+          finally {
+            docker rm -f capsule-standalone-ci 2>$null | Out-Null
+          }
 
       - name: Recreate a Compose project from saved intent
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          project_dir="$RUNNER_TEMP/context-capsule-compose-ci"
-          mkdir -p "$project_dir"
-          cat > "$project_dir/compose.yml" <<'YAML'
+          $projectDir = Join-Path $env:RUNNER_TEMP 'context-capsule-compose-ci'
+          New-Item -ItemType Directory -Path $projectDir -Force | Out-Null
+          $composePath = Join-Path $projectDir 'compose.yml'
+          @'
           services:
             worker:
               image: alpine:3.20
               command: ["sleep", "300"]
-          YAML
+          '@ | Set-Content -Path $composePath -Encoding utf8
 
-          cleanup() {
-            docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci down --remove-orphans >/dev/null 2>&1 || true
+          docker compose -f $composePath -p capsule-compose-ci down --remove-orphans 2>$null | Out-Null
+          try {
+            docker compose -f $composePath -p capsule-compose-ci up -d
+            if ($LASTEXITCODE -ne 0) { throw 'could not start Compose test project' }
+
+            cargo run --quiet -- save compose-ci
+            if ($LASTEXITCODE -ne 0) { throw 'Compose capsule save failed' }
+            $json = cargo run --quiet -- show compose-ci --json | Out-String
+            if ($json -notmatch 'capsule-compose-ci') { throw 'Compose project was not saved' }
+
+            docker compose -f $composePath -p capsule-compose-ci down
+            if ($LASTEXITCODE -ne 0) { throw 'Compose down failed' }
+            $running = @(docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q)
+            if ($running.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace(($running -join ''))) {
+              throw 'Compose project was still running after docker compose down'
+            }
+
+            cargo run --quiet -- docker restore compose-ci
+            if ($LASTEXITCODE -ne 0) { throw 'Compose Docker restore failed' }
+            $running = @(docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q)
+            if ($running.Count -eq 0 -or [string]::IsNullOrWhiteSpace(($running -join ''))) {
+              throw 'Compose project was not restored'
+            }
           }
-          trap cleanup EXIT
-          cleanup
-
-          docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci up -d
-          cargo run --quiet -- save compose-ci
-          cargo run --quiet -- show compose-ci --json | grep -F 'capsule-compose-ci'
-
-          docker compose -f "$project_dir/compose.yml" -p capsule-compose-ci down
-          if docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q | grep -q .; then
-            echo 'Compose project was still running after docker compose down' >&2
-            exit 1
-          fi
-
-          cargo run --quiet -- docker restore compose-ci
-          docker ps --filter 'label=com.docker.compose.project=capsule-compose-ci' --filter status=running -q | grep -q .
+          finally {
+            docker compose -f $composePath -p capsule-compose-ci down --remove-orphans 2>$null | Out-Null
+          }
