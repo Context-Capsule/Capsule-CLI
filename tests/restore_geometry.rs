@@ -1,6 +1,4 @@
-use context_capsule::restore::{
-    SavedRect, SnapSlot, snap_rect,
-};
+use context_capsule::restore::{SavedRect, SnapSlot, snap_rect};
 
 fn work_area() -> SavedRect {
     SavedRect {
@@ -32,10 +30,19 @@ fn every_snap_slot_stays_inside_the_current_work_area() {
 
     for slot in slots {
         let rect = snap_rect(area, slot);
-        assert!(rect.left >= area.left, "{slot:?} left edge escaped work area");
+        assert!(
+            rect.left >= area.left,
+            "{slot:?} left edge escaped work area"
+        );
         assert!(rect.top >= area.top, "{slot:?} top edge escaped work area");
-        assert!(rect.right <= area.right, "{slot:?} right edge escaped work area");
-        assert!(rect.bottom <= area.bottom, "{slot:?} bottom edge escaped work area");
+        assert!(
+            rect.right <= area.right,
+            "{slot:?} right edge escaped work area"
+        );
+        assert!(
+            rect.bottom <= area.bottom,
+            "{slot:?} bottom edge escaped work area"
+        );
         assert!(rect.width() > 0, "{slot:?} produced an empty width");
         assert!(rect.height() > 0, "{slot:?} produced an empty height");
     }

@@ -6,8 +6,7 @@ use std::{
     mem::{size_of, zeroed},
     path::Path,
     process::{Command, Stdio},
-    ptr,
-    thread,
+    ptr, thread,
     time::{Duration, Instant},
 };
 
@@ -253,7 +252,9 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
     let mut inventory = match CurrentInventory::initial(saved) {
         Ok(inventory) => inventory,
         Err(error) => {
-            report.failures.push(format!("desktop inventory failed: {error}"));
+            report
+                .failures
+                .push(format!("desktop inventory failed: {error}"));
             return report;
         }
     };
@@ -328,10 +329,9 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
                     &mut report.warnings,
                 ) {
                     Ok(()) => report.windows_moved += 1,
-                    Err(error) => report.failures.push(format!(
-                        "{} / '{}': {error}",
-                        app.name, saved_window.title
-                    )),
+                    Err(error) => report
+                        .failures
+                        .push(format!("{} / '{}': {error}", app.name, saved_window.title)),
                 }
             }
             matched_for_order.push((saved_window, current_window));
@@ -382,7 +382,11 @@ fn sort_launch_queue(apps: &mut Vec<&SavedApplication>) {
                     .cmp(&right.foreground_window().is_some())
             })
             .then_with(|| right.frontmost_z_order().cmp(&left.frontmost_z_order()))
-            .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
     });
 }
 
@@ -439,7 +443,9 @@ fn settle_new_windows(
 
         thread::sleep(SETTLE_POLL_INTERVAL);
         if let Err(error) = inventory.refresh_dynamic(&saved.applications) {
-            warnings.push(format!("could not refresh desktop state during settle: {error}"));
+            warnings.push(format!(
+                "could not refresh desktop state during settle: {error}"
+            ));
             return;
         }
         let observed = observed_saved_window_count(saved, inventory);
@@ -580,9 +586,11 @@ fn process_matches(app: &SavedApplication, process: &CurrentProcess) -> bool {
 
     if let Some(saved) = app.executable_path.as_deref() {
         strong_identity = true;
-        if process.executable_path.as_deref().is_some_and(|current| {
-            normalize_windows_path(current) == normalize_windows_path(saved)
-        }) {
+        if process
+            .executable_path
+            .as_deref()
+            .is_some_and(|current| normalize_windows_path(current) == normalize_windows_path(saved))
+        {
             return true;
         }
     }
@@ -1395,11 +1403,7 @@ mod tests {
             is_primary: true,
             relation_to_primary: "primary".to_owned(),
         };
-        let matches = match_windows(
-            &application,
-            &[&current_right, &current_left],
-            &[display],
-        );
+        let matches = match_windows(&application, &[&current_right, &current_left], &[display]);
         assert_eq!(matches[0].1.hwnd, 1);
         assert_eq!(matches[1].1.hwnd, 2);
     }

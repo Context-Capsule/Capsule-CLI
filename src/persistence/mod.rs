@@ -596,12 +596,24 @@ mod tests {
                 .expect("new revision");
             assert_eq!(summary.current_revision, 2);
             assert_eq!(summary.revision_count, 2);
-            assert_eq!(store.load("demo").expect("current").snapshot["marker"], "two");
-            assert_eq!(store.load("demo@1").expect("revision one").snapshot["marker"], "one");
-            assert_eq!(store.load("demo@2").expect("revision two").snapshot["marker"], "two");
+            assert_eq!(
+                store.load("demo").expect("current").snapshot["marker"],
+                "two"
+            );
+            assert_eq!(
+                store.load("demo@1").expect("revision one").snapshot["marker"],
+                "one"
+            );
+            assert_eq!(
+                store.load("demo@2").expect("revision two").snapshot["marker"],
+                "two"
+            );
 
             let history = store.history("demo").expect("history");
-            assert_eq!(history.iter().map(|item| item.revision).collect::<Vec<_>>(), vec![2, 1]);
+            assert_eq!(
+                history.iter().map(|item| item.revision).collect::<Vec<_>>(),
+                vec![2, 1]
+            );
             assert!(history[0].current);
             assert!(!history[1].current);
         }

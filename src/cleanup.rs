@@ -175,15 +175,21 @@ fn current_executable_name(application: &ApplicationInfo) -> Option<&str> {
     application
         .executable_path
         .as_deref()
-        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .or_else(|| {
+            application
+                .launch
+                .as_ref()
+                .map(|launch| launch.target.as_str())
+        })
         .and_then(file_name)
 }
 
 fn named_or_executable(application: &ApplicationInfo, values: &[&str]) -> bool {
-    values.iter().any(|value| application.name.eq_ignore_ascii_case(value))
-        || current_executable_name(application).is_some_and(|name| {
-            values.iter().any(|value| name.eq_ignore_ascii_case(value))
-        })
+    values
+        .iter()
+        .any(|value| application.name.eq_ignore_ascii_case(value))
+        || current_executable_name(application)
+            .is_some_and(|name| values.iter().any(|value| name.eq_ignore_ascii_case(value)))
 }
 
 fn is_windows_terminal(application: &ApplicationInfo) -> bool {
@@ -209,10 +215,7 @@ fn is_cursor(application: &ApplicationInfo) -> bool {
 }
 
 fn is_wezterm(application: &ApplicationInfo) -> bool {
-    named_or_executable(
-        application,
-        &["WezTerm", "wezterm-gui.exe", "wezterm.exe"],
-    )
+    named_or_executable(application, &["WezTerm", "wezterm-gui.exe", "wezterm.exe"])
 }
 
 fn is_alacritty(application: &ApplicationInfo) -> bool {
@@ -251,10 +254,7 @@ fn is_docker_desktop(application: &ApplicationInfo) -> bool {
 }
 
 fn is_explorer(application: &ApplicationInfo) -> bool {
-    named_or_executable(
-        application,
-        &["Explorer", "File Explorer", "explorer.exe"],
-    )
+    named_or_executable(application, &["Explorer", "File Explorer", "explorer.exe"])
 }
 
 fn terminal_snapshot_mentions_host(snapshot: &Value, host: &str) -> bool {
@@ -603,7 +603,10 @@ fn current_matches_application(left: &ApplicationInfo, right: &ApplicationInfo) 
     left.name.eq_ignore_ascii_case(&right.name)
 }
 
-fn ignored_surface_still_present(current: &[IgnoredCandidate], original: &IgnoredCandidate) -> bool {
+fn ignored_surface_still_present(
+    current: &[IgnoredCandidate],
+    original: &IgnoredCandidate,
+) -> bool {
     let Some(title) = original.window_title.as_deref() else {
         return false;
     };
@@ -638,9 +641,9 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
     let current = match crate::desktop::discover() {
         Ok(desktop) => desktop,
         Err(error) => {
-            report
-                .failures
-                .push(format!("could not inspect running applications for replace mode: {error}"));
+            report.failures.push(format!(
+                "could not inspect running applications for replace mode: {error}"
+            ));
             return report;
         }
     };
@@ -692,7 +695,9 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
     for application in &candidates {
         report.close_requests_sent += 1;
         for error in graceful_close(application) {
-            report.warnings.push(format!("{}: {error}", application.name));
+            report
+                .warnings
+                .push(format!("{}: {error}", application.name));
         }
     }
     for candidate in &ignored_surface_candidates {
@@ -700,7 +705,10 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
         if let Err(error) = close_ignored_surface(candidate) {
             report.warnings.push(format!(
                 "{}: {error}",
-                candidate.window_title.as_deref().unwrap_or(&candidate.executable)
+                candidate
+                    .window_title
+                    .as_deref()
+                    .unwrap_or(&candidate.executable)
             ));
         }
     }
@@ -727,7 +735,9 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
             .any(|current| current_matches_application(current, application))
         {
             for error in force_close(application) {
-                report.warnings.push(format!("{}: {error}", application.name));
+                report
+                    .warnings
+                    .push(format!("{}: {error}", application.name));
             }
         }
     }
@@ -736,7 +746,10 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
             if let Err(error) = close_ignored_surface(candidate) {
                 report.warnings.push(format!(
                     "{}: {error}",
-                    candidate.window_title.as_deref().unwrap_or(&candidate.executable)
+                    candidate
+                        .window_title
+                        .as_deref()
+                        .unwrap_or(&candidate.executable)
                 ));
             }
         }
@@ -774,7 +787,10 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
             report.applications_remaining += 1;
             report.failures.push(format!(
                 "'{}' is still open after replace-mode WM_CLOSE attempts",
-                candidate.window_title.as_deref().unwrap_or(&candidate.executable)
+                candidate
+                    .window_title
+                    .as_deref()
+                    .unwrap_or(&candidate.executable)
             ));
         } else {
             report.applications_closed += 1;
@@ -787,9 +803,7 @@ fn close_unrelated_windows(snapshot: &Value, dry_run: bool) -> ApplicationCleanu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop::{
-        ApplicationClassification, LaunchSpec, LaunchStrategy,
-    };
+    use crate::desktop::{ApplicationClassification, LaunchSpec, LaunchStrategy};
     use crate::restore::SavedLaunchSpec;
 
     fn current(name: &str, path: Option<&str>, aumid: Option<&str>) -> ApplicationInfo {

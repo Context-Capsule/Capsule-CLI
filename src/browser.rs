@@ -326,7 +326,10 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
         }
         "browser.window.blank.create" => {
             create_blank_browser_window()?;
-            logging::info("firefox", "native independent blank browser window requested");
+            logging::info(
+                "firefox",
+                "native independent blank browser window requested",
+            );
             Ok(success_response("browser.window.blank.created"))
         }
         "browser.zen.split.invoke" => {
@@ -839,8 +842,14 @@ mod tests {
     #[test]
     fn browser_log_levels_are_strict_and_case_insensitive() {
         assert_eq!(parse_native_log_level(None).unwrap(), LogLevel::Info);
-        assert_eq!(parse_native_log_level(Some("WARN")).unwrap(), LogLevel::Warn);
-        assert_eq!(parse_native_log_level(Some("trace")).unwrap(), LogLevel::Trace);
+        assert_eq!(
+            parse_native_log_level(Some("WARN")).unwrap(),
+            LogLevel::Warn
+        );
+        assert_eq!(
+            parse_native_log_level(Some("trace")).unwrap(),
+            LogLevel::Trace
+        );
         assert!(parse_native_log_level(Some("verbose")).is_err());
     }
 

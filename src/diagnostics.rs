@@ -157,8 +157,7 @@ fn firefox_native_host_check() -> DoctorCheck {
         .get("allowed_extensions")
         .and_then(Value::as_array)
         .is_some_and(|allowed| {
-            allowed.len() == 1
-                && allowed[0].as_str() == Some(browser::FIREFOX_EXTENSION_ID)
+            allowed.len() == 1 && allowed[0].as_str() == Some(browser::FIREFOX_EXTENSION_ID)
         });
 
     let mut details = vec![format!("manifest: {}", manifest_path.display())];
@@ -205,7 +204,10 @@ fn firefox_adapter_check() -> DoctorCheck {
                 format!("extension version: {}", snapshot.extension_version),
                 format!("windows: {}", snapshot.windows.len()),
                 format!("tabs: {}", snapshot.tab_count()),
-                format!("private windows skipped: {}", snapshot.skipped_private_windows),
+                format!(
+                    "private windows skipped: {}",
+                    snapshot.skipped_private_windows
+                ),
             ],
             None,
         ),
@@ -214,7 +216,9 @@ fn firefox_adapter_check() -> DoctorCheck {
             DoctorStatus::Warning,
             "no recent semantic state",
             Vec::new(),
-            Some("Open Zen/Firefox with the Context Capsule extension loaded, then wait a few seconds."),
+            Some(
+                "Open Zen/Firefox with the Context Capsule extension loaded, then wait a few seconds.",
+            ),
         ),
         Err(error) => check(
             "Firefox/Zen adapter",
@@ -231,7 +235,10 @@ fn vscode_adapter_check() -> DoctorCheck {
         Ok(Some(snapshot)) => {
             let mut details = vec![
                 format!("tabs: {}", snapshot.tab_count()),
-                format!("integrated terminals: {}", snapshot.integrated_terminals.len()),
+                format!(
+                    "integrated terminals: {}",
+                    snapshot.integrated_terminals.len()
+                ),
             ];
             if let Some(mode) = snapshot.extension_mode.as_deref() {
                 details.push(format!("host mode: {mode}"));
@@ -384,13 +391,7 @@ mod tests {
             version: "test".to_owned(),
             checks: vec![
                 check("one", DoctorStatus::Ok, "ok", Vec::new(), None),
-                check(
-                    "two",
-                    DoctorStatus::Warning,
-                    "warning",
-                    Vec::new(),
-                    None,
-                ),
+                check("two", DoctorStatus::Warning, "warning", Vec::new(), None),
             ],
         };
         assert!(!report.has_errors());
@@ -398,13 +399,7 @@ mod tests {
 
         let report = DoctorReport {
             version: "test".to_owned(),
-            checks: vec![check(
-                "bad",
-                DoctorStatus::Error,
-                "error",
-                Vec::new(),
-                None,
-            )],
+            checks: vec![check("bad", DoctorStatus::Error, "error", Vec::new(), None)],
         };
         assert!(report.has_errors());
     }

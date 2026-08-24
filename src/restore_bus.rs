@@ -176,8 +176,9 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
 
     #[cfg(windows)]
     {
-        let base = env::var_os("LOCALAPPDATA")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))?;
+        let base = env::var_os("LOCALAPPDATA").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
+        })?;
         return Ok(PathBuf::from(base)
             .join("ContextCapsule")
             .join("runtime")
@@ -241,7 +242,11 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 
 fn next_request_id(adapter: &str) -> String {
     let sequence = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{adapter}-{}-{}-{sequence}", std::process::id(), now_unix_ms())
+    format!(
+        "{adapter}-{}-{}-{sequence}",
+        std::process::id(),
+        now_unix_ms()
+    )
 }
 
 fn now_unix_ms() -> i64 {
@@ -292,13 +297,10 @@ mod tests {
                 None,
             )
             .unwrap();
-            let completion = wait_for_completion(
-                "firefox",
-                &request.request_id,
-                Duration::from_millis(20),
-            )
-            .unwrap()
-            .unwrap();
+            let completion =
+                wait_for_completion("firefox", &request.request_id, Duration::from_millis(20))
+                    .unwrap()
+                    .unwrap();
             assert!(completion.ok);
             assert_eq!(completion.changed, 3);
             assert!(!request_path("firefox").unwrap().exists());

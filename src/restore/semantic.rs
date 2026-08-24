@@ -12,12 +12,7 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 
 #[cfg(windows)]
-use std::{
-    os::windows::process::CommandExt,
-    process::Command,
-    thread,
-    time::Instant,
-};
+use std::{os::windows::process::CommandExt, process::Command, thread, time::Instant};
 
 const VSCODE_ADAPTER_TIMEOUT: Duration = Duration::from_secs(25);
 const FIREFOX_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -71,13 +66,7 @@ fn restore_firefox(snapshot: &Value, dry_run: bool, report: &mut SemanticRestore
         return;
     }
 
-    run_bus_adapter(
-        "firefox",
-        "Firefox",
-        saved,
-        FIREFOX_ADAPTER_TIMEOUT,
-        report,
-    );
+    run_bus_adapter("firefox", "Firefox", saved, FIREFOX_ADAPTER_TIMEOUT, report);
 }
 
 fn restore_chrome(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
@@ -97,13 +86,7 @@ fn restore_chrome(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreR
         return;
     }
 
-    run_bus_adapter(
-        "chrome",
-        "Chrome",
-        saved,
-        CHROME_ADAPTER_TIMEOUT,
-        report,
-    );
+    run_bus_adapter("chrome", "Chrome", saved, CHROME_ADAPTER_TIMEOUT, report);
 }
 
 fn restore_vscode(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
@@ -191,8 +174,12 @@ fn run_bus_adapter(
         Ok(None) => {
             let _ = restore_bus::cancel_request(adapter, &request.request_id);
             let diagnostic_hint = match adapter {
-                "firefox" => "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore",
-                "chrome" => "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore",
+                "firefox" => {
+                    "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore"
+                }
+                "chrome" => {
+                    "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore"
+                }
                 _ => "",
             };
             report.failures.push(format!(
@@ -280,10 +267,9 @@ fn missing_docker_resources(saved: &DockerSnapshot, current: &DockerSnapshot) ->
             .compose_projects
             .iter()
             .filter(|saved_project| {
-                !current
-                    .compose_projects
-                    .iter()
-                    .any(|current_project| compose_project_satisfied(saved_project, current_project))
+                !current.compose_projects.iter().any(|current_project| {
+                    compose_project_satisfied(saved_project, current_project)
+                })
             })
             .cloned()
             .collect(),
@@ -318,16 +304,20 @@ fn compose_project_satisfied(saved: &ComposeProject, current: &ComposeProject) -
         .iter()
         .map(|container| container.name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    saved.containers.iter().all(|container| {
-        current_names.contains(&container.name.to_ascii_lowercase())
-    })
+    saved
+        .containers
+        .iter()
+        .all(|container| current_names.contains(&container.name.to_ascii_lowercase()))
 }
 
 fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
     let Some(saved) = terminal_snapshot(snapshot) else {
         return;
     };
-    if !matches!(saved.status, TerminalStatus::Available | TerminalStatus::Degraded) {
+    if !matches!(
+        saved.status,
+        TerminalStatus::Available | TerminalStatus::Degraded
+    ) {
         return;
     }
 
@@ -484,7 +474,10 @@ fn launched_session_matches(saved: &TerminalSession, current: &TerminalSession) 
     {
         return false;
     }
-    match (saved.working_directory.as_deref(), current.working_directory.as_deref()) {
+    match (
+        saved.working_directory.as_deref(),
+        current.working_directory.as_deref(),
+    ) {
         (Some(saved_directory), Some(current_directory)) => {
             paths_equivalent(current_directory, saved_directory)
         }
@@ -507,13 +500,12 @@ fn terminal_hosts_compatible(saved: &TerminalHost, current: &TerminalHost) -> bo
 fn environment_matches(left: &TerminalEnvironment, right: &TerminalEnvironment) -> bool {
     match (left, right) {
         (TerminalEnvironment::Windows, TerminalEnvironment::Windows) => true,
-        (
-            TerminalEnvironment::Wsl { distro: left },
-            TerminalEnvironment::Wsl { distro: right },
-        ) => match (left.as_deref(), right.as_deref()) {
-            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
-            _ => true,
-        },
+        (TerminalEnvironment::Wsl { distro: left }, TerminalEnvironment::Wsl { distro: right }) => {
+            match (left.as_deref(), right.as_deref()) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                _ => true,
+            }
+        }
         _ => false,
     }
 }
@@ -670,7 +662,7 @@ fn direct_shell_process(executable: &str) -> bool {
 mod tests {
     use super::*;
     use crate::adapters::{
-        docker::{ContainerResource, ComposeProject},
+        docker::{ComposeProject, ContainerResource},
         terminal::{ShellKind, WorkingDirectorySource},
     };
 

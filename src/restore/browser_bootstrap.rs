@@ -116,7 +116,12 @@ fn is_zen_application(application: &SavedApplication) -> bool {
     application
         .executable_path
         .as_deref()
-        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .or_else(|| {
+            application
+                .launch
+                .as_ref()
+                .map(|launch| launch.target.as_str())
+        })
         .and_then(executable_basename)
         .is_some_and(|name| {
             name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen")
@@ -126,10 +131,12 @@ fn is_zen_application(application: &SavedApplication) -> bool {
 }
 
 fn safe_zen_executable(application: &SavedApplication) -> Option<&str> {
-    let candidate = application
-        .executable_path
-        .as_deref()
-        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))?;
+    let candidate = application.executable_path.as_deref().or_else(|| {
+        application
+            .launch
+            .as_ref()
+            .map(|launch| launch.target.as_str())
+    })?;
     let basename = executable_basename(candidate)?;
     (basename.eq_ignore_ascii_case("zen.exe") || basename.eq_ignore_ascii_case("zen"))
         .then_some(candidate)

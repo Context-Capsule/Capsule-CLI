@@ -1,10 +1,4 @@
-use std::{
-    collections::HashSet,
-    ffi::c_void,
-    mem::size_of,
-    thread,
-    time::Duration,
-};
+use std::{collections::HashSet, ffi::c_void, mem::size_of, thread, time::Duration};
 
 use crate::windows_snap_legacy;
 
@@ -344,11 +338,7 @@ fn non_client_hit_test(hwnd: Hwnd, point: (i32, i32)) -> Option<i32> {
 }
 
 fn screen_point_lparam(x: i32, y: i32) -> Option<isize> {
-    if x < i16::MIN as i32
-        || x > i16::MAX as i32
-        || y < i16::MIN as i32
-        || y > i16::MAX as i32
-    {
+    if x < i16::MIN as i32 || x > i16::MAX as i32 || y < i16::MIN as i32 || y > i16::MAX as i32 {
         return None;
     }
     let low = x as i16 as u16 as u32;
@@ -410,11 +400,7 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
     windows_snap_legacy::snap(hwnd, direction)
 }
 
-fn establish_pair(
-    first: Hwnd,
-    second: Hwnd,
-    orientation: SplitOrientation,
-) -> Result<(), String> {
+fn establish_pair(first: Hwnd, second: Hwnd, orientation: SplitOrientation) -> Result<(), String> {
     let (first_direction, second_direction) = match orientation {
         SplitOrientation::SideBySide => (SnapDirection::LeftHalf, SnapDirection::RightHalf),
         SplitOrientation::Stacked => (SnapDirection::TopHalf, SnapDirection::BottomHalf),
@@ -506,8 +492,8 @@ fn drag_saved_edge(
     orientation: SplitOrientation,
     target: i32,
 ) -> Result<(), String> {
-    let rect = frame_bounds(hwnd)
-        .ok_or_else(|| "could not read the arranged window frame".to_owned())?;
+    let rect =
+        frame_bounds(hwnd).ok_or_else(|| "could not read the arranged window frame".to_owned())?;
     let expected_hit = resize_hit_code(first_side, orientation);
     let start = find_resize_handle(hwnd, rect, first_side, orientation).ok_or_else(|| {
         format!(
@@ -570,7 +556,9 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
     };
 
     if unsafe { SetCursorPos(start.0, start.1) } == 0 {
-        return Err("SetCursorPos failed while targeting the Windows snap resize handle".to_owned());
+        return Err(
+            "SetCursorPos failed while targeting the Windows snap resize handle".to_owned(),
+        );
     }
     thread::sleep(DIVIDER_HOVER_SETTLE);
 
@@ -578,10 +566,8 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
 
     let steps = 18_i32;
     for step in 1..=steps {
-        let x = start.0 as i64
-            + ((end.0 as i64 - start.0 as i64) * step as i64) / steps as i64;
-        let y = start.1 as i64
-            + ((end.1 as i64 - start.1 as i64) * step as i64) / steps as i64;
+        let x = start.0 as i64 + ((end.0 as i64 - start.0 as i64) * step as i64) / steps as i64;
+        let y = start.1 as i64 + ((end.1 as i64 - start.1 as i64) * step as i64) / steps as i64;
         if unsafe { SetCursorPos(x as i32, y as i32) } == 0 {
             let _ = send_mouse_button(false);
             return Err("SetCursorPos failed during the Windows snap resize drag".to_owned());
@@ -732,8 +718,7 @@ pub(crate) fn restore_resized_pair(
                 }
 
                 if is_arranged(primary) == Some(true) && is_arranged(secondary) == Some(true) {
-                    if let Err(error) =
-                        drag_saved_edge(secondary, !first_side, orientation, target)
+                    if let Err(error) = drag_saved_edge(secondary, !first_side, orientation, target)
                     {
                         errors.push(format!(
                             "{} edge reached the target but the partner edge could not be resized: {error}",
@@ -817,7 +802,11 @@ mod tests {
 
     #[test]
     fn native_input_layout_matches_win32_abi() {
-        let expected = if cfg!(target_pointer_width = "64") { 40 } else { 28 };
+        let expected = if cfg!(target_pointer_width = "64") {
+            40
+        } else {
+            28
+        };
         assert_eq!(size_of::<NativeInput>(), expected);
     }
 }

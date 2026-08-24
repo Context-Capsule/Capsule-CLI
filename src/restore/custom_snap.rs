@@ -235,10 +235,7 @@ fn saved_custom_windows(desktop: &SavedDesktop) -> Vec<SavedCustom<'_>> {
         .collect()
 }
 
-fn build_pairs<'a>(
-    customs: &[SavedCustom<'a>],
-    warnings: &mut Vec<String>,
-) -> Vec<SavedPair<'a>> {
+fn build_pairs<'a>(customs: &[SavedCustom<'a>], warnings: &mut Vec<String>) -> Vec<SavedPair<'a>> {
     let mut result = Vec::new();
     let mut used = vec![false; customs.len()];
 
@@ -338,7 +335,9 @@ fn same_saved_display(left: &SavedWindow, right: &SavedWindow) -> bool {
     left.display_device
         .eq_ignore_ascii_case(&right.display_device)
         || (!left.display_relation.is_empty()
-            && left.display_relation.eq_ignore_ascii_case(&right.display_relation))
+            && left
+                .display_relation
+                .eq_ignore_ascii_case(&right.display_relation))
 }
 
 fn approx(actual: f64, expected: f64) -> bool {
@@ -374,7 +373,11 @@ fn application_match_score(app: &SavedApplication, current: &CurrentWindow) -> O
         }
     }
 
-    if let Some(launch) = app.launch.as_ref().filter(|launch| launch.strategy == "executable") {
+    if let Some(launch) = app
+        .launch
+        .as_ref()
+        .filter(|launch| launch.strategy == "executable")
+    {
         if let Some(current) = current_path {
             if normalize_path(&launch.target) == normalize_path(current) {
                 return Some(95);
@@ -431,7 +434,9 @@ fn rect_distance(left: SavedRect, right: SavedRect) -> i64 {
 }
 
 fn enumerate_windows() -> Result<Vec<CurrentWindow>, String> {
-    let mut context = WindowEnumeration { windows: Vec::new() };
+    let mut context = WindowEnumeration {
+        windows: Vec::new(),
+    };
     if unsafe {
         EnumWindows(
             Some(enum_window),
@@ -555,15 +560,14 @@ fn process_path(pid: u32) -> Option<String> {
     }
     let mut buffer = vec![0_u16; 32_768];
     let mut length = buffer.len() as u32;
-    let value = if unsafe {
-        QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length)
-    } != 0
-        && length > 0
-    {
-        Some(String::from_utf16_lossy(&buffer[..length as usize]))
-    } else {
-        None
-    };
+    let value =
+        if unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) } != 0
+            && length > 0
+        {
+            Some(String::from_utf16_lossy(&buffer[..length as usize]))
+        } else {
+            None
+        };
     unsafe {
         CloseHandle(process);
     }

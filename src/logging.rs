@@ -114,7 +114,10 @@ fn append_at(path: &Path, level: LogLevel, message: &str, max_bytes: u64) -> io:
     );
     rotate_if_needed(path, max_bytes, line.len() as u64)?;
     use std::io::Write;
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
 }

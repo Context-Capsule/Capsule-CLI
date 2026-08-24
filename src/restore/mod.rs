@@ -85,10 +85,7 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
         Ok(Some(desktop)) => {
             full_application_count = desktop.applications.len();
             let zen_semantic_owner = has_browser_semantic
-                && desktop
-                    .applications
-                    .iter()
-                    .any(is_zen_semantic_application);
+                && desktop.applications.iter().any(is_zen_semantic_application);
 
             #[cfg(windows)]
             if zen_semantic_owner {
@@ -415,7 +412,12 @@ fn executable_basename(application: &SavedApplication) -> Option<&str> {
     application
         .executable_path
         .as_deref()
-        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .or_else(|| {
+            application
+                .launch
+                .as_ref()
+                .map(|launch| launch.target.as_str())
+        })
         .and_then(|value| value.rsplit(['\\', '/']).next())
 }
 
@@ -526,10 +528,12 @@ mod tests {
             RestoreOptions { dry_run: true },
         );
         assert!(report.success());
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Firefox semantic restore")));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Firefox semantic restore"))
+        );
     }
 
     #[test]
@@ -539,19 +543,42 @@ mod tests {
             displays: Vec::new(),
             applications: vec![
                 application("zen", Some(r"C:\Program Files\Zen Browser\zen.exe")),
-                application("Mozilla Firefox", Some(r"C:\Program Files\Mozilla Firefox\firefox.exe")),
+                application(
+                    "Mozilla Firefox",
+                    Some(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
+                ),
                 application("Spotify", Some(r"C:\Users\me\Spotify.exe")),
             ],
         };
         let prerequisite = desktop_without_semantic_owned_hosts(&desktop, false, false, true);
         assert_eq!(prerequisite.applications.len(), 2);
-        assert!(prerequisite.applications.iter().any(|application| application.name == "Mozilla Firefox"));
-        assert!(prerequisite.applications.iter().any(|application| application.name == "Spotify"));
-        assert!(!prerequisite.applications.iter().any(is_zen_semantic_application));
+        assert!(
+            prerequisite
+                .applications
+                .iter()
+                .any(|application| application.name == "Mozilla Firefox")
+        );
+        assert!(
+            prerequisite
+                .applications
+                .iter()
+                .any(|application| application.name == "Spotify")
+        );
+        assert!(
+            !prerequisite
+                .applications
+                .iter()
+                .any(is_zen_semantic_application)
+        );
 
         let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
         assert_eq!(final_placement.applications.len(), 3);
-        assert!(final_placement.applications.iter().any(is_zen_semantic_application));
+        assert!(
+            final_placement
+                .applications
+                .iter()
+                .any(is_zen_semantic_application)
+        );
     }
 
     #[test]
@@ -584,8 +611,16 @@ mod tests {
             .iter()
             .find(|application| is_zen_semantic_application(application))
             .unwrap();
-        assert!(zen_physical.windows.iter().all(|window| window.title.is_empty()));
-        assert_eq!(physical.applications[1].windows[0].title, "notes.txt - Notepad");
+        assert!(
+            zen_physical
+                .windows
+                .iter()
+                .all(|window| window.title.is_empty())
+        );
+        assert_eq!(
+            physical.applications[1].windows[0].title,
+            "notes.txt - Notepad"
+        );
         assert_eq!(
             desktop.applications[0]
                 .windows
@@ -754,8 +789,7 @@ mod tests {
 
         let mut packaged = base.clone();
         packaged.executable_path = None;
-        packaged.app_user_model_id =
-            Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned());
+        packaged.app_user_model_id = Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned());
         assert!(is_windows_terminal_application(&packaged));
     }
 }

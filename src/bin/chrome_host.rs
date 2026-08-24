@@ -126,9 +126,7 @@ fn doctor() -> Result<DoctorReport, String> {
         .ok_or_else(|| "manifest has no allowed_origins array".to_owned())?;
     let expected_origin = extension_origin();
     if allowed.len() != 1 || allowed[0].as_str() != Some(expected_origin.as_str()) {
-        return Err(format!(
-            "manifest must authorize only '{expected_origin}'"
-        ));
+        return Err(format!("manifest must authorize only '{expected_origin}'"));
     }
 
     let executable_path = manifest
@@ -317,7 +315,9 @@ fn print_usage() {
     println!("  capsule-chrome-host --uninstall");
     println!();
     println!("--install writes the Chrome native manifest, registers it, and validates it.");
-    println!("--doctor verifies the manifest, executable, Windows registration, and protocol launch.");
+    println!(
+        "--doctor verifies the manifest, executable, Windows registration, and protocol launch."
+    );
 }
 
 #[cfg(test)]

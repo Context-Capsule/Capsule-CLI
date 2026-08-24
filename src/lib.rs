@@ -21,21 +21,21 @@ pub(crate) mod terminal_context;
 pub mod vscode;
 
 #[cfg(windows)]
-#[path = "zen_shortcuts.rs"]
-pub(crate) mod zen_shortcuts_core;
-#[cfg(windows)]
 #[path = "zen_shortcuts_hardened.rs"]
 pub(crate) mod zen_shortcuts;
+#[cfg(windows)]
+#[path = "zen_shortcuts.rs"]
+pub(crate) mod zen_shortcuts_core;
 
+#[cfg(windows)]
+#[path = "windows_snap_safe.rs"]
+pub(crate) mod windows_snap;
+#[cfg(windows)]
+#[path = "windows_snap_coord.rs"]
+pub(crate) mod windows_snap_coord;
 #[cfg(windows)]
 #[path = "windows_snap.rs"]
 pub(crate) mod windows_snap_core;
 #[cfg(windows)]
 #[path = "windows_snap_baseline.rs"]
 pub(crate) mod windows_snap_legacy;
-#[cfg(windows)]
-#[path = "windows_snap_coord.rs"]
-pub(crate) mod windows_snap_coord;
-#[cfg(windows)]
-#[path = "windows_snap_safe.rs"]
-pub(crate) mod windows_snap;

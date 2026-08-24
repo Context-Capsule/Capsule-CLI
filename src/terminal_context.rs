@@ -27,12 +27,9 @@ pub fn prepare_for_capture(
 
     #[cfg(not(windows))]
     {
-        prepare_with(
-            snapshot,
-            vscode_semantic_available,
-            &HashSet::new(),
-            |_| None,
-        )
+        prepare_with(snapshot, vscode_semantic_available, &HashSet::new(), |_| {
+            None
+        })
     }
 }
 
@@ -279,13 +276,7 @@ mod windows_process {
             return None;
         }
 
-        let raw = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                0,
-                pid,
-            )
-        };
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
         if raw.is_null() {
             return None;
         }
@@ -384,13 +375,7 @@ mod windows_process {
     fn read_exact(process: Handle, address: usize, buffer: *mut c_void, size: usize) -> bool {
         let mut read = 0_usize;
         unsafe {
-            ReadProcessMemory(
-                process,
-                address as *const c_void,
-                buffer,
-                size,
-                &mut read,
-            ) != 0
+            ReadProcessMemory(process, address as *const c_void, buffer, size, &mut read) != 0
                 && read == size
         }
     }
@@ -476,7 +461,10 @@ mod tests {
             (pid == 20).then(|| r"C:\work\project".to_owned())
         });
         let restored = &prepared.sessions[0];
-        assert_eq!(restored.working_directory.as_deref(), Some(r"C:\work\project"));
+        assert_eq!(
+            restored.working_directory.as_deref(),
+            Some(r"C:\work\project")
+        );
         assert_eq!(
             restored
                 .restart
@@ -497,6 +485,9 @@ mod tests {
         }
         assert_eq!(prepared.sessions.len(), value.sessions.len());
         assert_eq!(prepared.sessions[0].pid, value.sessions[0].pid);
-        assert_eq!(prepared.sessions[0].working_directory.as_deref(), Some(r"C:\work\project"));
+        assert_eq!(
+            prepared.sessions[0].working_directory.as_deref(),
+            Some(r"C:\work\project")
+        );
     }
 }

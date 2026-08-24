@@ -1,11 +1,7 @@
 #![cfg(windows)]
 
 use crate::zen_shortcuts_core;
-use std::{
-    ffi::c_void,
-    thread,
-    time::Duration,
-};
+use std::{ffi::c_void, thread, time::Duration};
 
 type Hwnd = *mut c_void;
 type Bool = i32;
@@ -41,7 +37,9 @@ impl InputQueueAttachment {
         let current_thread = unsafe { GetCurrentThreadId() };
         let target_thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
         if target_thread == 0 {
-            return Err("could not resolve Zen's foreground GUI thread before split invocation".to_owned());
+            return Err(
+                "could not resolve Zen's foreground GUI thread before split invocation".to_owned(),
+            );
         }
         if target_thread == current_thread {
             return Ok(Self {

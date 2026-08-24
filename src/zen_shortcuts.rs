@@ -158,11 +158,19 @@ fn split_action(orientation: &str) -> Result<(&'static str, char), String> {
 fn resolve_shortcut(action: &str, fallback_key: char) -> Result<ResolvedShortcut, String> {
     if let Some(path) = zen_shortcuts_path()? {
         if path.is_file() {
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("could not read Zen shortcuts '{}': {error}", path.display()))?;
-            let parsed: ShortcutFile = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("Zen shortcuts '{}' are invalid JSON: {error}", path.display()))?;
-            let binding = parsed.shortcuts.iter().find(|binding| binding.action == action);
+            let bytes = fs::read(&path).map_err(|error| {
+                format!("could not read Zen shortcuts '{}': {error}", path.display())
+            })?;
+            let parsed: ShortcutFile = serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "Zen shortcuts '{}' are invalid JSON: {error}",
+                    path.display()
+                )
+            })?;
+            let binding = parsed
+                .shortcuts
+                .iter()
+                .find(|binding| binding.action == action);
             if let Some(binding) = binding {
                 if binding.disabled {
                     return Err(format!(
@@ -200,7 +208,10 @@ fn resolve_shortcut(action: &str, fallback_key: char) -> Result<ResolvedShortcut
 fn binding_virtual_key(binding: &ShortcutBinding) -> Result<u16, String> {
     if !binding.keycode.trim().is_empty() {
         return virtual_key_from_keycode(binding.keycode.trim()).ok_or_else(|| {
-            format!("unsupported Zen keycode '{}' for {}", binding.keycode, binding.action)
+            format!(
+                "unsupported Zen keycode '{}' for {}",
+                binding.keycode, binding.action
+            )
         });
     }
     let mut chars = binding.key.chars();
@@ -227,18 +238,25 @@ fn ascii_virtual_key(character: char) -> Result<u16, String> {
 fn char_virtual_key(character: char) -> Result<u16, String> {
     let code = u32::from(character);
     if code > u16::MAX as u32 {
-        return Err(format!("shortcut character '{character}' is outside the Windows BMP"));
+        return Err(format!(
+            "shortcut character '{character}' is outside the Windows BMP"
+        ));
     }
     let mapped = unsafe { VkKeyScanW(code as u16) };
     if mapped == -1 {
-        return Err(format!("Windows cannot map Zen shortcut character '{character}' to a virtual key"));
+        return Err(format!(
+            "Windows cannot map Zen shortcut character '{character}' to a virtual key"
+        ));
     }
     Ok((mapped as u16) & 0x00ff)
 }
 
 fn virtual_key_from_keycode(keycode: &str) -> Option<u16> {
     let upper = keycode.trim().to_ascii_uppercase();
-    if let Some(number) = upper.strip_prefix("VK_F").and_then(|value| value.parse::<u16>().ok()) {
+    if let Some(number) = upper
+        .strip_prefix("VK_F")
+        .and_then(|value| value.parse::<u16>().ok())
+    {
         if (1..=24).contains(&number) {
             return Some(0x70 + number - 1);
         }
@@ -320,7 +338,8 @@ fn send_shortcut(shortcut: &ResolvedShortcut) -> Result<(), String> {
     // step fails, release every modifier best-effort so Context Capsule never
     // leaves Ctrl/Alt/Shift/Win logically held down.
     for virtual_key in &modifiers {
-        if let Err(error) = send_input_step(&[keyboard_input(*virtual_key, false)], shortcut.source) {
+        if let Err(error) = send_input_step(&[keyboard_input(*virtual_key, false)], shortcut.source)
+        {
             release_modifiers_best_effort(&modifiers);
             return Err(error);
         }
@@ -338,7 +357,8 @@ fn send_shortcut(shortcut: &ResolvedShortcut) -> Result<(), String> {
     thread::sleep(SHORTCUT_STEP_SETTLE);
 
     for virtual_key in modifiers.iter().rev() {
-        if let Err(error) = send_input_step(&[keyboard_input(*virtual_key, true)], shortcut.source) {
+        if let Err(error) = send_input_step(&[keyboard_input(*virtual_key, true)], shortcut.source)
+        {
             release_modifiers_best_effort(&modifiers);
             return Err(error);
         }
@@ -390,7 +410,9 @@ fn foreground_executable() -> Result<Option<PathBuf>, String> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if process.is_null() {
         let error = unsafe { GetLastError() };
-        return Err(format!("OpenProcess({process_id}) failed with Win32 error {error}"));
+        return Err(format!(
+            "OpenProcess({process_id}) failed with Win32 error {error}"
+        ));
     }
 
     let mut buffer = vec![0_u16; 32_768];
@@ -399,7 +421,9 @@ fn foreground_executable() -> Result<Option<PathBuf>, String> {
     unsafe { CloseHandle(process) };
     if ok == 0 {
         let error = unsafe { GetLastError() };
-        return Err(format!("QueryFullProcessImageNameW failed with Win32 error {error}"));
+        return Err(format!(
+            "QueryFullProcessImageNameW failed with Win32 error {error}"
+        ));
     }
     buffer.truncate(size as usize);
     Ok(Some(PathBuf::from(String::from_utf16_lossy(&buffer))))
@@ -408,7 +432,9 @@ fn foreground_executable() -> Result<Option<PathBuf>, String> {
 fn is_zen_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen"))
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("zen.exe") || name.eq_ignore_ascii_case("zen")
+        })
 }
 
 fn zen_shortcuts_path() -> Result<Option<PathBuf>, String> {
@@ -416,7 +442,9 @@ fn zen_shortcuts_path() -> Result<Option<PathBuf>, String> {
         if explicit.is_empty() {
             return Err("CONTEXT_CAPSULE_ZEN_PROFILE is empty".to_owned());
         }
-        return Ok(Some(PathBuf::from(explicit).join("zen-keyboard-shortcuts.json")));
+        return Ok(Some(
+            PathBuf::from(explicit).join("zen-keyboard-shortcuts.json"),
+        ));
     }
 
     let Some(app_data) = env::var_os("APPDATA") else {
@@ -446,7 +474,9 @@ fn resolve_profile_from_ini(root: &Path, text: &str) -> Result<Option<PathBuf>, 
             values.entry(section.clone()).or_default();
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         if section.is_empty() {
             continue;
         }
@@ -460,7 +490,10 @@ fn resolve_profile_from_ini(root: &Path, text: &str) -> Result<Option<PathBuf>, 
         if !name.starts_with("Install") {
             continue;
         }
-        if let Some(default) = section_values.get("Default").filter(|value| !value.is_empty()) {
+        if let Some(default) = section_values
+            .get("Default")
+            .filter(|value| !value.is_empty())
+        {
             return Ok(Some(resolve_profile_path(root, default, true)));
         }
     }
@@ -475,11 +508,18 @@ fn resolve_profile_from_ini(root: &Path, text: &str) -> Result<Option<PathBuf>, 
         };
         profiles.push(ProfileEntry {
             path: path.clone(),
-            relative: section_values.get("IsRelative").is_none_or(|value| value != "0"),
-            default: section_values.get("Default").is_some_and(|value| value == "1"),
+            relative: section_values
+                .get("IsRelative")
+                .is_none_or(|value| value != "0"),
+            default: section_values
+                .get("Default")
+                .is_some_and(|value| value == "1"),
         });
     }
-    let selected = profiles.iter().find(|profile| profile.default).or_else(|| profiles.first());
+    let selected = profiles
+        .iter()
+        .find(|profile| profile.default)
+        .or_else(|| profiles.first());
     Ok(selected.map(|profile| resolve_profile_path(root, &profile.path, profile.relative)))
 }
 
@@ -497,8 +537,14 @@ mod tests {
 
     #[test]
     fn resolves_zen_split_actions() {
-        assert_eq!(split_action("vertical").unwrap(), ("cmd_zenSplitViewVertical", 'V'));
-        assert_eq!(split_action("horizontal").unwrap(), ("cmd_zenSplitViewHorizontal", 'H'));
+        assert_eq!(
+            split_action("vertical").unwrap(),
+            ("cmd_zenSplitViewVertical", 'V')
+        );
+        assert_eq!(
+            split_action("horizontal").unwrap(),
+            ("cmd_zenSplitViewHorizontal", 'H')
+        );
         assert_eq!(split_action("grid").unwrap(), ("cmd_zenSplitViewGrid", 'G'));
         assert!(split_action("diagonal").is_err());
     }
