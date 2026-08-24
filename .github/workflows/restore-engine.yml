@@ -153,3 +153,5 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
             -d "{\"state\":\"$state\",\"context\":\"ci/potus-restore-linux\",\"description\":\"POTUS-linux restore: $JOB_STATUS\",\"target_url\":\"$target_url\"}" >/dev/null
+
+# rerun requested after self-hosted runner dependency setup
