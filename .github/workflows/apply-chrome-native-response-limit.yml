@@ -1,0 +1,84 @@
+name: Apply Chrome Native Response Limit Fix
+
+on:
+  push:
+    branches: ['feature/chrome-browser-adapter-20260822']
+    paths: ['.github/workflows/apply-chrome-native-response-limit.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.event.head_commit.message == 'chore: apply Chrome native response limit fix'
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/chrome-browser-adapter-20260822
+      - name: Ensure stable Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+      - name: Apply Chromium host-to-browser response ceiling
+        shell: pwsh
+        run: |
+          $path = 'src/chrome.rs'
+          $text = Get-Content $path -Raw
+
+          function Replace-ExactlyOnce([string]$old, [string]$new) {
+            $count = ([regex]::Matches($script:text, [regex]::Escape($old))).Count
+            if ($count -ne 1) { throw "Expected exactly one occurrence, found $count: $old" }
+            $script:text = $script:text.Replace($old, $new)
+          }
+
+          Replace-ExactlyOnce `
+            'const MAX_NATIVE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;' `
+            "const MAX_NATIVE_REQUEST_BYTES: usize = 8 * 1024 * 1024;`r`nconst MAX_NATIVE_RESPONSE_BYTES: usize = 1024 * 1024;"
+          Replace-ExactlyOnce `
+            'if length == 0 || length > MAX_NATIVE_MESSAGE_BYTES {' `
+            'if length == 0 || length > MAX_NATIVE_REQUEST_BYTES {'
+          Replace-ExactlyOnce `
+            'if payload.is_empty() || payload.len() > MAX_NATIVE_MESSAGE_BYTES {' `
+            'if payload.is_empty() || payload.len() > MAX_NATIVE_RESPONSE_BYTES {'
+
+          $marker = @'
+    #[test]
+    fn native_ping_reads_and_writes_framed_messages() {
+'@
+          $test = @'
+    #[test]
+    fn rejects_native_response_larger_than_chromium_host_limit() {
+        let mut output = Vec::new();
+        let payload = vec![b'x'; MAX_NATIVE_RESPONSE_BYTES + 1];
+        let error = write_native_message(&mut output, &payload).unwrap_err();
+        assert!(error.to_string().contains("invalid native response length"));
+        assert!(output.is_empty());
+    }
+
+'@
+          $count = ([regex]::Matches($text, [regex]::Escape($marker))).Count
+          if ($count -ne 1) { throw "Expected exactly one native ping test marker, found $count" }
+          $text = $text.Replace($marker, $test + $marker)
+          Set-Content -Path $path -Value $text -Encoding utf8NoBOM
+      - run: cargo fmt --all -- --check
+      - run: cargo check --all-targets
+      - run: cargo test chrome -- --nocapture
+      - name: Commit verified fix and remove one-shot workflow
+        shell: pwsh
+        run: |
+          git rm .github/workflows/apply-chrome-native-response-limit.yml
+          git add src/chrome.rs
+          git config user.name 'GPT-Slave'
+          git config user.email '313162660+GPT-Slave@users.noreply.github.com'
+          git commit -m 'fix: enforce Chromium native response size limit'
+          if ($LASTEXITCODE -ne 0) { throw 'git commit failed' }
+          git push origin HEAD:feature/chrome-browser-adapter-20260822
+          if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
