@@ -39,3 +39,5 @@ pub(crate) mod windows_snap_core;
 #[cfg(windows)]
 #[path = "windows_snap_baseline.rs"]
 pub(crate) mod windows_snap_legacy;
+
+// CI rerun trigger for self-hosted runner validation.
