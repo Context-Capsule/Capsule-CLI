@@ -23,9 +23,18 @@ jobs:
         run: |
           if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Ensure stable Rust toolchain
+        shell: pwsh
+        run: |
+          Get-Command rustup -ErrorAction Stop | Format-List Source
+          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+          rustc --version
+          if ($LASTEXITCODE -ne 0) { throw 'rustc is unavailable after rustup setup' }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo is unavailable after rustup setup' }
       - run: cargo fmt --all -- --check
       - run: cargo check --all-targets
       - run: cargo test chrome -- --nocapture
