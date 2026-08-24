@@ -88,3 +88,5 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'format commit failed' }
           git push origin "HEAD:${env:GITHUB_REF_NAME}"
           if ($LASTEXITCODE -ne 0) { throw 'format commit push failed' }
+
+# rerun requested after POTUS/POTUS-linux dependency setup
