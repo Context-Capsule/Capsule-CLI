@@ -1,4 +1,4 @@
-name: Format Feature Branch
+name: Finalize Self-Hosted CI
 
 on:
   push:
@@ -10,83 +10,131 @@ permissions:
   contents: write
 
 concurrency:
-  group: format-${{ github.ref }}
+  group: finalize-self-hosted-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  rustfmt:
-    runs-on: [self-hosted, Windows, X64]
-    defaults:
-      run:
-        shell: powershell
+  finalize:
+    runs-on: [self-hosted, Linux, X64]
     steps:
-      - name: Verify POTUS runner and Rust tools
+      - name: Verify POTUS-linux runner
+        shell: bash
         run: |
-          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
-          Get-Command cargo -ErrorAction Stop | Format-List Source
-          Get-Command rustup -ErrorAction Stop | Format-List Source
-          rustup component add rustfmt
-          if ($LASTEXITCODE -ne 0) { throw 'could not install/enable rustfmt' }
+          set -euo pipefail
+          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
 
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      - name: Apply canonical Rust formatting
-        run: |
-          cargo fmt --all
-          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
-      - name: Make Windows self-hosted jobs compatible with Windows PowerShell
-        run: |
-          $workflowPaths = @(
-            '.github/workflows/rust.yml',
-            '.github/workflows/restore-engine.yml',
-            '.github/workflows/firefox-native-host.yml',
-            '.github/workflows/chrome-native-host.yml',
-            '.github/workflows/zen-native-messaging-e2e.yml'
-          )
+      - name: Verify canonical Rust formatting
+        shell: bash
+        run: cargo fmt --all -- --check
 
-          foreach ($path in $workflowPaths) {
-            $text = Get-Content $path -Raw
-            $text = $text.Replace('shell: pwsh', 'shell: powershell')
-            $marker = "    runs-on: [self-hosted, Windows, X64]`n"
-            if (-not $text.Contains($marker)) {
-              $marker = "    runs-on: [self-hosted, Windows, X64]`r`n"
-            }
-            if ($text.Contains($marker)) {
-              $newline = if ($marker.Contains("`r`n")) { "`r`n" } else { "`n" }
-              $replacement = $marker + "    defaults:$newline      run:$newline        shell: powershell$newline"
-              $text = $text.Replace($marker, $replacement)
-            }
-            Set-Content -Path $path -Value $text -Encoding utf8
-          }
-
-      - name: Verify formatting result
+      - name: Replace Windows action toolchain setup with rustup
+        shell: bash
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          paths = [
+              Path('.github/workflows/rust.yml'),
+              Path('.github/workflows/restore-engine.yml'),
+              Path('.github/workflows/firefox-native-host.yml'),
+              Path('.github/workflows/chrome-native-host.yml'),
+              Path('.github/workflows/zen-native-messaging-e2e.yml'),
+          ]
+
+          replacement = [
+              '      - name: Ensure stable Rust toolchain\n',
+              '        shell: pwsh\n',
+              '        run: |\n',
+              "          Get-Command rustup -ErrorAction Stop | Format-List Source\n",
+              "          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update\n",
+              "          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }\n",
+              "          rustup default stable\n",
+              "          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }\n",
+              "          rustc --version\n",
+              "          if ($LASTEXITCODE -ne 0) { throw 'rustc is unavailable after rustup setup' }\n",
+              "          cargo --version\n",
+              "          if ($LASTEXITCODE -ne 0) { throw 'cargo is unavailable after rustup setup' }\n",
+          ]
+
+          for path in paths:
+              lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+              output = []
+              windows_job = False
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  if re.match(r'^  [A-Za-z0-9_-]+:\s*$', line):
+                      windows_job = False
+                  if 'runs-on: [self-hosted, Windows, X64]' in line:
+                      windows_job = True
+
+                  if windows_job and line.strip() == '- uses: dtolnay/rust-toolchain@stable':
+                      output.extend(replacement)
+                      i += 1
+                      while i < len(lines):
+                          candidate = lines[i]
+                          indent = len(candidate) - len(candidate.lstrip(' '))
+                          if candidate.strip() and indent <= 6:
+                              break
+                          i += 1
+                      continue
+
+                  output.append(line)
+                  i += 1
+
+              new_text = ''.join(output)
+              if 'runs-on: [self-hosted, Windows, X64]' in new_text and 'dtolnay/rust-toolchain@stable' in new_text:
+                  # Linux jobs may still legitimately use dtolnay. Verify no Windows job kept it.
+                  current_windows = False
+                  for line in new_text.splitlines():
+                      if re.match(r'^  [A-Za-z0-9_-]+:\s*$', line):
+                          current_windows = False
+                      if 'runs-on: [self-hosted, Windows, X64]' in line:
+                          current_windows = True
+                      if current_windows and 'dtolnay/rust-toolchain@stable' in line:
+                          raise SystemExit(f'{path}: Windows job still contains dtolnay/rust-toolchain')
+              path.write_text(new_text, encoding='utf-8', newline='\n')
+          PY
+
+      - name: Validate mechanical workflow changes
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo fmt --all -- --check
-          if ($LASTEXITCODE -ne 0) { throw 'repository is still not rustfmt-clean' }
           git diff --check
-          if ($LASTEXITCODE -ne 0) { throw 'mechanical edits introduced whitespace errors' }
+          for path in .github/workflows/rust.yml .github/workflows/restore-engine.yml .github/workflows/firefox-native-host.yml .github/workflows/chrome-native-host.yml .github/workflows/zen-native-messaging-e2e.yml; do
+            grep -F 'Ensure stable Rust toolchain' "$path" >/dev/null
+          done
 
-      - name: Commit mechanical fixes if needed
+      - name: Remove one-shot migration workflow and push
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          git rm .github/workflows/format-feature.yml
           git status --short
-          git diff --quiet
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host 'Sources and workflows are already normalized.'
-            exit 0
-          }
-          $global:LASTEXITCODE = 0
+          git diff --check
+
+          git fetch origin "${GITHUB_REF_NAME}"
+          remote_sha="$(git rev-parse "origin/${GITHUB_REF_NAME}")"
+          if [ "$remote_sha" != "$GITHUB_SHA" ]; then
+            echo "Branch moved while migration was running: expected $GITHUB_SHA, found $remote_sha" >&2
+            exit 1
+          fi
+
           git config user.name 'Context Capsule CI'
           git config user.email 'actions@users.noreply.github.com'
-          git add src tests .github/workflows/rust.yml .github/workflows/restore-engine.yml .github/workflows/firefox-native-host.yml .github/workflows/chrome-native-host.yml .github/workflows/zen-native-messaging-e2e.yml
-          git commit -m 'style: apply rustfmt and Windows CI shell compatibility'
-          if ($LASTEXITCODE -ne 0) { throw 'format commit failed' }
-          git push origin "HEAD:${env:GITHUB_REF_NAME}"
-          if ($LASTEXITCODE -ne 0) { throw 'format commit push failed' }
-
-# rerun requested after POTUS/POTUS-linux dependency setup
+          git add .github/workflows
+          git commit -m 'ci: make Windows Rust setup self-hosted-safe'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
