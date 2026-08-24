@@ -15,126 +15,112 @@ concurrency:
 
 jobs:
   finalize:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Windows, X64]
     steps:
-      - name: Verify POTUS-linux runner
-        shell: bash
+      - name: Verify POTUS runner
+        shell: pwsh
         run: |
-          set -euo pipefail
-          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
 
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Verify canonical Rust formatting
-        shell: bash
-        run: cargo fmt --all -- --check
-
-      - name: Replace Windows action toolchain setup with rustup
-        shell: bash
+      - name: Replace Windows Rust action with installed rustup
+        shell: pwsh
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          $paths = @(
+            '.github/workflows/rust.yml',
+            '.github/workflows/restore-engine.yml',
+            '.github/workflows/firefox-native-host.yml',
+            '.github/workflows/chrome-native-host.yml',
+            '.github/workflows/zen-native-messaging-e2e.yml'
+          )
 
-          paths = [
-              Path('.github/workflows/rust.yml'),
-              Path('.github/workflows/restore-engine.yml'),
-              Path('.github/workflows/firefox-native-host.yml'),
-              Path('.github/workflows/chrome-native-host.yml'),
-              Path('.github/workflows/zen-native-messaging-e2e.yml'),
-          ]
+          $replacement = @(
+            '      - name: Ensure stable Rust toolchain',
+            '        shell: pwsh',
+            '        run: |',
+            '          Get-Command rustup -ErrorAction Stop | Format-List Source',
+            '          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update',
+            "          if (`$LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }",
+            '          rustup default stable',
+            "          if (`$LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }",
+            '          rustc --version',
+            "          if (`$LASTEXITCODE -ne 0) { throw 'rustc is unavailable after rustup setup' }",
+            '          cargo --version',
+            "          if (`$LASTEXITCODE -ne 0) { throw 'cargo is unavailable after rustup setup' }"
+          )
 
-          replacement = [
-              '      - name: Ensure stable Rust toolchain\n',
-              '        shell: pwsh\n',
-              '        run: |\n',
-              "          Get-Command rustup -ErrorAction Stop | Format-List Source\n",
-              "          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update\n",
-              "          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }\n",
-              "          rustup default stable\n",
-              "          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }\n",
-              "          rustc --version\n",
-              "          if ($LASTEXITCODE -ne 0) { throw 'rustc is unavailable after rustup setup' }\n",
-              "          cargo --version\n",
-              "          if ($LASTEXITCODE -ne 0) { throw 'cargo is unavailable after rustup setup' }\n",
-          ]
+          foreach ($path in $paths) {
+            $lines = @(Get-Content -Path $path)
+            $output = [System.Collections.Generic.List[string]]::new()
+            $windowsJob = $false
+            $i = 0
 
-          for path in paths:
-              lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
-              output = []
-              windows_job = False
-              i = 0
-              while i < len(lines):
-                  line = lines[i]
-                  if re.match(r'^  [A-Za-z0-9_-]+:\s*$', line):
-                      windows_job = False
-                  if 'runs-on: [self-hosted, Windows, X64]' in line:
-                      windows_job = True
+            while ($i -lt $lines.Count) {
+              $line = [string]$lines[$i]
+              if ($line -match '^  [A-Za-z0-9_-]+:\s*$') { $windowsJob = $false }
+              if ($line.Contains('runs-on: [self-hosted, Windows, X64]')) { $windowsJob = $true }
 
-                  if windows_job and line.strip() == '- uses: dtolnay/rust-toolchain@stable':
-                      output.extend(replacement)
-                      i += 1
-                      while i < len(lines):
-                          candidate = lines[i]
-                          indent = len(candidate) - len(candidate.lstrip(' '))
-                          if candidate.strip() and indent <= 6:
-                              break
-                          i += 1
-                      continue
+              if ($windowsJob -and $line.Trim() -eq '- uses: dtolnay/rust-toolchain@stable') {
+                foreach ($replacementLine in $replacement) { $output.Add($replacementLine) }
+                $i++
+                while ($i -lt $lines.Count) {
+                  $candidate = [string]$lines[$i]
+                  $indent = $candidate.Length - $candidate.TrimStart(' ').Length
+                  if ($candidate.Trim().Length -gt 0 -and $indent -le 6) { break }
+                  $i++
+                }
+                continue
+              }
 
-                  output.append(line)
-                  i += 1
+              $output.Add($line)
+              $i++
+            }
 
-              new_text = ''.join(output)
-              if 'runs-on: [self-hosted, Windows, X64]' in new_text and 'dtolnay/rust-toolchain@stable' in new_text:
-                  # Linux jobs may still legitimately use dtolnay. Verify no Windows job kept it.
-                  current_windows = False
-                  for line in new_text.splitlines():
-                      if re.match(r'^  [A-Za-z0-9_-]+:\s*$', line):
-                          current_windows = False
-                      if 'runs-on: [self-hosted, Windows, X64]' in line:
-                          current_windows = True
-                      if current_windows and 'dtolnay/rust-toolchain@stable' in line:
-                          raise SystemExit(f'{path}: Windows job still contains dtolnay/rust-toolchain')
-              path.write_text(new_text, encoding='utf-8', newline='\n')
-          PY
+            Set-Content -Path $path -Value $output -Encoding utf8
 
-      - name: Validate mechanical workflow changes
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fmt --all -- --check
-          git diff --check
-          for path in .github/workflows/rust.yml .github/workflows/restore-engine.yml .github/workflows/firefox-native-host.yml .github/workflows/chrome-native-host.yml .github/workflows/zen-native-messaging-e2e.yml; do
-            grep -F 'Ensure stable Rust toolchain' "$path" >/dev/null
-          done
+            $checkLines = @(Get-Content -Path $path)
+            $insideWindows = $false
+            foreach ($checkLine in $checkLines) {
+              if ($checkLine -match '^  [A-Za-z0-9_-]+:\s*$') { $insideWindows = $false }
+              if ($checkLine.Contains('runs-on: [self-hosted, Windows, X64]')) { $insideWindows = $true }
+              if ($insideWindows -and $checkLine.Contains('dtolnay/rust-toolchain@stable')) {
+                throw "$path still contains dtolnay/rust-toolchain inside a Windows job"
+              }
+            }
+          }
 
-      - name: Remove one-shot migration workflow and push
-        shell: bash
+      - name: Validate and push migration
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          git rm .github/workflows/format-feature.yml
-          git status --short
           git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'workflow edits contain whitespace errors' }
 
-          git fetch origin "${GITHUB_REF_NAME}"
-          remote_sha="$(git rev-parse "origin/${GITHUB_REF_NAME}")"
-          if [ "$remote_sha" != "$GITHUB_SHA" ]; then
-            echo "Branch moved while migration was running: expected $GITHUB_SHA, found $remote_sha" >&2
-            exit 1
-          fi
+          foreach ($path in @('.github/workflows/rust.yml','.github/workflows/restore-engine.yml','.github/workflows/firefox-native-host.yml','.github/workflows/chrome-native-host.yml','.github/workflows/zen-native-messaging-e2e.yml')) {
+            if (-not (Select-String -Path $path -SimpleMatch 'Ensure stable Rust toolchain' -Quiet)) {
+              throw "$path was not migrated"
+            }
+          }
+
+          git rm .github/workflows/format-feature.yml
+          if ($LASTEXITCODE -ne 0) { throw 'could not remove one-shot migration workflow' }
+
+          git fetch origin $env:GITHUB_REF_NAME
+          if ($LASTEXITCODE -ne 0) { throw 'could not refresh branch before push' }
+          $remoteSha = (git rev-parse "origin/$env:GITHUB_REF_NAME").Trim()
+          if ($remoteSha -ne $env:GITHUB_SHA) {
+            throw "branch moved while migration was running: expected $env:GITHUB_SHA, found $remoteSha"
+          }
 
           git config user.name 'Context Capsule CI'
           git config user.email 'actions@users.noreply.github.com'
           git add .github/workflows
           git commit -m 'ci: make Windows Rust setup self-hosted-safe'
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          if ($LASTEXITCODE -ne 0) { throw 'migration commit failed' }
+          git push origin "HEAD:$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw 'migration push failed' }
