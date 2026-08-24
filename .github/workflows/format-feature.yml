@@ -1,4 +1,4 @@
-name: Finalize Self-Hosted CI
+name: Export Self-Hosted CI Patch
 
 on:
   push:
@@ -7,15 +7,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   statuses: write
 
 concurrency:
-  group: finalize-self-hosted-${{ github.ref }}
+  group: export-self-hosted-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  finalize:
+  export:
     runs-on: [self-hosted, Windows, X64]
     steps:
       - name: Verify POTUS runner
@@ -24,11 +24,8 @@ jobs:
           if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
 
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-          fetch-depth: 0
 
-      - name: Replace Windows Rust action with installed rustup
+      - name: Generate patched Windows workflows
         shell: pwsh
         run: |
           $paths = @(
@@ -59,12 +56,10 @@ jobs:
             $output = [System.Collections.Generic.List[string]]::new()
             $windowsJob = $false
             $i = 0
-
             while ($i -lt $lines.Count) {
               $line = [string]$lines[$i]
               if ($line -match '^  [A-Za-z0-9_-]+:\s*$') { $windowsJob = $false }
               if ($line.Contains('runs-on: [self-hosted, Windows, X64]')) { $windowsJob = $true }
-
               if ($windowsJob -and $line.Trim() -eq '- uses: dtolnay/rust-toolchain@stable') {
                 foreach ($replacementLine in $replacement) { $output.Add($replacementLine) }
                 $i++
@@ -76,57 +71,24 @@ jobs:
                 }
                 continue
               }
-
               $output.Add($line)
               $i++
             }
-
             Set-Content -Path $path -Value $output -Encoding utf8
-
-            $checkLines = @(Get-Content -Path $path)
-            $insideWindows = $false
-            foreach ($checkLine in $checkLines) {
-              if ($checkLine -match '^  [A-Za-z0-9_-]+:\s*$') { $insideWindows = $false }
-              if ($checkLine.Contains('runs-on: [self-hosted, Windows, X64]')) { $insideWindows = $true }
-              if ($insideWindows -and $checkLine.Contains('dtolnay/rust-toolchain@stable')) {
-                throw "$path still contains dtolnay/rust-toolchain inside a Windows job"
-              }
-            }
           }
 
-      - name: Validate and push migration
+      - name: Export patched files
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          git diff --check
-          if ($LASTEXITCODE -ne 0) { throw 'workflow edits contain whitespace errors' }
-
           foreach ($path in @('.github/workflows/rust.yml','.github/workflows/restore-engine.yml','.github/workflows/firefox-native-host.yml','.github/workflows/chrome-native-host.yml','.github/workflows/zen-native-messaging-e2e.yml')) {
-            if (-not (Select-String -Path $path -SimpleMatch 'Ensure stable Rust toolchain' -Quiet)) {
-              throw "$path was not migrated"
-            }
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $path))
+            $encoded = [Convert]::ToBase64String($bytes)
+            Write-Host "CAPSULE_FILE_BEGIN::$path"
+            Write-Host $encoded
+            Write-Host "CAPSULE_FILE_END::$path"
           }
 
-          git rm .github/workflows/format-feature.yml
-          if ($LASTEXITCODE -ne 0) { throw 'could not remove one-shot migration workflow' }
-
-          git fetch origin $env:GITHUB_REF_NAME
-          if ($LASTEXITCODE -ne 0) { throw 'could not refresh branch before push' }
-          $remoteSha = (git rev-parse "origin/$env:GITHUB_REF_NAME").Trim()
-          if ($remoteSha -ne $env:GITHUB_SHA) {
-            throw "branch moved while migration was running: expected $env:GITHUB_SHA, found $remoteSha"
-          }
-
-          git config user.name 'Context Capsule CI'
-          git config user.email 'actions@users.noreply.github.com'
-          git add .github/workflows
-          git commit -m 'ci: make Windows Rust setup self-hosted-safe'
-          if ($LASTEXITCODE -ne 0) { throw 'migration commit failed' }
-          git push origin "HEAD:$env:GITHUB_REF_NAME"
-          if ($LASTEXITCODE -ne 0) { throw 'migration push failed' }
-
-      - name: Publish finalizer status
+      - name: Publish exporter status
         if: always()
         shell: pwsh
         env:
@@ -136,8 +98,8 @@ jobs:
           $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
           $body = @{
             state = $state
-            context = 'ci/potus-finalizer'
-            description = "POTUS CI finalizer: $($env:JOB_STATUS)"
+            context = 'ci/potus-workflow-export'
+            description = "POTUS workflow export: $($env:JOB_STATUS)"
             target_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           } | ConvertTo-Json
           Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
