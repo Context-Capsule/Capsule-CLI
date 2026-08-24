@@ -2,19 +2,35 @@ name: VS Code State Integration
 
 on:
   push:
-    branches: [main, 'agent/**']
+    branches: [main, 'agent/**', 'feature/**']
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  vscode-state-to-capsule:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  vscode-state-to-capsule-windows:
+    runs-on: [self-hosted, Windows, X64]
     steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Ensure stable Rust toolchain
+        shell: pwsh
+        run: |
+          Get-Command rustup -ErrorAction Stop | Format-List Source
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
       - name: Configure isolated runtime paths
         shell: pwsh
         run: |
@@ -69,6 +85,7 @@ jobs:
       - name: Save runtime state into the SQLite capsule and verify semantics
         shell: pwsh
         run: |
+          Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
           cargo run --quiet -- save vscode-contract
           if ($LASTEXITCODE -ne 0) { throw 'capsule save failed' }
           $storedPath = Join-Path $env:RUNNER_TEMP 'stored-vscode.json'
@@ -84,3 +101,113 @@ jobs:
           if (-not $vscode.tabGroups[0].tabs[0].pinned) { throw 'pinned editor state was not preserved' }
           if ($vscode.visibleEditorSelections[0].selections[0].active[1] -ne 8) { throw 'selection state was not preserved' }
           Write-Host 'VS Code producer schema -> Rust parser -> SQLite capsule contract passed.'
+      - name: Publish Windows VS Code state status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{ state = $state; context = 'ci/potus-vscode-state-windows'; description = "POTUS VS Code state Windows: $($env:JOB_STATUS)" } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
+
+  vscode-state-to-capsule-linux:
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      CONTEXT_CAPSULE_VSCODE_STATE_PATH: ${{ runner.temp }}/context-capsule-vscode-state.json
+      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-vscode.db
+    steps:
+      - name: Verify POTUS-linux runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and test VS Code state parser
+        run: |
+          cargo build
+          cargo test vscode
+      - name: Write a producer-compatible live VS Code snapshot
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          now = int(time.time() * 1000)
+          payload = {
+              'updatedAtUnixMs': now,
+              'snapshot': {
+                  'schemaVersion': 1,
+                  'capturedAtUnixMs': now,
+                  'appName': 'Visual Studio Code',
+                  'appHost': 'desktop',
+                  'remoteName': 'wsl',
+                  'workspaceTrusted': True,
+                  'workspaceFile': None,
+                  'workspaceFolders': [{
+                      'uri': 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule',
+                      'name': 'context-capsule',
+                      'index': 0,
+                  }],
+                  'tabGroups': [{
+                      'viewColumn': 1,
+                      'active': True,
+                      'tabs': [{
+                          'label': 'main.rs',
+                          'inputKind': 'text',
+                          'uri': 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs',
+                          'active': True,
+                          'dirty': False,
+                          'pinned': True,
+                          'preview': False,
+                          'restorable': True,
+                      }],
+                  }],
+                  'visibleEditorSelections': [{
+                      'uri': 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs',
+                      'viewColumn': 1,
+                      'selections': [{'anchor': [4, 2], 'active': [4, 8]}],
+                  }],
+                  'activeEditorUri': 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs',
+              },
+          }
+          with open(os.environ['CONTEXT_CAPSULE_VSCODE_STATE_PATH'], 'w', encoding='utf-8') as handle:
+              json.dump(payload, handle, separators=(',', ':'))
+          PY
+      - name: Save runtime state into the SQLite capsule and verify semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$CONTEXT_CAPSULE_DB"
+          cargo run --quiet -- save vscode-contract
+          cargo run --quiet -- show vscode-contract --json > "$RUNNER_TEMP/stored-vscode.json"
+          python3 - <<'PY'
+          import json, os
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'stored-vscode.json'), encoding='utf-8') as handle:
+              stored = json.load(handle)
+          vscode = stored['snapshot']['editors']['vscode']
+          assert vscode['schemaVersion'] == 1
+          assert vscode['remoteName'] == 'wsl'
+          assert vscode['workspaceFolders'][0]['uri'] == 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule'
+          assert vscode['tabGroups'][0]['tabs'][0]['uri'] == 'vscode-remote://wsl+Ubuntu/home/runner/context-capsule/src/main.rs'
+          assert vscode['tabGroups'][0]['tabs'][0]['pinned'] is True
+          assert vscode['visibleEditorSelections'][0]['selections'][0]['active'][1] == 8
+          print('VS Code producer schema -> Rust parser -> SQLite capsule contract passed.')
+          PY
+      - name: Publish Linux VS Code state status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          state=failure
+          [ "$JOB_STATUS" = success ] && state=success
+          [ "$JOB_STATUS" = cancelled ] && state=error
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"$state\",\"context\":\"ci/potus-vscode-state-linux\",\"description\":\"POTUS-linux VS Code state: $JOB_STATUS\"}" >/dev/null
