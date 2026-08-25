@@ -111,14 +111,16 @@ pub fn capture_snapshot_with_options(
     } else {
         serde_json::to_value(explorer::discover())?
     };
-    let firefox = if ignored.iter().any(|application| is_firefox_family(application)) {
+    let firefox_ignored = ignored.iter().any(|application| is_firefox_family(application));
+    let firefox_running = discovery
+        .desktop
+        .as_ref()
+        .ok()
+        .is_some_and(|desktop| desktop.applications.iter().any(is_firefox_family));
+    let firefox = if firefox_ignored {
         None
     } else {
-        browser::load_recent_firefox_state()
-            .ok()
-            .flatten()
-            .map(serde_json::to_value)
-            .transpose()?
+        firefox_state_for_capture(browser::load_recent_firefox_state(), firefox_running)?
     };
     let chrome = if ignored.iter().any(|application| is_chrome(application)) {
         None
@@ -196,6 +198,26 @@ pub fn capture_snapshot_with_options(
     }
 
     Ok(StoredCapsuleSnapshot::new(snapshot))
+}
+
+fn firefox_state_for_capture(
+    state: Result<Option<browser::FirefoxSnapshot>, browser::BrowserError>,
+    firefox_running: bool,
+) -> Result<Option<Value>, PersistenceError> {
+    match state {
+        Ok(Some(snapshot)) => serde_json::to_value(snapshot)
+            .map(Some)
+            .map_err(PersistenceError::Json),
+        Ok(None) if firefox_running => Err(PersistenceError::InvalidPayload(
+            "Zen/Firefox is running, but no fresh semantic browser state is available. Context Capsule refused to save an incomplete capsule because it would not be able to restore missing browser tabs. Ensure the Context Capsule browser extension is installed and connected to the native host, then save again (or explicitly --ignore-app Zen/Firefox)."
+                .to_owned(),
+        )),
+        Ok(None) => Ok(None),
+        Err(error) if firefox_running => Err(PersistenceError::InvalidPayload(format!(
+            "Zen/Firefox is running, but its semantic browser state could not be captured: {error}. Context Capsule refused to save an incomplete capsule."
+        ))),
+        Err(_) => Ok(None),
+    }
 }
 
 fn filtered_terminal_snapshot(
@@ -488,6 +510,25 @@ mod tests {
         assert!(stored.snapshot.pointer("/browsers/firefox").is_some());
         assert!(stored.snapshot.pointer("/editors/vscode").is_some());
         assert!(stored.snapshot.get("capture_options").is_none());
+    }
+
+    #[test]
+    fn running_firefox_family_rejects_missing_semantic_state() {
+        let error = firefox_state_for_capture(Ok(None), true)
+            .expect_err("running Zen/Firefox must not silently produce a null browser slot");
+        assert!(matches!(
+            error,
+            PersistenceError::InvalidPayload(message)
+                if message.contains("no fresh semantic browser state")
+        ));
+    }
+
+    #[test]
+    fn stopped_firefox_family_allows_missing_semantic_state() {
+        assert_eq!(
+            firefox_state_for_capture(Ok(None), false).expect("missing inactive browser state"),
+            None
+        );
     }
 
     #[test]
