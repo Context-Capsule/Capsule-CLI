@@ -1,4 +1,4 @@
-name: Apply Chrome Native Response Limit Fix
+name: Apply Terminal CWD Regression Fix
 
 on:
   push:
@@ -7,10 +7,11 @@ on:
 
 permissions:
   contents: write
+  statuses: write
 
 jobs:
   apply-fix:
-    if: github.event.head_commit.message == 'chore: apply Chrome native response limit fix'
+    if: github.event.head_commit.message == 'chore: apply terminal cwd regression fix'
     runs-on: [self-hosted, Windows, X64]
     steps:
       - name: Verify POTUS runner
@@ -20,6 +21,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: feature/chrome-browser-adapter-20260822
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Ensure stable Rust toolchain
         shell: pwsh
         run: |
@@ -27,58 +31,216 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
           rustup default stable
           if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
-      - name: Apply Chromium host-to-browser response ceiling
+      - name: Patch terminal live-CWD capture and restart plans
         shell: pwsh
         run: |
-          $path = 'src/chrome.rs'
-          $text = Get-Content $path -Raw
+          @'
+          from pathlib import Path
 
-          function Replace-ExactlyOnce([string]$old, [string]$new) {
-            $count = ([regex]::Matches($script:text, [regex]::Escape($old))).Count
-            if ($count -ne 1) { throw "Expected exactly one occurrence, found $count: $old" }
-            $script:text = $script:text.Replace($old, $new)
-          }
+          context_path = Path('src/terminal_context.rs')
+          text = context_path.read_text(encoding='utf-8')
 
-          Replace-ExactlyOnce `
-            'const MAX_NATIVE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;' `
-            "const MAX_NATIVE_REQUEST_BYTES: usize = 8 * 1024 * 1024;`r`nconst MAX_NATIVE_RESPONSE_BYTES: usize = 1024 * 1024;"
-          Replace-ExactlyOnce `
-            'if length == 0 || length > MAX_NATIVE_MESSAGE_BYTES {' `
-            'if length == 0 || length > MAX_NATIVE_REQUEST_BYTES {'
-          Replace-ExactlyOnce `
-            'if payload.is_empty() || payload.len() > MAX_NATIVE_MESSAGE_BYTES {' `
-            'if payload.is_empty() || payload.len() > MAX_NATIVE_RESPONSE_BYTES {'
+          def once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one occurrence, found {count}: {old[:140]!r}')
+              text = text.replace(old, new, 1)
 
-          $marker = @'
+          once(
+              'use crate::adapters::terminal::{\n    TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot,\n};',
+              'use crate::adapters::terminal::{\n    TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot, WorkingDirectorySource,\n};',
+          )
+
+          old_enrich = '''fn enrich_working_directory<F>(session: &mut TerminalSession, cwd_for_pid: &F)\nwhere\n    F: Fn(u32) -> Option<String>,\n{\n    if !matches!(session.environment, TerminalEnvironment::Windows) {\n        return;\n    }\n\n    if session.working_directory.is_none() {\n        let Some(pid) = session.pid else {\n            return;\n        };\n        let Some(directory) = cwd_for_pid(pid) else {\n            return;\n        };\n        session.working_directory = Some(directory);\n    }\n\n    let Some(directory) = session.working_directory.clone() else {\n        return;\n    };\n    let Some(restart) = session.restart.as_mut() else {\n        return;\n    };\n\n    // Direct shell restart plans are launched with Command::current_dir during\n    // restore. Windows Terminal state already encodes its starting directory\n    // through `wt.exe -d`, so do not mutate that richer plan here.\n    if restart.working_directory.is_none() && is_direct_windows_shell(&restart.executable) {\n        restart.working_directory = Some(directory);\n        restart.note = Some(\n            "Starts the captured interactive shell in its captured working directory without replaying shell history or foreground commands."\n                .to_owned(),\n        );\n    }\n}'''
+          new_enrich = '''fn enrich_working_directory<F>(session: &mut TerminalSession, cwd_for_pid: &F)\nwhere\n    F: Fn(u32) -> Option<String>,\n{\n    if !matches!(session.environment, TerminalEnvironment::Windows) {\n        return;\n    }\n\n    // Persisted Windows Terminal layout records the tab's *starting* directory,\n    // not necessarily the shell's current directory after `cd`/Set-Location. A\n    // live shell process CWD is therefore stronger evidence and must override a\n    // stale startingDirectory whenever Windows lets us read it.\n    if let Some(directory) = session.pid.and_then(|pid| cwd_for_pid(pid)) {\n        session.working_directory = Some(directory);\n        session.working_directory_source = WorkingDirectorySource::WindowsProcess;\n    }\n\n    let Some(directory) = session.working_directory.clone() else {\n        return;\n    };\n    let Some(restart) = session.restart.as_mut() else {\n        return;\n    };\n\n    if is_direct_windows_shell(&restart.executable) {\n        // Command::current_dir is the safe restart primitive for standalone\n        // cmd/PowerShell shells. Overwrite any stale value so matching/capture\n        // and launch use the same current directory.\n        restart.working_directory = Some(directory);\n        restart.note = Some(\n            "Starts the captured interactive shell in its captured live working directory without replaying shell history or foreground commands."\n                .to_owned(),\n        );\n    } else if is_windows_terminal_launcher(&restart.executable) {\n        // The child shell inside Windows Terminal does not inherit the CLI's\n        // working directory reliably; wt.exe needs an explicit -d argument.\n        set_windows_terminal_restart_directory(&mut restart.args, &directory);\n        restart.note = Some(\n            "Reopens the captured Windows Terminal profile in the shell's captured live working directory without replaying shell history or foreground commands."\n                .to_owned(),\n        );\n    }\n}'''
+          once(old_enrich, new_enrich)
+
+          helper_marker = '''}\n\n#[cfg(windows)]\nmod windows_process {'''
+          helpers = '''}\n\nfn is_windows_terminal_launcher(executable: &str) -> bool {\n    let name = executable\n        .rsplit(['\\\\', '/'])\n        .next()\n        .unwrap_or(executable)\n        .to_ascii_lowercase();\n    matches!(name.as_str(), "wt.exe" | "wt")\n}\n\nfn set_windows_terminal_restart_directory(args: &mut Vec<String>, directory: &str) {\n    if let Some(index) = args.iter().position(|argument| {\n        argument.eq_ignore_ascii_case("-d")\n            || argument.eq_ignore_ascii_case("--startingDirectory")\n            || argument.eq_ignore_ascii_case("--starting-directory")\n    }) {\n        if let Some(value) = args.get_mut(index + 1) {\n            *value = directory.to_owned();\n        } else {\n            args.push(directory.to_owned());\n        }\n        return;\n    }\n\n    args.push("-d".to_owned());\n    args.push(directory.to_owned());\n}\n\n#[cfg(windows)]\nmod windows_process {'''
+          once(helper_marker, helpers)
+
+          insert_at = text.rfind('\n}')
+          if insert_at < 0:
+              raise SystemExit('could not find terminal_context test module end')
+          tests = r'''
+
     #[test]
-    fn native_ping_reads_and_writes_framed_messages() {
-'@
-          $test = @'
-    #[test]
-    fn rejects_native_response_larger_than_chromium_host_limit() {
-        let mut output = Vec::new();
-        let payload = vec![b'x'; MAX_NATIVE_RESPONSE_BYTES + 1];
-        let error = write_native_message(&mut output, &payload).unwrap_err();
-        assert!(error.to_string().contains("invalid native response length"));
-        assert!(output.is_empty());
+    fn windows_terminal_live_cwd_overrides_persisted_starting_directory() {
+        let startup = r"C:\startup";
+        let live = r"C:\users\example\project";
+        let mut wt = session(TerminalHost::WindowsTerminal, 30, "pwsh.exe");
+        wt.profile = Some("PowerShell".to_owned());
+        wt.working_directory = Some(startup.to_owned());
+        wt.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        wt.restart = Some(RestartPlan {
+            executable: "wt.exe".to_owned(),
+            args: vec![
+                "new-tab".to_owned(),
+                "-p".to_owned(),
+                "PowerShell".to_owned(),
+                "-d".to_owned(),
+                startup.to_owned(),
+            ],
+            working_directory: None,
+            note: None,
+        });
+
+        let prepared = prepare_with(&snapshot(vec![wt]), false, &HashSet::new(), |pid| {
+            (pid == 30).then(|| live.to_owned())
+        });
+        let restored = &prepared.sessions[0];
+        assert_eq!(restored.working_directory.as_deref(), Some(live));
+        assert_eq!(restored.working_directory_source, WorkingDirectorySource::WindowsProcess);
+        let plan = restored.restart.as_ref().expect("Windows Terminal restart plan");
+        let directory_index = plan.args.iter().position(|arg| arg == "-d").expect("-d argument");
+        assert_eq!(plan.args.get(directory_index + 1).map(String::as_str), Some(live));
     }
 
-'@
-          $count = ([regex]::Matches($text, [regex]::Escape($marker))).Count
-          if ($count -ne 1) { throw "Expected exactly one native ping test marker, found $count" }
-          $text = $text.Replace($marker, $test + $marker)
-          Set-Content -Path $path -Value $text -Encoding utf8NoBOM
+    #[test]
+    fn windows_terminal_persisted_starting_directory_is_fallback_when_live_cwd_is_unavailable() {
+        let startup = r"C:\startup";
+        let mut wt = session(TerminalHost::WindowsTerminal, 31, "pwsh.exe");
+        wt.working_directory = Some(startup.to_owned());
+        wt.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        wt.restart = Some(RestartPlan {
+            executable: "wt.exe".to_owned(),
+            args: vec!["new-tab".to_owned(), "-d".to_owned(), startup.to_owned()],
+            working_directory: None,
+            note: None,
+        });
+
+        let prepared = prepare_with(&snapshot(vec![wt]), false, &HashSet::new(), |_| None);
+        let restored = &prepared.sessions[0];
+        assert_eq!(restored.working_directory.as_deref(), Some(startup));
+        assert_eq!(restored.working_directory_source, WorkingDirectorySource::WindowsTerminalState);
+        let plan = restored.restart.as_ref().expect("Windows Terminal restart plan");
+        assert_eq!(plan.args.last().map(String::as_str), Some(startup));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_cwd_reader_observes_a_live_cmd_directory_change() {
+        use std::{
+            fs,
+            io::Write,
+            process::{Command, Stdio},
+            thread,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "context-capsule-cwd-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let start = root.join("start");
+        let target = root.join("target");
+        fs::create_dir_all(&start).expect("create start directory");
+        fs::create_dir_all(&target).expect("create target directory");
+
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/Q", "/K"])
+            .current_dir(&start)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd.exe");
+        let mut stdin = child.stdin.take().expect("cmd stdin");
+        writeln!(stdin, "cd /d \"{}\"", target.display()).expect("send cd command");
+        stdin.flush().expect("flush cd command");
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut observed = None;
+        while Instant::now() < deadline {
+            observed = process_working_directory(child.id());
+            if observed.as_deref().is_some_and(|directory| {
+                directory.replace('/', "\\").eq_ignore_ascii_case(
+                    &target.to_string_lossy().replace('/', "\\")
+                )
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            observed.as_deref().is_some_and(|directory| {
+                directory.replace('/', "\\").eq_ignore_ascii_case(
+                    &target.to_string_lossy().replace('/', "\\")
+                )
+            }),
+            "live cmd.exe CWD reader did not converge to target; observed={observed:?}"
+        );
+    }
+'''
+          text = text[:insert_at] + tests + text[insert_at:]
+          context_path.write_text(text, encoding='utf-8')
+
+          terminal_path = Path('src/adapters/terminal.rs')
+          terminal = terminal_path.read_text(encoding='utf-8')
+          old_enum = '''pub enum WorkingDirectorySource {\n    WindowsTerminalState,\n    WslProc,\n    Unknown,\n}'''
+          new_enum = '''pub enum WorkingDirectorySource {\n    WindowsTerminalState,\n    WindowsProcess,\n    WslProc,\n    Unknown,\n}'''
+          if terminal.count(old_enum) != 1:
+              raise SystemExit('unexpected WorkingDirectorySource enum shape')
+          terminal = terminal.replace(old_enum, new_enum, 1)
+          terminal_path.write_text(terminal, encoding='utf-8')
+
+          # Finish the previously staged Chromium native-messaging safety fix so
+          # this branch no longer carries a latent self-modifying workflow.
+          chrome_path = Path('src/chrome.rs')
+          chrome = chrome_path.read_text(encoding='utf-8')
+          replacements = [
+              ('const MAX_NATIVE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;',
+               'const MAX_NATIVE_REQUEST_BYTES: usize = 8 * 1024 * 1024;\nconst MAX_NATIVE_RESPONSE_BYTES: usize = 1024 * 1024;'),
+              ('if length == 0 || length > MAX_NATIVE_MESSAGE_BYTES {',
+               'if length == 0 || length > MAX_NATIVE_REQUEST_BYTES {'),
+              ('if payload.is_empty() || payload.len() > MAX_NATIVE_MESSAGE_BYTES {',
+               'if payload.is_empty() || payload.len() > MAX_NATIVE_RESPONSE_BYTES {'),
+          ]
+          for old, new in replacements:
+              if chrome.count(old) != 1:
+                  raise SystemExit(f'unexpected Chrome native limit source: {old}')
+              chrome = chrome.replace(old, new, 1)
+          marker = '''    #[test]\n    fn native_ping_reads_and_writes_framed_messages() {\n'''
+          response_test = '''    #[test]\n    fn rejects_native_response_larger_than_chromium_host_limit() {\n        let mut output = Vec::new();\n        let payload = vec![b'x'; MAX_NATIVE_RESPONSE_BYTES + 1];\n        let error = write_native_message(&mut output, &payload).unwrap_err();\n        assert!(error.to_string().contains("invalid native response length"));\n        assert!(output.is_empty());\n    }\n\n'''
+          if chrome.count(marker) != 1:
+              raise SystemExit('unexpected Chrome native ping test marker')
+          chrome = chrome.replace(marker, response_test + marker, 1)
+          chrome_path.write_text(chrome, encoding='utf-8')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'terminal CWD patch script failed' }
       - run: cargo fmt --all -- --check
       - run: cargo check --all-targets
+      - run: cargo test terminal_context -- --nocapture
+      - run: cargo test restore::semantic -- --nocapture
       - run: cargo test chrome -- --nocapture
-      - name: Commit verified fix and remove one-shot workflow
+      - run: cargo test --all -- --nocapture
+      - name: Commit verified fixes and remove one-shot workflow
         shell: pwsh
         run: |
           git rm .github/workflows/apply-chrome-native-response-limit.yml
-          git add src/chrome.rs
+          git add src/terminal_context.rs src/adapters/terminal.rs src/chrome.rs
           git config user.name 'GPT-Slave'
           git config user.email '313162660+GPT-Slave@users.noreply.github.com'
-          git commit -m 'fix: enforce Chromium native response size limit'
+          git commit -m 'fix: restore Windows terminals in captured live directory'
           if ($LASTEXITCODE -ne 0) { throw 'git commit failed' }
           git push origin HEAD:feature/chrome-browser-adapter-20260822
           if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
+      - name: Publish terminal CWD regression status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{ state = $state; context = 'ci/potus-terminal-cwd-fix'; description = "POTUS terminal CWD fix: $($env:JOB_STATUS)" } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
