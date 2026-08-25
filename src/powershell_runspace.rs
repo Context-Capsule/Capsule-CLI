@@ -71,7 +71,7 @@ $candidates = @(
     Get-Runspace |
         Where-Object {
             $_ -ne $currentManagementRunspace -and
-            $_.State -eq 'Opened'
+            $_.RunspaceStateInfo.State -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened
         } |
         ForEach-Object {
             try {
