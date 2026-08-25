@@ -40,6 +40,18 @@ struct PersistedIdentity {
     tab_title: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeBinding {
+    source_index: usize,
+    target_index: usize,
+    pid: u32,
+    parent_pid: Option<u32>,
+    session_id: String,
+    shell_executable: Option<String>,
+    startup_command: Option<String>,
+    foreground_command: Option<String>,
+}
+
 fn load_persisted_identities(snapshot: &TerminalSnapshot) -> Vec<PersistedIdentity> {
     let paths = snapshot
         .windows_terminal_layouts
@@ -116,23 +128,25 @@ fn rebind_with<F>(
 ) where
     F: Fn(u32) -> Option<String>,
 {
-    let runtime_bindings = snapshot
-        .sessions
-        .iter()
-        .enumerate()
-        .filter(|(_, session)| {
-            session.host == TerminalHost::WindowsTerminal
-                && session.pid.is_some()
-                && session.sources.contains(&TerminalSource::WindowsProcess)
-        })
-        .filter_map(|(index, session)| {
-            let pid = session.pid?;
-            let session_id = normalize_session_id(&session_id_for_pid(pid)?);
-            (!session_id.is_empty()).then_some((index, pid, session_id))
-        })
-        .collect::<Vec<_>>();
+    let mut bindings = Vec::new();
 
-    for (runtime_index, pid, session_id) in runtime_bindings {
+    for (source_index, session) in snapshot.sessions.iter().enumerate() {
+        if session.host != TerminalHost::WindowsTerminal
+            || session.pid.is_none()
+            || !session.sources.contains(&TerminalSource::WindowsProcess)
+        {
+            continue;
+        }
+        let Some(pid) = session.pid else {
+            continue;
+        };
+        let Some(raw_session_id) = session_id_for_pid(pid) else {
+            continue;
+        };
+        let session_id = normalize_session_id(&raw_session_id);
+        if session_id.is_empty() {
+            continue;
+        }
         let Some(identity) = identities
             .iter()
             .find(|identity| identity.session_id == session_id)
@@ -144,7 +158,7 @@ fn rebind_with<F>(
             .sessions
             .iter()
             .enumerate()
-            .filter(|(_, session)| persisted_identity_matches(identity, session))
+            .filter(|(_, candidate)| persisted_identity_matches(identity, candidate))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
 
@@ -154,13 +168,28 @@ fn rebind_with<F>(
         if candidates.len() != 1 {
             continue;
         }
-        move_runtime_binding(
-            &mut snapshot.sessions,
-            runtime_index,
-            candidates[0],
+
+        bindings.push(RuntimeBinding {
+            source_index,
+            target_index: candidates[0],
             pid,
-            &session_id,
-        );
+            parent_pid: session.parent_pid,
+            session_id,
+            shell_executable: session.shell_executable.clone(),
+            startup_command: session.startup_command.clone(),
+            foreground_command: session.foreground_command.clone(),
+        });
+    }
+
+    // Compute every mapping from the untouched snapshot first. A source for one
+    // live process can be the target for another mis-associated process, so
+    // moving them sequentially would clobber runtime evidence. Clear all source
+    // associations, then apply all exact mappings as one logical operation.
+    for binding in &bindings {
+        clear_runtime_binding(&mut snapshot.sessions[binding.source_index]);
+    }
+    for binding in bindings {
+        apply_runtime_binding(&mut snapshot.sessions[binding.target_index], &binding);
     }
 }
 
@@ -202,59 +231,30 @@ fn persisted_identity_matches(identity: &PersistedIdentity, session: &TerminalSe
     true
 }
 
-fn move_runtime_binding(
-    sessions: &mut [TerminalSession],
-    from_index: usize,
-    to_index: usize,
-    pid: u32,
-    session_id: &str,
-) {
-    if from_index == to_index {
-        sessions[to_index].tty = Some(session_id.to_owned());
-        return;
-    }
-
-    let (from, to) = two_sessions_mut(sessions, from_index, to_index);
-    let parent_pid = from.parent_pid;
-    let shell_executable = from.shell_executable.clone();
-    let startup_command = from.startup_command.clone();
-    let foreground_command = from.foreground_command.clone();
-
-    from.sources
+fn clear_runtime_binding(session: &mut TerminalSession) {
+    session
+        .sources
         .retain(|source| *source != TerminalSource::WindowsProcess);
-    from.pid = None;
-    from.parent_pid = None;
-    from.foreground_command = None;
-    from.tty = None;
-
-    if !to.sources.contains(&TerminalSource::WindowsProcess) {
-        to.sources.push(TerminalSource::WindowsProcess);
-    }
-    to.pid = Some(pid);
-    to.parent_pid = parent_pid;
-    to.tty = Some(session_id.to_owned());
-    if to.shell_executable.is_none() {
-        to.shell_executable = shell_executable;
-    }
-    if to.startup_command.is_none() {
-        to.startup_command = startup_command;
-    }
-    to.foreground_command = foreground_command;
+    session.pid = None;
+    session.parent_pid = None;
+    session.foreground_command = None;
+    session.tty = None;
 }
 
-fn two_sessions_mut(
-    sessions: &mut [TerminalSession],
-    left: usize,
-    right: usize,
-) -> (&mut TerminalSession, &mut TerminalSession) {
-    debug_assert_ne!(left, right);
-    if left < right {
-        let (before, after) = sessions.split_at_mut(right);
-        (&mut before[left], &mut after[0])
-    } else {
-        let (before, after) = sessions.split_at_mut(left);
-        (&mut after[0], &mut before[right])
+fn apply_runtime_binding(session: &mut TerminalSession, binding: &RuntimeBinding) {
+    if !session.sources.contains(&TerminalSource::WindowsProcess) {
+        session.sources.push(TerminalSource::WindowsProcess);
     }
+    session.pid = Some(binding.pid);
+    session.parent_pid = binding.parent_pid;
+    session.tty = Some(binding.session_id.clone());
+    if session.shell_executable.is_none() {
+        session.shell_executable = binding.shell_executable.clone();
+    }
+    if session.startup_command.is_none() {
+        session.startup_command = binding.startup_command.clone();
+    }
+    session.foreground_command = binding.foreground_command.clone();
 }
 
 fn paths_equivalent(left: &str, right: &str) -> bool {
@@ -567,6 +567,29 @@ mod tests {
         }
     }
 
+    fn identities() -> Vec<PersistedIdentity> {
+        vec![
+            PersistedIdentity {
+                session_id: "one".to_owned(),
+                profile: Some("PowerShell".to_owned()),
+                starting_directory: Some(r"C:\one".to_owned()),
+                tab_title: Some("PowerShell".to_owned()),
+            },
+            PersistedIdentity {
+                session_id: "two".to_owned(),
+                profile: Some("PowerShell".to_owned()),
+                starting_directory: Some(r"C:\two".to_owned()),
+                tab_title: Some("PowerShell".to_owned()),
+            },
+            PersistedIdentity {
+                session_id: "three".to_owned(),
+                profile: Some("PowerShell".to_owned()),
+                starting_directory: Some(r"C:\three".to_owned()),
+                tab_title: Some("PowerShell".to_owned()),
+            },
+        ]
+    }
+
     #[test]
     fn parses_persisted_session_ids() {
         let root = json!({
@@ -594,35 +617,15 @@ mod tests {
 
     #[test]
     fn session_id_rebind_moves_live_process_to_its_real_persisted_pane() {
-        // The generic adapter incorrectly merged PID 30 into the first same-profile
-        // layout (C:\one). WT_SESSION says that process actually belongs to C:\three.
+        // The generic adapter incorrectly merged PID 30 into C:\one. WT_SESSION
+        // says that process actually belongs to C:\three.
         let mut current = snapshot(vec![
             powershell_layout(r"C:\one", Some(30)),
             powershell_layout(r"C:\two", None),
             powershell_layout(r"C:\three", None),
         ]);
-        let identities = vec![
-            PersistedIdentity {
-                session_id: "one".to_owned(),
-                profile: Some("PowerShell".to_owned()),
-                starting_directory: Some(r"C:\one".to_owned()),
-                tab_title: Some("PowerShell".to_owned()),
-            },
-            PersistedIdentity {
-                session_id: "two".to_owned(),
-                profile: Some("PowerShell".to_owned()),
-                starting_directory: Some(r"C:\two".to_owned()),
-                tab_title: Some("PowerShell".to_owned()),
-            },
-            PersistedIdentity {
-                session_id: "three".to_owned(),
-                profile: Some("PowerShell".to_owned()),
-                starting_directory: Some(r"C:\three".to_owned()),
-                tab_title: Some("PowerShell".to_owned()),
-            },
-        ];
 
-        rebind_with(&mut current, &identities, |pid| {
+        rebind_with(&mut current, &identities(), |pid| {
             (pid == 30).then(|| "{THREE}".to_owned())
         });
 
@@ -635,6 +638,35 @@ mod tests {
             .sources
             .contains(&TerminalSource::WindowsProcess));
         assert_eq!(current.sessions[2].tty.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn session_id_rebind_handles_multiple_live_processes_without_clobbering() {
+        // Generic first-compatible pairing produced one->PID30 and two->PID31,
+        // while the actual WT_SESSION identities are PID30->two and PID31->three.
+        let mut current = snapshot(vec![
+            powershell_layout(r"C:\one", Some(30)),
+            powershell_layout(r"C:\two", Some(31)),
+            powershell_layout(r"C:\three", None),
+        ]);
+
+        rebind_with(&mut current, &identities(), |pid| match pid {
+            30 => Some("two".to_owned()),
+            31 => Some("three".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(current.sessions[0].pid, None);
+        assert_eq!(current.sessions[1].pid, Some(30));
+        assert_eq!(current.sessions[1].tty.as_deref(), Some("two"));
+        assert_eq!(current.sessions[2].pid, Some(31));
+        assert_eq!(current.sessions[2].tty.as_deref(), Some("three"));
+        assert!(current.sessions[1]
+            .sources
+            .contains(&TerminalSource::WindowsProcess));
+        assert!(current.sessions[2]
+            .sources
+            .contains(&TerminalSource::WindowsProcess));
     }
 
     #[test]
