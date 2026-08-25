@@ -54,7 +54,7 @@ if ($target.RunspaceAvailability -ne [System.Management.Automation.Runspaces.Run
 try {
     $location = $target.SessionStateProxy.Path.CurrentLocation
     if ($null -ne $location -and $location.Provider.Name -eq 'FileSystem') {
-        [Console]::Out.Write([string]$location.Path)
+        [string]$location.Path
     }
 }
 catch {
@@ -125,13 +125,13 @@ $target = @(
         Sort-Object Id
 )[0]
 if ($null -eq $target) {
-    [Console]::Out.Write('UNKNOWN')
+    'UNKNOWN'
     return
 }
 if ($target.RunspaceAvailability -eq [System.Management.Automation.Runspaces.RunspaceAvailability]::Available) {
-    [Console]::Out.Write('IDLE')
+    'IDLE'
 } else {
-    [Console]::Out.Write('BUSY')
+    'BUSY'
 }
 "#;
 
