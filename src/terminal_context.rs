@@ -693,7 +693,13 @@ mod tests {
             if observed.as_deref().is_some_and(|directory| {
                 directory
                     .replace('/', "\\")
-                    .eq_ignore_ascii_case(&target.to_string_lossy().replace('/', "\\"))
+                    .trim_end_matches('\\')
+                    .eq_ignore_ascii_case(
+                        target
+                            .to_string_lossy()
+                            .replace('/', "\\")
+                            .trim_end_matches('\\'),
+                    )
             }) {
                 break;
             }
@@ -707,7 +713,13 @@ mod tests {
             observed.as_deref().is_some_and(|directory| {
                 directory
                     .replace('/', "\\")
-                    .eq_ignore_ascii_case(&target.to_string_lossy().replace('/', "\\"))
+                    .trim_end_matches('\\')
+                    .eq_ignore_ascii_case(
+                        target
+                            .to_string_lossy()
+                            .replace('/', "\\")
+                            .trim_end_matches('\\'),
+                    )
             }),
             "live cmd.exe CWD reader did not converge to target; observed={observed:?}"
         );
