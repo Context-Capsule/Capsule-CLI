@@ -84,11 +84,29 @@ where
         return;
     }
 
-    // Windows Terminal persists a tab's *starting* directory. After `cd` or
-    // Set-Location that value is stale, while the live shell process has the
-    // directory the user was actually in when the capsule was captured.
-    if let Some(directory) = session.pid.and_then(|pid| cwd_for_pid(pid)) {
-        session.working_directory = Some(directory);
+    let process_directory = session.pid.and_then(|pid| cwd_for_pid(pid));
+    let has_terminal_reported_powershell_location = session.host == TerminalHost::WindowsTerminal
+        && matches!(
+            session.shell,
+            crate::adapters::terminal::ShellKind::PowerShell
+                | crate::adapters::terminal::ShellKind::WindowsPowerShell
+        )
+        && session.working_directory.is_some()
+        && matches!(
+            session.working_directory_source,
+            crate::adapters::terminal::WorkingDirectorySource::WindowsTerminalState
+        );
+
+    // cmd.exe keeps the Win32 process CWD in sync with `cd`, so the live process
+    // value is authoritative and can replace a stale Windows Terminal starting
+    // directory. PowerShell is different: each runspace owns its own `$PWD`, and
+    // Microsoft explicitly documents that this is not the process CWD. When
+    // Windows Terminal has a shell-reported location for PowerShell, preserve it;
+    // the PEB value is only a fallback when no terminal-reported location exists.
+    if !has_terminal_reported_powershell_location {
+        if let Some(directory) = process_directory {
+            session.working_directory = Some(directory);
+        }
     }
 
     let Some(directory) = session.working_directory.clone() else {
@@ -99,11 +117,10 @@ where
     };
 
     if is_direct_windows_shell(&restart.executable) {
-        // Standalone cmd/PowerShell shells are launched with Command::current_dir.
-        // Overwrite any stale value so capture, matching, and restore agree.
+        // Direct shell restart plans are launched with Command::current_dir.
         restart.working_directory = Some(directory);
         restart.note = Some(
-            "Starts the captured interactive shell in its captured live working directory without replaying shell history or foreground commands."
+            "Starts the captured interactive shell in its captured working directory without replaying shell history or foreground commands."
                 .to_owned(),
         );
     } else if is_windows_terminal_launcher(&restart.executable) {
@@ -111,7 +128,7 @@ where
         // working directory. wt.exe therefore needs an explicit -d argument.
         set_windows_terminal_restart_directory(&mut restart.args, &directory);
         restart.note = Some(
-            "Reopens the captured Windows Terminal profile in the shell's captured live working directory without replaying shell history or foreground commands."
+            "Reopens the captured Windows Terminal profile in the shell's captured working directory without replaying shell history or foreground commands."
                 .to_owned(),
         );
     }
@@ -523,11 +540,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_terminal_live_cwd_overrides_persisted_starting_directory() {
+    fn windows_terminal_cmd_live_cwd_overrides_persisted_starting_directory() {
         let startup = r"C:\startup";
         let live = r"C:\users\example\project";
-        let mut wt = session(TerminalHost::WindowsTerminal, 30, "pwsh.exe");
-        wt.profile = Some("PowerShell".to_owned());
+        let mut wt = session(TerminalHost::WindowsTerminal, 30, "cmd.exe");
+        wt.profile = Some("Command Prompt".to_owned());
         wt.working_directory = Some(startup.to_owned());
         wt.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
         wt.restart = Some(RestartPlan {
@@ -535,7 +552,7 @@ mod tests {
             args: vec![
                 "new-tab".to_owned(),
                 "-p".to_owned(),
-                "PowerShell".to_owned(),
+                "Command Prompt".to_owned(),
                 "-d".to_owned(),
                 startup.to_owned(),
             ],
@@ -564,9 +581,52 @@ mod tests {
     }
 
     #[test]
+    fn windows_terminal_powershell_prefers_terminal_reported_location_over_process_cwd() {
+        let reported = r"C:\users\example\project";
+        let stale_process = r"C:\startup";
+        let mut wt = session(TerminalHost::WindowsTerminal, 31, "pwsh.exe");
+        wt.shell = ShellKind::PowerShell;
+        wt.profile = Some("PowerShell".to_owned());
+        wt.working_directory = Some(reported.to_owned());
+        wt.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        wt.restart = Some(RestartPlan {
+            executable: "wt.exe".to_owned(),
+            args: vec![
+                "new-tab".to_owned(),
+                "-p".to_owned(),
+                "PowerShell".to_owned(),
+                "-d".to_owned(),
+                reported.to_owned(),
+            ],
+            working_directory: None,
+            note: None,
+        });
+
+        let prepared = prepare_with(&snapshot(vec![wt]), false, &HashSet::new(), |pid| {
+            (pid == 31).then(|| stale_process.to_owned())
+        });
+        let restored = &prepared.sessions[0];
+        assert_eq!(restored.working_directory.as_deref(), Some(reported));
+        let plan = restored
+            .restart
+            .as_ref()
+            .expect("Windows Terminal restart plan");
+        let directory_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "-d")
+            .expect("-d argument");
+        assert_eq!(
+            plan.args.get(directory_index + 1).map(String::as_str),
+            Some(reported)
+        );
+    }
+
+    #[test]
     fn windows_terminal_persisted_starting_directory_is_fallback_when_live_cwd_is_unavailable() {
         let startup = r"C:\startup";
-        let mut wt = session(TerminalHost::WindowsTerminal, 31, "pwsh.exe");
+        let mut wt = session(TerminalHost::WindowsTerminal, 32, "pwsh.exe");
+        wt.shell = ShellKind::PowerShell;
         wt.working_directory = Some(startup.to_owned());
         wt.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
         wt.restart = Some(RestartPlan {
