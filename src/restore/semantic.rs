@@ -470,7 +470,14 @@ fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
         return saved.restart.clone();
     }
 
-    let mut args = vec!["new-tab".to_owned()];
+    // Explicitly target the most recently used existing Windows Terminal
+    // window. Without -w, Windows Terminal's windowingBehavior setting controls
+    // whether wt.exe creates a new window or a tab; its default is useNew.
+    let mut args = vec![
+        "-w".to_owned(),
+        "0".to_owned(),
+        "new-tab".to_owned(),
+    ];
     if let Some(profile) = saved
         .profile
         .as_deref()
@@ -504,7 +511,7 @@ fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
         args,
         working_directory: None,
         note: Some(
-            "Reopens the captured Windows Terminal session through wt.exe so the restore cannot attach an interactive shell to the terminal running Context Capsule."
+            "Reopens the captured Windows Terminal session through wt.exe in the most recently used existing Terminal window, so the restore cannot attach an interactive shell to the terminal running Context Capsule."
                 .to_owned(),
         ),
     })
@@ -870,6 +877,8 @@ mod tests {
         assert_eq!(
             plan.args,
             vec![
+                "-w".to_owned(),
+                "0".to_owned(),
                 "new-tab".to_owned(),
                 "-p".to_owned(),
                 "Windows PowerShell".to_owned(),
@@ -899,6 +908,8 @@ mod tests {
         assert_eq!(
             plan.args,
             vec![
+                "-w".to_owned(),
+                "0".to_owned(),
                 "new-tab".to_owned(),
                 "-d".to_owned(),
                 r"D:\projects\capsule".to_owned(),
@@ -926,6 +937,8 @@ mod tests {
         assert_eq!(
             plan.args,
             vec![
+                "-w".to_owned(),
+                "0".to_owned(),
                 "new-tab".to_owned(),
                 "-p".to_owned(),
                 "Windows PowerShell".to_owned(),
