@@ -3,10 +3,6 @@ use crate::adapters::terminal::{
 };
 use std::collections::HashSet;
 
-#[cfg(windows)]
-#[path = "windows_terminal_identity.rs"]
-mod windows_terminal_identity;
-
 /// Prepare generic terminal discovery for durable capsule storage.
 ///
 /// Two kinds of sessions must not become independent restart plans:
@@ -45,15 +41,8 @@ pub(crate) fn enrich_for_matching(snapshot: &TerminalSnapshot) -> TerminalSnapsh
     let mut prepared = snapshot.clone();
 
     #[cfg(windows)]
-    {
-        // Windows Terminal state.json and each live pane share the same stable
-        // WT_SESSION GUID. Repair any first-compatible same-shell process merge
-        // before consulting CWDs or deciding which persisted panes are alive.
-        windows_terminal_identity::rebind(&mut prepared);
-
-        for session in &mut prepared.sessions {
-            enrich_working_directory(session, &process_working_directory);
-        }
+    for session in &mut prepared.sessions {
+        enrich_working_directory(session, &process_working_directory);
     }
 
     // Windows Terminal's persistedWindowLayouts are restart metadata, not a
