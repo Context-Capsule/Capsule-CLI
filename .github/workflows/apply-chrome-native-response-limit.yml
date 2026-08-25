@@ -10,25 +10,17 @@ permissions:
 
 jobs:
   apply-and-verify:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     steps:
-      - name: Verify POTUS runner
-        shell: pwsh
-        run: |
-          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
       - uses: actions/checkout@v4
         with:
           ref: feature/chrome-browser-adapter-20260822
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Ensure stable Rust toolchain
-        shell: pwsh
-        run: |
-          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
-          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
-          rustup default stable
-          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Apply regression patch
         run: python scripts/apply-terminal-cwd-regression.py
       - run: cargo fmt --all -- --check
