@@ -5,7 +5,8 @@ mod powershell_runspace;
 
 use crate::{
     adapters::terminal::{
-        ShellKind, TerminalEnvironment, TerminalHost, TerminalSnapshot, WorkingDirectorySource,
+        ShellKind, TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot,
+        WorkingDirectorySource,
     },
     logging,
 };
@@ -28,6 +29,16 @@ pub(crate) fn enrich_for_matching(snapshot: &TerminalSnapshot) -> TerminalSnapsh
 }
 
 fn enrich_exact_powershell_locations(snapshot: &mut TerminalSnapshot, stage: &str) {
+    enrich_exact_powershell_locations_with(snapshot, stage, powershell_runspace::working_directory);
+}
+
+fn enrich_exact_powershell_locations_with<F>(
+    snapshot: &mut TerminalSnapshot,
+    stage: &str,
+    probe: F,
+) where
+    F: Fn(&TerminalSession) -> Option<String>,
+{
     for session in &mut snapshot.sessions {
         if session.host != TerminalHost::WindowsTerminal
             || !matches!(session.environment, TerminalEnvironment::Windows)
@@ -38,7 +49,7 @@ fn enrich_exact_powershell_locations(snapshot: &mut TerminalSnapshot, stage: &st
 
         let previous_directory = session.working_directory.clone();
         let previous_source = session.working_directory_source.clone();
-        let Some(directory) = powershell_runspace::working_directory(session) else {
+        let Some(directory) = probe(session) else {
             logging::info(
                 TERMINAL_LOG_COMPONENT,
                 format!(
@@ -49,6 +60,11 @@ fn enrich_exact_powershell_locations(snapshot: &mut TerminalSnapshot, stage: &st
             continue;
         };
 
+        // WorkingDirectorySource predates direct runspace probing. The existing
+        // WindowsTerminalState value is the serialized trust channel understood
+        // by restore matching; terminal.log records the true PowerShellRunspace
+        // provenance explicitly until the snapshot schema grows a dedicated
+        // source variant.
         session.working_directory = Some(directory.clone());
         session.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
 
@@ -66,7 +82,7 @@ fn enrich_exact_powershell_locations(snapshot: &mut TerminalSnapshot, stage: &st
 mod tests {
     use super::*;
     use crate::adapters::terminal::{
-        RestartPlan, TerminalHistoryPolicy, TerminalSession, TerminalSource, TerminalStatus,
+        RestartPlan, TerminalHistoryPolicy, TerminalSource, TerminalStatus,
     };
 
     fn snapshot_with(session: TerminalSession) -> TerminalSnapshot {
@@ -90,30 +106,44 @@ mod tests {
             shell: ShellKind::WindowsPowerShell,
             shell_executable: Some("powershell.exe".to_owned()),
             environment: TerminalEnvironment::Windows,
-            pid: Some(u32::MAX),
+            pid: Some(42),
             parent_pid: None,
             tty: None,
             profile: Some("Windows PowerShell".to_owned()),
             title: None,
-            working_directory: Some(r"C:\Users\fallback".to_owned()),
+            working_directory: Some(r"C:\Users\monji".to_owned()),
             working_directory_source: WorkingDirectorySource::Unknown,
             startup_command: None,
             foreground_command: None,
             restart: Some(RestartPlan {
                 executable: "powershell.exe".to_owned(),
                 args: Vec::new(),
-                working_directory: Some(r"C:\Users\fallback".to_owned()),
+                working_directory: Some(r"C:\Users\monji".to_owned()),
                 note: None,
             }),
         }
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn failed_direct_probe_preserves_existing_metadata() {
+    fn exact_runspace_cwd_overrides_untrusted_process_fallback() {
+        let mut snapshot = snapshot_with(fake_windows_terminal_powershell());
+        enrich_exact_powershell_locations_with(&mut snapshot, "test", |session| {
+            (session.pid == Some(42)).then(|| r"D:\actual-project".to_owned())
+        });
+
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.working_directory.as_deref(), Some(r"D:\actual-project"));
+        assert_eq!(
+            session.working_directory_source,
+            WorkingDirectorySource::WindowsTerminalState
+        );
+    }
+
+    #[test]
+    fn failed_runspace_probe_preserves_existing_fallback() {
         let original = fake_windows_terminal_powershell();
         let mut snapshot = snapshot_with(original.clone());
-        enrich_exact_powershell_locations(&mut snapshot, "test");
+        enrich_exact_powershell_locations_with(&mut snapshot, "test", |_| None);
         assert_eq!(snapshot.sessions[0], original);
     }
 }
