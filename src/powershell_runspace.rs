@@ -65,7 +65,7 @@ try {
     $ps = [System.Management.Automation.PowerShell]::Create()
     try {
         $ps.Runspace = $managementRunspace
-        [void]$ps.AddScript(@'
+        $queryScript = @'
 $currentManagementRunspace = [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace
 $candidates = @(
     Get-Runspace |
@@ -94,7 +94,8 @@ $candidates = @(
 $candidates |
     Sort-Object @{ Expression = { if ($_.Availability -eq 'Available') { 0 } else { 1 } } }, Id |
     Select-Object -First 1 -ExpandProperty Path
-'@)
+'@
+        [void]$ps.AddScript($queryScript)
         $result = @($ps.Invoke())
         if ($ps.Streams.Error.Count -gt 0) {
             exit 3
