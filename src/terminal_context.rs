@@ -102,6 +102,50 @@ fn enrich_exact_powershell_locations_with<F>(
     }
 }
 
+fn ui_probe_is_safe(safety_snapshot: &TerminalSnapshot, stage: &str) -> bool {
+    for session in safety_snapshot
+        .sessions
+        .iter()
+        .filter(|session| is_windows_terminal_powershell(session))
+    {
+        if session.foreground_command.is_some() {
+            logging::info(
+                TERMINAL_LOG_COMPONENT,
+                format!(
+                    "{stage}: PowerShell UI CWD fallback skipped because pid={:?} has foreground command {:?}",
+                    session.pid, session.foreground_command,
+                ),
+            );
+            return false;
+        }
+
+        match powershell_runspace::is_idle(session) {
+            Some(true) => {}
+            Some(false) => {
+                logging::info(
+                    TERMINAL_LOG_COMPONENT,
+                    format!(
+                        "{stage}: PowerShell UI CWD fallback skipped because pid={:?} runspace is busy",
+                        session.pid,
+                    ),
+                );
+                return false;
+            }
+            None => {
+                logging::info(
+                    TERMINAL_LOG_COMPONENT,
+                    format!(
+                        "{stage}: PowerShell UI CWD fallback skipped because idle state could not be proven for pid={:?}",
+                        session.pid,
+                    ),
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn enrich_exact_powershell_locations_from_ui(
     target: &mut TerminalSnapshot,
     safety_snapshot: &TerminalSnapshot,
@@ -112,6 +156,10 @@ fn enrich_exact_powershell_locations_from_ui(
         .iter()
         .any(|session| is_windows_terminal_powershell(session) && !has_trusted_exact_directory(session))
     {
+        return;
+    }
+
+    if !ui_probe_is_safe(safety_snapshot, stage) {
         return;
     }
 
