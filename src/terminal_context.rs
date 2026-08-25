@@ -1,5 +1,5 @@
 use crate::adapters::terminal::{
-    TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot,
+    TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot, TerminalSource,
 };
 use std::collections::HashSet;
 
@@ -45,7 +45,28 @@ pub(crate) fn enrich_for_matching(snapshot: &TerminalSnapshot) -> TerminalSnapsh
         enrich_working_directory(session, &process_working_directory);
     }
 
+    // Windows Terminal's persistedWindowLayouts are restart metadata, not a
+    // reliable inventory of tabs that are alive right now. A closed tab can
+    // remain in that state file and previously satisfied restore matching even
+    // though its shell process was gone. Keep those records for capture, but
+    // require runtime evidence before a Windows Terminal session can suppress a
+    // saved tab during restore.
+    prepared.sessions.retain(terminal_session_is_live_for_matching);
+
     prepared
+}
+
+fn terminal_session_is_live_for_matching(session: &TerminalSession) -> bool {
+    if session.host != TerminalHost::WindowsTerminal {
+        return true;
+    }
+
+    session.sources.iter().any(|source| {
+        matches!(
+            source,
+            TerminalSource::WindowsProcess | TerminalSource::WslProc
+        )
+    })
 }
 
 fn prepare_with<F>(
@@ -537,6 +558,33 @@ mod tests {
             prepared.sessions[0].working_directory.as_deref(),
             Some(r"C:\work\project")
         );
+    }
+
+    #[test]
+    fn restore_matching_ignores_closed_powershell_tabs_left_in_terminal_state() {
+        let mut live = session(TerminalHost::WindowsTerminal, 30, "pwsh.exe");
+        live.shell = ShellKind::PowerShell;
+        live.profile = Some("PowerShell".to_owned());
+        live.sources = vec![
+            TerminalSource::WindowsTerminalState,
+            TerminalSource::WindowsProcess,
+        ];
+
+        let mut closed_one = live.clone();
+        closed_one.pid = None;
+        closed_one.sources = vec![TerminalSource::WindowsTerminalState];
+
+        let mut closed_two = closed_one.clone();
+        closed_two.profile = Some("PowerShell".to_owned());
+
+        let mut current = snapshot(vec![live, closed_one, closed_two]);
+        current.sessions.retain(terminal_session_is_live_for_matching);
+
+        assert_eq!(current.sessions.len(), 1);
+        assert_eq!(current.sessions[0].pid, Some(30));
+        assert!(current.sessions[0]
+            .sources
+            .contains(&TerminalSource::WindowsProcess));
     }
 
     #[test]
