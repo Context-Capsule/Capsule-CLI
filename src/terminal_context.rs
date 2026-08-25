@@ -26,7 +26,13 @@ pub fn prepare_for_capture(
     // that connection, so unresolved Windows Terminal sessions then fall back to
     // a guarded UI probe that asks the real terminal pane for $PWD.
     enrich_exact_powershell_locations(&mut prepared, "capture");
-    enrich_exact_powershell_locations_from_ui(&mut prepared, "capture");
+
+    // The UI probe gets the raw inventory for safety checks. prepare_for_capture
+    // intentionally removes the shell that is hosting the current capsule
+    // command, but that shell must remain visible to the UI safety gate so we
+    // never type into a busy command-host tab merely because it was filtered out
+    // of the capsule payload.
+    enrich_exact_powershell_locations_from_ui(&mut prepared, snapshot, "capture");
     prepared
 }
 
@@ -37,7 +43,7 @@ pub(crate) fn enrich_for_matching(snapshot: &TerminalSnapshot) -> TerminalSnapsh
     // capture. Otherwise multiple identical PowerShell tabs are indistinguishable
     // and a surviving tab can be mistaken for a missing one.
     enrich_exact_powershell_locations(&mut prepared, "restore-match");
-    enrich_exact_powershell_locations_from_ui(&mut prepared, "restore-match");
+    enrich_exact_powershell_locations_from_ui(&mut prepared, snapshot, "restore-match");
     prepared
 }
 
@@ -96,8 +102,12 @@ fn enrich_exact_powershell_locations_with<F>(
     }
 }
 
-fn enrich_exact_powershell_locations_from_ui(snapshot: &mut TerminalSnapshot, stage: &str) {
-    if !snapshot
+fn enrich_exact_powershell_locations_from_ui(
+    target: &mut TerminalSnapshot,
+    safety_snapshot: &TerminalSnapshot,
+    stage: &str,
+) {
+    if !target
         .sessions
         .iter()
         .any(|session| is_windows_terminal_powershell(session) && !has_trusted_exact_directory(session))
@@ -105,7 +115,7 @@ fn enrich_exact_powershell_locations_from_ui(snapshot: &mut TerminalSnapshot, st
         return;
     }
 
-    let exact_by_pid = powershell_ui_probe::working_directories(snapshot);
+    let exact_by_pid = powershell_ui_probe::working_directories(safety_snapshot);
     if exact_by_pid.is_empty() {
         logging::info(
             TERMINAL_LOG_COMPONENT,
@@ -114,7 +124,7 @@ fn enrich_exact_powershell_locations_from_ui(snapshot: &mut TerminalSnapshot, st
         return;
     }
 
-    for session in &mut snapshot.sessions {
+    for session in &mut target.sessions {
         if !is_windows_terminal_powershell(session) || has_trusted_exact_directory(session) {
             continue;
         }
