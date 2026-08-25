@@ -12,7 +12,12 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 
 #[cfg(windows)]
-use std::{os::windows::process::CommandExt, process::Command, thread, time::Instant};
+use std::{
+    os::windows::process::CommandExt,
+    process::{Command, Stdio},
+    thread,
+    time::Instant,
+};
 
 const VSCODE_ADAPTER_TIMEOUT: Duration = Duration::from_secs(25);
 const FIREFOX_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -20,7 +25,7 @@ const CHROME_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const TERMINAL_LAUNCH_SPACING: Duration = Duration::from_millis(120);
 #[cfg(windows)]
-const TERMINAL_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
+const TERMINAL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const TERMINAL_VERIFY_POLL: Duration = Duration::from_millis(250);
 #[cfg(windows)]
@@ -354,7 +359,7 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
             continue;
         }
 
-        if let Some(plan) = saved_session.restart.clone() {
+        if let Some(plan) = safe_restart_plan(saved_session) {
             missing.push((saved_session.clone(), plan));
         } else {
             report.warnings.push(format!(
@@ -426,6 +431,63 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
             .warnings
             .push("Terminal restore is currently implemented for Windows/WSL only".to_owned());
     }
+}
+
+fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
+    if saved.host != TerminalHost::WindowsTerminal
+        || !matches!(saved.environment, TerminalEnvironment::Windows)
+    {
+        return saved.restart.clone();
+    }
+
+    // A Windows Terminal session must always be reopened through wt.exe. Older
+    // capsules could contain a process-derived restart plan such as
+    // powershell.exe even though the session host was WindowsTerminal. Launching
+    // that child directly inherits the caller's terminal handles and can inject
+    // an interactive shell into the VS Code/console session running `capsule
+    // restore`. Rebuild the plan from semantic WT metadata instead.
+    let mut args = vec!["new-tab".to_owned()];
+    if let Some(profile) = saved
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("-p".to_owned());
+        args.push(profile.to_owned());
+    }
+    if let Some(directory) = saved
+        .working_directory
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("-d".to_owned());
+        args.push(directory.to_owned());
+    }
+
+    // If state.json did not identify the profile, preserve only the shell
+    // executable itself. Do not replay startup/foreground command lines.
+    if saved.profile.as_deref().is_none_or(|profile| profile.trim().is_empty()) {
+        let executable = saved
+            .shell_executable
+            .as_deref()
+            .or_else(|| saved.restart.as_ref().map(|plan| plan.executable.as_str()))?;
+        if !direct_shell_process(executable) {
+            return None;
+        }
+        args.push(executable.to_owned());
+    }
+
+    Some(RestartPlan {
+        executable: "wt.exe".to_owned(),
+        args,
+        working_directory: None,
+        note: Some(
+            "Reopens the captured Windows Terminal session through wt.exe so the restore cannot attach an interactive shell to the terminal running Context Capsule."
+                .to_owned(),
+        ),
+    })
 }
 
 fn terminal_snapshot(snapshot: &Value) -> Option<TerminalSnapshot> {
@@ -569,13 +631,28 @@ fn wait_for_terminal_launch(
 
 #[cfg(windows)]
 fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<u32, String> {
+    if session.host == TerminalHost::WindowsTerminal && !windows_terminal_launcher(&plan.executable) {
+        return Err(format!(
+            "refusing unsafe Windows Terminal restart plan '{}'; Windows Terminal sessions must be launched through wt.exe",
+            plan.executable
+        ));
+    }
+
     let mut command = Command::new(&plan.executable);
     command.args(&plan.args);
     if let Some(directory) = plan.working_directory.as_deref() {
         command.current_dir(directory);
     }
 
-    if needs_fresh_console_window(session, plan) {
+    if windows_terminal_launcher(&plan.executable) {
+        // wt.exe is only a launcher. It must never inherit the stdin/stdout of
+        // the terminal running Context Capsule, especially an integrated VS Code
+        // terminal.
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else if needs_fresh_console_window(session, plan) {
         command.creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
     }
 
@@ -583,6 +660,16 @@ fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<
         .spawn()
         .map(|child| child.id())
         .map_err(|error| format!("failed to start '{}': {error}", plan.executable))
+}
+
+#[cfg(any(windows, test))]
+fn windows_terminal_launcher(executable: &str) -> bool {
+    let executable = executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    matches!(executable.as_str(), "wt.exe" | "wt")
 }
 
 #[cfg(windows)]
@@ -628,7 +715,7 @@ fn fresh_console_executable(executable: &str) -> bool {
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn direct_shell_process(executable: &str) -> bool {
     let executable = executable
         .rsplit(['\\', '/'])
@@ -753,6 +840,61 @@ mod tests {
     }
 
     #[test]
+    fn windows_terminal_direct_powershell_plan_is_rewritten_through_wt() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        saved.profile = Some("Windows PowerShell".to_owned());
+        saved.working_directory = Some(r"D:\projects\capsule".to_owned());
+        saved.restart = Some(RestartPlan {
+            executable: r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
+            args: Vec::new(),
+            working_directory: Some(r"C:\Users\example".to_owned()),
+            note: None,
+        });
+
+        let plan = safe_restart_plan(&saved).expect("safe Windows Terminal plan");
+        assert_eq!(plan.executable, "wt.exe");
+        assert_eq!(
+            plan.args,
+            vec![
+                "new-tab".to_owned(),
+                "-p".to_owned(),
+                "Windows PowerShell".to_owned(),
+                "-d".to_owned(),
+                r"D:\projects\capsule".to_owned(),
+            ]
+        );
+        assert!(plan.working_directory.is_none());
+    }
+
+    #[test]
+    fn windows_terminal_without_profile_uses_only_safe_shell_executable() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        saved.working_directory = Some(r"D:\projects\capsule".to_owned());
+        saved.startup_command = Some("powershell.exe -NoExit -Command dangerous-user-history".to_owned());
+        saved.restart = Some(RestartPlan {
+            executable: saved.shell_executable.clone().unwrap(),
+            args: Vec::new(),
+            working_directory: None,
+            note: None,
+        });
+
+        let plan = safe_restart_plan(&saved).expect("safe Windows Terminal plan");
+        assert_eq!(plan.executable, "wt.exe");
+        assert_eq!(
+            plan.args,
+            vec![
+                "new-tab".to_owned(),
+                "-d".to_owned(),
+                r"D:\projects\capsule".to_owned(),
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
+            ]
+        );
+        assert!(!plan.args.iter().any(|arg| arg.contains("dangerous-user-history")));
+    }
+
+    #[test]
     fn console_host_and_unknown_are_compatible_for_standalone_shells() {
         let saved = terminal_session(TerminalHost::ConsoleHost, ShellKind::CommandPrompt);
         let current = terminal_session(TerminalHost::Unknown, ShellKind::CommandPrompt);
@@ -810,5 +952,6 @@ mod tests {
         };
         assert!(!needs_fresh_console_window(&session, &wt));
         assert!(!direct_shell_process(&wt.executable));
+        assert!(windows_terminal_launcher(&wt.executable));
     }
 }
