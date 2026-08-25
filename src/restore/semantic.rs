@@ -662,7 +662,6 @@ fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<
         .map_err(|error| format!("failed to start '{}': {error}", plan.executable))
 }
 
-#[cfg(any(windows, test))]
 fn windows_terminal_launcher(executable: &str) -> bool {
     let executable = executable
         .rsplit(['\\', '/'])
@@ -715,7 +714,6 @@ fn fresh_console_executable(executable: &str) -> bool {
     )
 }
 
-#[cfg(any(windows, test))]
 fn direct_shell_process(executable: &str) -> bool {
     let executable = executable
         .rsplit(['\\', '/'])
