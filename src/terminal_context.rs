@@ -84,13 +84,10 @@ where
         return;
     }
 
-    if session.working_directory.is_none() {
-        let Some(pid) = session.pid else {
-            return;
-        };
-        let Some(directory) = cwd_for_pid(pid) else {
-            return;
-        };
+    // Windows Terminal persists a tab's *starting* directory. After `cd` or
+    // Set-Location that value is stale, while the live shell process has the
+    // directory the user was actually in when the capsule was captured.
+    if let Some(directory) = session.pid.and_then(|pid| cwd_for_pid(pid)) {
         session.working_directory = Some(directory);
     }
 
@@ -101,13 +98,20 @@ where
         return;
     };
 
-    // Direct shell restart plans are launched with Command::current_dir during
-    // restore. Windows Terminal state already encodes its starting directory
-    // through `wt.exe -d`, so do not mutate that richer plan here.
-    if restart.working_directory.is_none() && is_direct_windows_shell(&restart.executable) {
+    if is_direct_windows_shell(&restart.executable) {
+        // Standalone cmd/PowerShell shells are launched with Command::current_dir.
+        // Overwrite any stale value so capture, matching, and restore agree.
         restart.working_directory = Some(directory);
         restart.note = Some(
-            "Starts the captured interactive shell in its captured working directory without replaying shell history or foreground commands."
+            "Starts the captured interactive shell in its captured live working directory without replaying shell history or foreground commands."
+                .to_owned(),
+        );
+    } else if is_windows_terminal_launcher(&restart.executable) {
+        // A Windows Terminal child shell does not reliably inherit the CLI's
+        // working directory. wt.exe therefore needs an explicit -d argument.
+        set_windows_terminal_restart_directory(&mut restart.args, &directory);
+        restart.note = Some(
+            "Reopens the captured Windows Terminal profile in the shell's captured live working directory without replaying shell history or foreground commands."
                 .to_owned(),
         );
     }
@@ -140,6 +144,33 @@ fn is_direct_windows_shell(executable: &str) -> bool {
             | "sh.exe"
             | "sh"
     )
+}
+
+fn is_windows_terminal_launcher(executable: &str) -> bool {
+    let name = executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    matches!(name.as_str(), "wt.exe" | "wt")
+}
+
+fn set_windows_terminal_restart_directory(args: &mut Vec<String>, directory: &str) {
+    if let Some(index) = args.iter().position(|argument| {
+        argument.eq_ignore_ascii_case("-d")
+            || argument.eq_ignore_ascii_case("--startingDirectory")
+            || argument.eq_ignore_ascii_case("--starting-directory")
+    }) {
+        if let Some(value) = args.get_mut(index + 1) {
+            *value = directory.to_owned();
+        } else {
+            args.push(directory.to_owned());
+        }
+        return;
+    }
+
+    args.push("-d".to_owned());
+    args.push(directory.to_owned());
 }
 
 #[cfg(windows)]
@@ -488,6 +519,137 @@ mod tests {
         assert_eq!(
             prepared.sessions[0].working_directory.as_deref(),
             Some(r"C:\work\project")
+        );
+    }
+
+    #[test]
+    fn windows_terminal_live_cwd_overrides_persisted_starting_directory() {
+        let startup = r"C:\startup";
+        let live = r"C:\users\example\project";
+        let mut wt = session(TerminalHost::WindowsTerminal, 30, "pwsh.exe");
+        wt.profile = Some("PowerShell".to_owned());
+        wt.working_directory = Some(startup.to_owned());
+        wt.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        wt.restart = Some(RestartPlan {
+            executable: "wt.exe".to_owned(),
+            args: vec![
+                "new-tab".to_owned(),
+                "-p".to_owned(),
+                "PowerShell".to_owned(),
+                "-d".to_owned(),
+                startup.to_owned(),
+            ],
+            working_directory: None,
+            note: None,
+        });
+
+        let prepared = prepare_with(&snapshot(vec![wt]), false, &HashSet::new(), |pid| {
+            (pid == 30).then(|| live.to_owned())
+        });
+        let restored = &prepared.sessions[0];
+        assert_eq!(restored.working_directory.as_deref(), Some(live));
+        let plan = restored
+            .restart
+            .as_ref()
+            .expect("Windows Terminal restart plan");
+        let directory_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "-d")
+            .expect("-d argument");
+        assert_eq!(
+            plan.args.get(directory_index + 1).map(String::as_str),
+            Some(live)
+        );
+    }
+
+    #[test]
+    fn windows_terminal_persisted_starting_directory_is_fallback_when_live_cwd_is_unavailable() {
+        let startup = r"C:\startup";
+        let mut wt = session(TerminalHost::WindowsTerminal, 31, "pwsh.exe");
+        wt.working_directory = Some(startup.to_owned());
+        wt.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        wt.restart = Some(RestartPlan {
+            executable: "wt.exe".to_owned(),
+            args: vec!["new-tab".to_owned(), "-d".to_owned(), startup.to_owned()],
+            working_directory: None,
+            note: None,
+        });
+
+        let prepared = prepare_with(&snapshot(vec![wt]), false, &HashSet::new(), |_| None);
+        let restored = &prepared.sessions[0];
+        assert_eq!(restored.working_directory.as_deref(), Some(startup));
+        assert_eq!(
+            restored.working_directory_source,
+            WorkingDirectorySource::WindowsTerminalState
+        );
+        let plan = restored
+            .restart
+            .as_ref()
+            .expect("Windows Terminal restart plan");
+        assert_eq!(plan.args.last().map(String::as_str), Some(startup));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_cwd_reader_observes_a_live_cmd_directory_change() {
+        use std::{
+            fs,
+            io::Write,
+            process::{Command, Stdio},
+            thread,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "context-capsule-cwd-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let start = root.join("start");
+        let target = root.join("target");
+        fs::create_dir_all(&start).expect("create start directory");
+        fs::create_dir_all(&target).expect("create target directory");
+
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/Q", "/K"])
+            .current_dir(&start)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd.exe");
+        let mut stdin = child.stdin.take().expect("cmd stdin");
+        writeln!(stdin, "cd /d \"{}\"", target.display()).expect("send cd command");
+        stdin.flush().expect("flush cd command");
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut observed = None;
+        while Instant::now() < deadline {
+            observed = process_working_directory(child.id());
+            if observed.as_deref().is_some_and(|directory| {
+                directory
+                    .replace('/', "\\")
+                    .eq_ignore_ascii_case(&target.to_string_lossy().replace('/', "\\"))
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            observed.as_deref().is_some_and(|directory| {
+                directory
+                    .replace('/', "\\")
+                    .eq_ignore_ascii_case(&target.to_string_lossy().replace('/', "\\"))
+            }),
+            "live cmd.exe CWD reader did not converge to target; observed={observed:?}"
         );
     }
 }
