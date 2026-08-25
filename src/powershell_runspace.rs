@@ -5,15 +5,22 @@ use crate::{
 
 #[cfg(windows)]
 use std::{
+    io::Read,
     os::windows::process::CommandExt,
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 const TERMINAL_LOG_COMPONENT: &str = "terminal";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(windows)]
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Read the filesystem location of the interactive PowerShell runspace hosted by
 /// `session.pid` without sending input to the terminal and without attaching the
@@ -34,11 +41,16 @@ pub(super) fn working_directory(session: &TerminalSession) -> Option<String> {
     #[cfg(windows)]
     {
         let pid = session.pid?;
-        let client = match session.shell {
+        let default_client = match session.shell {
             ShellKind::WindowsPowerShell => "powershell.exe",
             ShellKind::PowerShell => "pwsh.exe",
             _ => return None,
         };
+        let client = session
+            .shell_executable
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(default_client);
 
         let script = r#"
 $ErrorActionPreference = 'Stop'
@@ -73,8 +85,8 @@ $candidates = @(
                 }
             }
             catch {
-                # A busy runspace can reject SessionStateProxy access. Ignore it
-                # instead of disturbing the command that is currently running.
+                # SessionStateProxy refuses access to a busy runspace. Ignore it
+                # rather than interrupting or debugging the user's command.
             }
         }
 )
@@ -96,6 +108,7 @@ $candidates |
     }
 }
 catch {
+    [Console]::Error.Write($_.Exception.Message)
     exit 2
 }
 finally {
@@ -103,13 +116,15 @@ finally {
 }
 "#;
 
-        let output = match Command::new(client)
+        let mut child = match Command::new(client)
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
             .env("CONTEXT_CAPSULE_TARGET_POWERSHELL_PID", pid.to_string())
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
         {
-            Ok(output) => output,
+            Ok(child) => child,
             Err(error) => {
                 logging::warn(
                     TERMINAL_LOG_COMPONENT,
@@ -121,18 +136,67 @@ finally {
             }
         };
 
-        if !output.status.success() {
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < PROBE_TIMEOUT => {
+                    thread::sleep(PROBE_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    logging::warn(
+                        TERMINAL_LOG_COMPONENT,
+                        format!(
+                            "PowerShell runspace CWD probe: pid={pid} client={client} timed out after {} ms",
+                            PROBE_TIMEOUT.as_millis(),
+                        ),
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    logging::warn(
+                        TERMINAL_LOG_COMPONENT,
+                        format!(
+                            "PowerShell runspace CWD probe: pid={pid} client={client} wait failed: {error}"
+                        ),
+                    );
+                    return None;
+                }
+            }
+        };
+
+        let mut stdout = Vec::new();
+        if let Some(mut reader) = child.stdout.take() {
+            let _ = reader.read_to_end(&mut stdout);
+        }
+        let mut stderr = Vec::new();
+        if let Some(mut reader) = child.stderr.take() {
+            let _ = reader.read_to_end(&mut stderr);
+        }
+        let _ = child.wait();
+
+        if !status.success() {
+            let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
             logging::info(
                 TERMINAL_LOG_COMPONENT,
                 format!(
-                    "PowerShell runspace CWD probe: pid={pid} client={client} unavailable (exit={:?})",
-                    output.status.code(),
+                    "PowerShell runspace CWD probe: pid={pid} client={client} unavailable (exit={:?}){}",
+                    status.code(),
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" detail={detail:?}")
+                    },
                 ),
             );
             return None;
         }
 
-        let directory = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let directory = String::from_utf8_lossy(&stdout).trim().to_owned();
         if directory.is_empty() {
             logging::info(
                 TERMINAL_LOG_COMPONENT,
