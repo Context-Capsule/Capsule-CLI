@@ -42,9 +42,6 @@ pub struct SemanticRestoreReport {
 pub fn restore(snapshot: &Value, dry_run: bool) -> SemanticRestoreReport {
     let mut report = SemanticRestoreReport::default();
 
-    // Docker can be restored without a GUI host, so converge it first. The GUI
-    // adapters are then handled one at a time to avoid simultaneous large
-    // browser/editor restores. External terminals are last.
     restore_docker(snapshot, dry_run, &mut report);
     restore_vscode(snapshot, dry_run, &mut report);
     restore_firefox(snapshot, dry_run, &mut report);
@@ -179,12 +176,8 @@ fn run_bus_adapter(
         Ok(None) => {
             let _ = restore_bus::cancel_request(adapter, &request.request_id);
             let diagnostic_hint = match adapter {
-                "firefox" => {
-                    "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore"
-                }
-                "chrome" => {
-                    "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore"
-                }
+                "firefox" => "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore",
+                "chrome" => "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore",
                 _ => "",
             };
             report.failures.push(format!(
@@ -360,6 +353,12 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
         }
 
         if let Some(plan) = safe_restart_plan(saved_session) {
+            if windows_terminal_powershell_has_untrusted_directory(saved_session) {
+                report.warnings.push(
+                    "Terminal restore: a saved Windows Terminal PowerShell session had only a Win32/process working-directory fallback. That value is not PowerShell $PWD, so Context Capsule ignored it instead of restoring a known-wrong directory. Configure Windows Terminal PowerShell CWD reporting (OSC 9;9) for exact directory restore."
+                        .to_owned(),
+                );
+            }
             missing.push((saved_session.clone(), plan));
         } else {
             report.warnings.push(format!(
@@ -433,6 +432,37 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
     }
 }
 
+fn windows_terminal_powershell(session: &TerminalSession) -> bool {
+    session.host == TerminalHost::WindowsTerminal
+        && matches!(session.environment, TerminalEnvironment::Windows)
+        && matches!(
+            session.shell,
+            crate::adapters::terminal::ShellKind::PowerShell
+                | crate::adapters::terminal::ShellKind::WindowsPowerShell
+        )
+}
+
+fn windows_terminal_powershell_has_untrusted_directory(session: &TerminalSession) -> bool {
+    windows_terminal_powershell(session)
+        && session.working_directory.is_some()
+        && !matches!(
+            session.working_directory_source,
+            crate::adapters::terminal::WorkingDirectorySource::WindowsTerminalState
+        )
+}
+
+fn trusted_saved_working_directory(session: &TerminalSession) -> Option<&str> {
+    if windows_terminal_powershell(session)
+        && !matches!(
+            session.working_directory_source,
+            crate::adapters::terminal::WorkingDirectorySource::WindowsTerminalState
+        )
+    {
+        return None;
+    }
+    session.working_directory.as_deref()
+}
+
 fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
     if saved.host != TerminalHost::WindowsTerminal
         || !matches!(saved.environment, TerminalEnvironment::Windows)
@@ -440,12 +470,6 @@ fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
         return saved.restart.clone();
     }
 
-    // A Windows Terminal session must always be reopened through wt.exe. Older
-    // capsules could contain a process-derived restart plan such as
-    // powershell.exe even though the session host was WindowsTerminal. Launching
-    // that child directly inherits the caller's terminal handles and can inject
-    // an interactive shell into the VS Code/console session running `capsule
-    // restore`. Rebuild the plan from semantic WT metadata instead.
     let mut args = vec!["new-tab".to_owned()];
     if let Some(profile) = saved
         .profile
@@ -456,9 +480,7 @@ fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
         args.push("-p".to_owned());
         args.push(profile.to_owned());
     }
-    if let Some(directory) = saved
-        .working_directory
-        .as_deref()
+    if let Some(directory) = trusted_saved_working_directory(saved)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -466,8 +488,6 @@ fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
         args.push(directory.to_owned());
     }
 
-    // If state.json did not identify the profile, preserve only the shell
-    // executable itself. Do not replay startup/foreground command lines.
     if saved.profile.as_deref().is_none_or(|profile| profile.trim().is_empty()) {
         let executable = saved
             .shell_executable
@@ -516,7 +536,7 @@ fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) 
             return false;
         }
     }
-    match saved.working_directory.as_deref() {
+    match trusted_saved_working_directory(saved) {
         Some(directory) => current
             .working_directory
             .as_deref()
@@ -537,15 +557,12 @@ fn launched_session_matches(saved: &TerminalSession, current: &TerminalSession) 
         return false;
     }
     match (
-        saved.working_directory.as_deref(),
+        trusted_saved_working_directory(saved),
         current.working_directory.as_deref(),
     ) {
         (Some(saved_directory), Some(current_directory)) => {
             paths_equivalent(current_directory, saved_directory)
         }
-        // This is only used after Context Capsule itself created this exact
-        // child PID and set Command::current_dir from the restart plan. Windows
-        // process discovery may temporarily be unable to read that CWD back.
         (Some(_), None) | (None, _) => true,
     }
 }
@@ -645,9 +662,6 @@ fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<
     }
 
     if windows_terminal_launcher(&plan.executable) {
-        // wt.exe is only a launcher. It must never inherit the stdin/stdout of
-        // the terminal running Context Capsule, especially an integrated VS Code
-        // terminal.
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -843,6 +857,7 @@ mod tests {
         saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
         saved.profile = Some("Windows PowerShell".to_owned());
         saved.working_directory = Some(r"D:\projects\capsule".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
         saved.restart = Some(RestartPlan {
             executable: r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
             args: Vec::new(),
@@ -870,6 +885,7 @@ mod tests {
         let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
         saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
         saved.working_directory = Some(r"D:\projects\capsule".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
         saved.startup_command = Some("powershell.exe -NoExit -Command dangerous-user-history".to_owned());
         saved.restart = Some(RestartPlan {
             executable: saved.shell_executable.clone().unwrap(),
@@ -890,6 +906,40 @@ mod tests {
             ]
         );
         assert!(!plan.args.iter().any(|arg| arg.contains("dangerous-user-history")));
+    }
+
+    #[test]
+    fn windows_terminal_powershell_ignores_untrusted_process_directory() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        saved.profile = Some("Windows PowerShell".to_owned());
+        saved.working_directory = Some(r"C:\Users\monji".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::Unknown;
+        saved.restart = Some(RestartPlan {
+            executable: saved.shell_executable.clone().unwrap(),
+            args: Vec::new(),
+            working_directory: Some(r"C:\Users\monji".to_owned()),
+            note: None,
+        });
+
+        let plan = safe_restart_plan(&saved).expect("safe Windows Terminal plan");
+        assert_eq!(
+            plan.args,
+            vec![
+                "new-tab".to_owned(),
+                "-p".to_owned(),
+                "Windows PowerShell".to_owned(),
+            ]
+        );
+        assert!(windows_terminal_powershell_has_untrusted_directory(&saved));
+
+        let mut current = saved.clone();
+        current.working_directory = Some(r"D:\actual-project".to_owned());
+        current.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        assert!(
+            terminal_session_matches(&saved, &current),
+            "an untrusted Win32 PowerShell directory must not make a live semantic session look different"
+        );
     }
 
     #[test]
