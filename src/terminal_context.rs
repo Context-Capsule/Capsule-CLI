@@ -1,5 +1,8 @@
-use crate::adapters::terminal::{
-    TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot, TerminalSource,
+use crate::{
+    adapters::terminal::{
+        TerminalEnvironment, TerminalHost, TerminalSession, TerminalSnapshot, TerminalSource,
+    },
+    logging,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -7,11 +10,29 @@ use std::collections::HashSet;
 #[cfg(windows)]
 use std::{collections::HashMap, fs};
 
+const TERMINAL_LOG_COMPONENT: &str = "terminal";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WindowsTerminalSessionMetadata {
     profile: Option<String>,
     starting_directory: Option<String>,
     tab_title: Option<String>,
+}
+
+fn log_terminal_session(stage: &str, session: &TerminalSession) {
+    logging::info(
+        TERMINAL_LOG_COMPONENT,
+        format!(
+            "{stage}: host={:?} shell={} pid={:?} profile={:?} cwd={:?} cwd_source={:?} sources={:?}",
+            session.host,
+            session.shell.as_str(),
+            session.pid,
+            session.profile,
+            session.working_directory,
+            session.working_directory_source,
+            session.sources,
+        ),
+    );
 }
 
 /// Prepare generic terminal discovery for durable capsule storage.
@@ -28,6 +49,15 @@ pub fn prepare_for_capture(
     snapshot: &TerminalSnapshot,
     vscode_semantic_available: bool,
 ) -> TerminalSnapshot {
+    logging::info(
+        TERMINAL_LOG_COMPONENT,
+        format!(
+            "capture begin: discovered_sessions={} windows_terminal_layouts={} vscode_semantic_available={vscode_semantic_available}",
+            snapshot.sessions.len(),
+            snapshot.windows_terminal_layouts.len(),
+        ),
+    );
+
     #[cfg(windows)]
     {
         let mut reconciled = snapshot.clone();
@@ -49,15 +79,30 @@ pub fn prepare_for_capture(
             prepared.warnings.push(format!(
                 "Ignored {omitted} persisted-only Windows Terminal session(s) because no live shell process or WSL session confirmed that those tabs are still open."
             ));
+            logging::info(
+                TERMINAL_LOG_COMPONENT,
+                format!("capture omitted {omitted} persisted-only Windows Terminal session(s)"),
+            );
         }
+        for session in &prepared.sessions {
+            log_terminal_session("capture final session", session);
+        }
+        logging::info(
+            TERMINAL_LOG_COMPONENT,
+            format!("capture complete: saved_sessions={}", prepared.sessions.len()),
+        );
         return prepared;
     }
 
     #[cfg(not(windows))]
     {
-        prepare_with(snapshot, vscode_semantic_available, &HashSet::new(), |_| {
+        let prepared = prepare_with(snapshot, vscode_semantic_available, &HashSet::new(), |_| {
             None
-        })
+        });
+        for session in &prepared.sessions {
+            log_terminal_session("capture final session", session);
+        }
+        prepared
     }
 }
 
@@ -115,21 +160,74 @@ fn reconcile_windows_terminal_sessions(snapshot: &mut TerminalSnapshot) {
             source_paths.insert(layout.source_path.clone());
         }
     }
+    logging::info(
+        TERMINAL_LOG_COMPONENT,
+        format!(
+            "Windows Terminal reconcile: layout_records={} distinct_state_files={}",
+            snapshot.windows_terminal_layouts.len(),
+            source_paths.len(),
+        ),
+    );
     if source_paths.is_empty() {
+        logging::warn(
+            TERMINAL_LOG_COMPONENT,
+            "Windows Terminal reconcile: no persisted state file paths were discovered",
+        );
         return;
     }
 
     let mut metadata_by_session = HashMap::new();
     for source_path in source_paths {
-        let Ok(text) = fs::read_to_string(&source_path) else {
-            continue;
+        logging::info(
+            TERMINAL_LOG_COMPONENT,
+            format!("Windows Terminal reconcile: reading state file {source_path}"),
+        );
+        let text = match fs::read_to_string(&source_path) {
+            Ok(text) => text,
+            Err(error) => {
+                logging::warn(
+                    TERMINAL_LOG_COMPONENT,
+                    format!(
+                        "Windows Terminal reconcile: could not read state file {source_path}: {error}"
+                    ),
+                );
+                continue;
+            }
         };
-        let Ok(root) = serde_json::from_str::<Value>(&text) else {
-            continue;
+        let root = match serde_json::from_str::<Value>(&text) {
+            Ok(root) => root,
+            Err(error) => {
+                logging::warn(
+                    TERMINAL_LOG_COMPONENT,
+                    format!(
+                        "Windows Terminal reconcile: state file {source_path} is not valid JSON: {error}"
+                    ),
+                );
+                continue;
+            }
         };
+        let before = metadata_by_session.len();
         collect_windows_terminal_session_metadata(&root, &mut metadata_by_session);
+        logging::info(
+            TERMINAL_LOG_COMPONENT,
+            format!(
+                "Windows Terminal reconcile: state file {source_path} contributed {} session record(s)",
+                metadata_by_session.len().saturating_sub(before),
+            ),
+        );
     }
+    logging::info(
+        TERMINAL_LOG_COMPONENT,
+        format!(
+            "Windows Terminal reconcile: total persisted session metadata records={}",
+            metadata_by_session.len(),
+        ),
+    );
     if metadata_by_session.is_empty() {
+        logging::warn(
+            TERMINAL_LOG_COMPONENT,
+            "Windows Terminal reconcile: no persisted sessionId metadata was available",
+        );
         return;
     }
 
@@ -140,16 +238,46 @@ fn reconcile_windows_terminal_sessions(snapshot: &mut TerminalSnapshot) {
             continue;
         }
         let Some(pid) = session.pid else {
+            logging::warn(
+                TERMINAL_LOG_COMPONENT,
+                "Windows Terminal reconcile: live WindowsProcess session had no PID",
+            );
             continue;
         };
         let Some(wt_session) = process_environment_variable(pid, "WT_SESSION") else {
+            logging::warn(
+                TERMINAL_LOG_COMPONENT,
+                format!(
+                    "Windows Terminal reconcile: pid={pid} shell={} had no readable WT_SESSION environment value",
+                    session.shell.as_str(),
+                ),
+            );
             continue;
         };
         let key = normalize_windows_terminal_session_id(&wt_session);
         let Some(metadata) = metadata_by_session.get(&key) else {
+            logging::warn(
+                TERMINAL_LOG_COMPONENT,
+                format!(
+                    "Windows Terminal reconcile: pid={pid} shell={} WT_SESSION={} had no matching persisted sessionId record",
+                    session.shell.as_str(),
+                    key,
+                ),
+            );
             continue;
         };
+        logging::info(
+            TERMINAL_LOG_COMPONENT,
+            format!(
+                "Windows Terminal reconcile: pid={pid} shell={} WT_SESSION={} matched profile={:?} starting_directory={:?}",
+                session.shell.as_str(),
+                key,
+                metadata.profile,
+                metadata.starting_directory,
+            ),
+        );
         apply_windows_terminal_session_metadata(session, metadata);
+        log_terminal_session("Windows Terminal reconcile applied", session);
     }
 }
 
@@ -278,17 +406,32 @@ where
     }
 
     let process_directory = session.pid.and_then(|pid| cwd_for_pid(pid));
-    let has_terminal_reported_powershell_location = session.host == TerminalHost::WindowsTerminal
+    let is_windows_terminal_powershell = session.host == TerminalHost::WindowsTerminal
         && matches!(
             session.shell,
             crate::adapters::terminal::ShellKind::PowerShell
                 | crate::adapters::terminal::ShellKind::WindowsPowerShell
-        )
+        );
+    let has_terminal_reported_powershell_location = is_windows_terminal_powershell
         && session.working_directory.is_some()
         && matches!(
             session.working_directory_source,
             crate::adapters::terminal::WorkingDirectorySource::WindowsTerminalState
         );
+
+    if is_windows_terminal_powershell {
+        logging::info(
+            TERMINAL_LOG_COMPONENT,
+            format!(
+                "PowerShell CWD decision: pid={:?} profile={:?} terminal_cwd={:?} terminal_cwd_source={:?} process_cwd={:?} terminal_reported={has_terminal_reported_powershell_location}",
+                session.pid,
+                session.profile,
+                session.working_directory,
+                session.working_directory_source,
+                process_directory,
+            ),
+        );
+    }
 
     // cmd.exe keeps the Win32 process CWD in sync with `cd`, so the live process
     // value is authoritative and can replace a stale Windows Terminal starting
@@ -300,6 +443,18 @@ where
         if let Some(directory) = process_directory {
             session.working_directory = Some(directory);
         }
+    }
+
+    if is_windows_terminal_powershell {
+        logging::info(
+            TERMINAL_LOG_COMPONENT,
+            format!(
+                "PowerShell CWD decision result: pid={:?} chosen_cwd={:?} chosen_source={:?}",
+                session.pid,
+                session.working_directory,
+                session.working_directory_source,
+            ),
+        );
     }
 
     let Some(directory) = session.working_directory.clone() else {
