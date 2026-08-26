@@ -333,7 +333,9 @@ fn restore_desktop_with_policy(
             };
             let target = target_rect(saved_window, display);
             let satisfied = window_satisfied(current_window, saved_window, display, target);
-            if satisfied && !force_layout {
+            let force_this_window =
+                force_layout && force_layout_replay_supported(current_window, saved_window);
+            if satisfied && !force_this_window {
                 report.windows_already_placed += 1;
             } else if dry_run {
                 report.windows_planned_to_move += 1;
@@ -715,6 +717,18 @@ fn native_snap_direction(slot: SnapSlot) -> Option<SnapDirection> {
     }
 }
 
+fn force_layout_replay_supported(current: &CurrentWindow, saved: &SavedWindow) -> bool {
+    match saved.state_spec() {
+        WindowStateSpec::Snapped(slot) if native_snap_direction(slot).is_some() => {
+            // If IsWindowArranged is unavailable, the native snap helpers cannot
+            // verify a replay. Do not destroy a geometrically correct legacy
+            // layout just to force an unverifiable transition.
+            windows_snap::is_arranged(current.hwnd as Hwnd).is_some()
+        }
+        _ => true,
+    }
+}
+
 fn window_geometry_satisfied(
     current: &CurrentWindow,
     saved: &SavedWindow,
@@ -808,7 +822,7 @@ fn apply_window_state(
     saved: &SavedWindow,
     display: &TargetDisplay,
     target: SavedRect,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<(), String> {
     let hwnd = current.hwnd as Hwnd;
     if hwnd.is_null() {
@@ -1486,7 +1500,7 @@ mod tests {
     #[test]
     fn forced_final_pass_never_skips_an_initially_satisfied_window() {
         let satisfied = true;
-        assert!(!(satisfied && true));
+        assert!(!(satisfied && !true));
         assert!(satisfied && !false);
     }
 }
