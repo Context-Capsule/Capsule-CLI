@@ -2,7 +2,7 @@
 mod legacy;
 #[path = "powershell_runspace.rs"]
 mod powershell_runspace;
-#[path = "powershell_ui_probe_v3.rs"]
+#[path = "powershell_ui_probe_v4.rs"]
 mod powershell_ui_probe;
 
 use crate::{
@@ -12,6 +12,7 @@ use crate::{
     },
     logging,
 };
+use std::collections::HashMap;
 
 const TERMINAL_LOG_COMPONENT: &str = "terminal";
 
@@ -104,9 +105,6 @@ where
         .iter()
         .filter(|session| is_windows_terminal_powershell(session))
     {
-        // Process-tree evidence is authoritative for this UI safety gate. If an
-        // external child command is running under the interactive shell, typing
-        // into that terminal could queue a command behind the running process.
         if session.foreground_command.is_some() {
             logging::info(
                 TERMINAL_LOG_COMPONENT,
@@ -118,13 +116,6 @@ where
             return false;
         }
 
-        // The process-remoting management connection can expose several runspaces
-        // in one PowerShell host. A Busy value from the first enumerated runspace
-        // is therefore advisory only: it may describe the remoting/management
-        // runspace rather than the visible Windows Terminal prompt. The user's
-        // logs demonstrated exactly that false-positive. We still record the
-        // signal for diagnostics, but only independent process-tree evidence can
-        // suppress the UI fallback.
         match idle_probe(session) {
             Some(true) => {
                 logging::info(
@@ -177,13 +168,13 @@ fn enrich_exact_powershell_locations_from_ui(
 
     logging::info(
         TERMINAL_LOG_COMPONENT,
-        format!("{stage}: entering PowerShell UI CWD fallback"),
+        format!("{stage}: entering PowerShell UI CWD fallback v4"),
     );
-    let exact_by_pid = powershell_ui_probe::working_directories(safety_snapshot);
-    if exact_by_pid.is_empty() {
+    let probe = powershell_ui_probe::probe(safety_snapshot);
+    if probe.directories.is_empty() && probe.ordered_pids.is_empty() {
         logging::info(
             TERMINAL_LOG_COMPONENT,
-            format!("{stage}: PowerShell UI CWD fallback produced no exact directory results"),
+            format!("{stage}: PowerShell UI CWD fallback v4 produced no results"),
         );
         return;
     }
@@ -195,7 +186,7 @@ fn enrich_exact_powershell_locations_from_ui(
         let Some(pid) = session.pid else {
             continue;
         };
-        let Some(directory) = exact_by_pid.get(&pid).cloned() else {
+        let Some(directory) = probe.directories.get(&pid).cloned() else {
             continue;
         };
 
@@ -205,11 +196,71 @@ fn enrich_exact_powershell_locations_from_ui(
             session,
             directory,
             stage,
-            "PowerShellUiProbeV3",
+            "PowerShellUiProbeV4",
             previous_directory,
             previous_source,
         );
     }
+
+    reorder_windows_terminal_powershell_sessions(target, &probe.ordered_pids, stage);
+}
+
+fn reorder_windows_terminal_powershell_sessions(
+    snapshot: &mut TerminalSnapshot,
+    ordered_pids: &[u32],
+    stage: &str,
+) {
+    if ordered_pids.is_empty() {
+        return;
+    }
+
+    let rank = ordered_pids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, pid)| (pid, index))
+        .collect::<HashMap<_, _>>();
+
+    let slots = snapshot
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| is_windows_terminal_powershell(session))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    if slots.len() < 2 {
+        return;
+    }
+
+    let mut terminal_sessions = slots
+        .iter()
+        .map(|index| snapshot.sessions[*index].clone())
+        .collect::<Vec<_>>();
+
+    terminal_sessions.sort_by_key(|session| {
+        session
+            .pid
+            .and_then(|pid| rank.get(&pid).copied())
+            .unwrap_or(usize::MAX)
+    });
+
+    for (slot, session) in slots.into_iter().zip(terminal_sessions) {
+        snapshot.sessions[slot] = session;
+    }
+
+    let saved_order = snapshot
+        .sessions
+        .iter()
+        .filter(|session| is_windows_terminal_powershell(session))
+        .filter_map(|session| session.pid)
+        .collect::<Vec<_>>();
+    logging::info(
+        TERMINAL_LOG_COMPONENT,
+        format!(
+            "{stage}: Windows Terminal PowerShell session order aligned to observed tab order observed={ordered_pids:?} saved={saved_order:?}"
+        ),
+    );
 }
 
 fn apply_exact_directory(
@@ -238,14 +289,17 @@ mod tests {
     use crate::adapters::terminal::{
         RestartPlan, TerminalHistoryPolicy, TerminalSource, TerminalStatus,
     };
-    use std::collections::HashMap;
 
     fn snapshot_with(session: TerminalSession) -> TerminalSnapshot {
+        snapshot_with_sessions(vec![session])
+    }
+
+    fn snapshot_with_sessions(sessions: Vec<TerminalSession>) -> TerminalSnapshot {
         TerminalSnapshot {
             status: TerminalStatus::Available,
             message: None,
             windows_terminal_layouts: Vec::new(),
-            sessions: vec![session],
+            sessions,
             warnings: Vec::new(),
             history: TerminalHistoryPolicy {
                 captured: false,
@@ -255,13 +309,17 @@ mod tests {
     }
 
     fn fake_windows_terminal_powershell() -> TerminalSession {
+        fake_windows_terminal_powershell_with_pid(42)
+    }
+
+    fn fake_windows_terminal_powershell_with_pid(pid: u32) -> TerminalSession {
         TerminalSession {
             sources: vec![TerminalSource::WindowsProcess],
             host: TerminalHost::WindowsTerminal,
             shell: ShellKind::WindowsPowerShell,
             shell_executable: Some("powershell.exe".to_owned()),
             environment: TerminalEnvironment::Windows,
-            pid: Some(42),
+            pid: Some(pid),
             parent_pid: None,
             tty: None,
             profile: Some("Windows PowerShell".to_owned()),
@@ -299,7 +357,7 @@ mod tests {
                 session,
                 directory,
                 "test",
-                "PowerShellUiProbeV3",
+                "PowerShellUiProbeV4",
                 previous_directory,
                 previous_source,
             );
@@ -333,6 +391,23 @@ mod tests {
             session.working_directory_source,
             WorkingDirectorySource::WindowsTerminalState
         );
+    }
+
+    #[test]
+    fn observed_tab_order_reorders_saved_windows_terminal_sessions() {
+        let mut first = fake_windows_terminal_powershell_with_pid(200);
+        first.working_directory = Some(r"D:\second".to_owned());
+        let mut second = fake_windows_terminal_powershell_with_pid(100);
+        second.working_directory = Some(r"D:\first".to_owned());
+        let mut unrelated = fake_windows_terminal_powershell_with_pid(300);
+        unrelated.host = TerminalHost::VisualStudioCode;
+
+        let mut snapshot = snapshot_with_sessions(vec![first, unrelated.clone(), second]);
+        reorder_windows_terminal_powershell_sessions(&mut snapshot, &[100, 200], "test");
+
+        assert_eq!(snapshot.sessions[0].pid, Some(100));
+        assert_eq!(snapshot.sessions[1], unrelated);
+        assert_eq!(snapshot.sessions[2].pid, Some(200));
     }
 
     #[test]
