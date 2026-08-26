@@ -2,7 +2,7 @@
 mod legacy;
 #[path = "powershell_runspace.rs"]
 mod powershell_runspace;
-#[path = "powershell_ui_probe_v2.rs"]
+#[path = "powershell_ui_probe_v3.rs"]
 mod powershell_ui_probe;
 
 use crate::{
@@ -20,28 +20,13 @@ pub fn prepare_for_capture(
     vscode_semantic_available: bool,
 ) -> TerminalSnapshot {
     let mut prepared = legacy::prepare_for_capture(snapshot, vscode_semantic_available);
-
-    // Prefer the non-invasive PowerShell management/runspace API first. Some
-    // Windows PowerShell hosts do not expose their interactive runspace through
-    // that connection, so unresolved Windows Terminal sessions then fall back to
-    // a guarded UI probe that asks the real terminal pane for $PWD.
     enrich_exact_powershell_locations(&mut prepared, "capture");
-
-    // The UI probe gets the raw inventory for safety checks. prepare_for_capture
-    // intentionally removes the shell that is hosting the current capsule
-    // command, but that shell must remain visible to the UI safety gate so we
-    // never type into a busy command-host tab merely because it was filtered out
-    // of the capsule payload.
     enrich_exact_powershell_locations_from_ui(&mut prepared, snapshot, "capture");
     prepared
 }
 
 pub(crate) fn enrich_for_matching(snapshot: &TerminalSnapshot) -> TerminalSnapshot {
     let mut prepared = legacy::enrich_for_matching(snapshot);
-
-    // Restore matching needs the same exact logical PowerShell CWD used during
-    // capture. Otherwise multiple identical PowerShell tabs are indistinguishable
-    // and a surviving tab can be mistaken for a missing one.
     enrich_exact_powershell_locations(&mut prepared, "restore-match");
     enrich_exact_powershell_locations_from_ui(&mut prepared, snapshot, "restore-match");
     prepared
@@ -151,12 +136,6 @@ where
                 return false;
             }
             None => {
-                // The process-attach API is known to be incomplete on some
-                // Windows PowerShell 5.1 hosts (the same hosts that cannot expose
-                // SessionStateProxy/$PWD). Treating that API failure as a veto
-                // made the UI fallback unreachable. We still refuse any session
-                // with a discovered foreground child command, while the UI probe
-                // itself verifies foreground ownership before every SendInput.
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
                     format!(
@@ -217,7 +196,7 @@ fn enrich_exact_powershell_locations_from_ui(
             session,
             directory,
             stage,
-            "PowerShellUiProbeV2",
+            "PowerShellUiProbeV3",
             previous_directory,
             previous_source,
         );
@@ -232,10 +211,6 @@ fn apply_exact_directory(
     previous_directory: Option<String>,
     previous_source: WorkingDirectorySource,
 ) {
-    // WorkingDirectorySource predates exact PowerShell probing. The existing
-    // WindowsTerminalState variant is the serialized trust channel understood by
-    // restore matching. terminal.log records the true provenance explicitly so
-    // this does not masquerade as state.json discovery during diagnostics.
     session.working_directory = Some(directory.clone());
     session.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
 
@@ -315,7 +290,7 @@ mod tests {
                 session,
                 directory,
                 "test",
-                "PowerShellUiProbeV2",
+                "PowerShellUiProbeV3",
                 previous_directory,
                 previous_source,
             );
