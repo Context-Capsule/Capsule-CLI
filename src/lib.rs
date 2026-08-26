@@ -13,6 +13,7 @@ pub mod desktop;
 pub mod diagnostics;
 pub mod diff;
 pub mod explorer;
+pub mod git_context;
 pub mod logging;
 pub mod persistence;
 pub mod restore;

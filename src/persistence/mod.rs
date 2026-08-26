@@ -203,7 +203,9 @@ impl CapsuleStore {
         replace: bool,
     ) -> Result<CapsuleSummary, PersistenceError> {
         validate_capsule_name(name)?;
-        let payload_json = serde_json::to_string(snapshot)?;
+        let mut snapshot = snapshot.clone();
+        context_capsule::git_context::capture_into_snapshot(&mut snapshot.snapshot);
+        let payload_json = serde_json::to_string(&snapshot)?;
         let now = now_unix_ms();
         let transaction = self.connection.transaction()?;
 
