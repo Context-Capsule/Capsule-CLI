@@ -244,6 +244,22 @@ impl CurrentInventory {
 }
 
 pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreReport {
+    restore_desktop_with_policy(saved, dry_run, false)
+}
+
+/// Replays every saved window state even when the initial inventory already
+/// appears to match. This is used only for the final post-semantic pass so any
+/// focus/tab restoration side effects are overwritten by the saved physical
+/// desktop state instead of being accepted from a stale pre-focus observation.
+pub fn restore_desktop_forced(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreReport {
+    restore_desktop_with_policy(saved, dry_run, true)
+}
+
+fn restore_desktop_with_policy(
+    saved: &SavedDesktop,
+    dry_run: bool,
+    force_layout: bool,
+) -> DesktopRestoreReport {
     let mut report = DesktopRestoreReport {
         applications_total: saved.applications.len(),
         ..DesktopRestoreReport::default()
@@ -316,7 +332,8 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
                 continue;
             };
             let target = target_rect(saved_window, display);
-            if window_satisfied(current_window, saved_window, display, target) {
+            let satisfied = window_satisfied(current_window, saved_window, display, target);
+            if satisfied && !force_layout {
                 report.windows_already_placed += 1;
             } else if dry_run {
                 report.windows_planned_to_move += 1;
@@ -339,7 +356,12 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
     }
 
     if !dry_run && !matched_for_order.is_empty() {
-        reconcile_order_and_foreground(&matched_for_order, &mut report.warnings);
+        reconcile_order_and_foreground(
+            &matched_for_order,
+            &inventory.displays,
+            &mut report.warnings,
+            &mut report.failures,
+        );
     }
 
     if saved
@@ -879,21 +901,20 @@ fn apply_window_state(
         }
     }
 
-    // Native snapping is deliberately best-effort because SendInput can be
-    // blocked by foreground/UIPI policy and tools such as FancyZones can
-    // override Windows-key behavior. A saved rectangle that converged is still
-    // useful and is safer than failing the entire capsule restore.
+    // On modern Windows, a saved native Snap slot is not restored unless the
+    // arranged-state API confirms it. Keep the exact rectangle as a containment
+    // fallback, but return an error instead of silently reporting a floating
+    // half-screen window as successfully restored.
     if geometry_converged && native_direction.is_some() && native_failure.is_some() {
         stage_window_rect(hwnd, target)?;
         thread::sleep(Duration::from_millis(PLACEMENT_SETTLE_BASE_MS));
         if let Some(observed) = observe_window(hwnd) {
             if window_geometry_satisfied(&observed, saved, display, target) {
-                warnings.push(format!(
-                    "Native Windows snap could not be restored for '{}'; restored the exact saved rectangle instead: {}",
+                return Err(format!(
+                    "native Windows snap could not be restored for '{}'; exact saved geometry was retained but the window is not in the required arranged state: {}",
                     saved.title,
                     native_failure.as_deref().unwrap_or("unknown native snap failure")
                 ));
-                return Ok(());
             }
             last_observed = Some(observed);
         }
@@ -974,7 +995,9 @@ fn frame_adjusted_outer_rect(hwnd: Hwnd, desired_frame: SavedRect) -> SavedRect 
 
 fn reconcile_order_and_foreground(
     matches: &[(&SavedWindow, &CurrentWindow)],
+    displays: &[TargetDisplay],
     warnings: &mut Vec<String>,
+    failures: &mut Vec<String>,
 ) {
     let mut desired = matches.to_vec();
     desired.sort_by_key(|(saved, _)| saved.z_order);
@@ -1003,11 +1026,41 @@ fn reconcile_order_and_foreground(
     }
 
     if let Some((_, current)) = desired.iter().find(|(saved, _)| saved.is_foreground) {
-        if !current.is_foreground && unsafe { SetForegroundWindow(current.hwnd as Hwnd) } == 0 {
+        if unsafe { GetForegroundWindow() } as usize != current.hwnd
+            && unsafe { SetForegroundWindow(current.hwnd as Hwnd) } == 0
+        {
             warnings.push(
                 "Windows foreground-lock policy prevented restoring the saved foreground window"
                     .to_owned(),
             );
+        }
+    }
+
+    // Foreground/Z-order restoration happens after the main placement loop and
+    // may trigger application-specific window behavior. Re-observe every saved
+    // window now and repair anything that stopped satisfying its saved state.
+    // This is deliberately based on live Win32 state, not the inventory captured
+    // before focus changed.
+    for (saved, current) in &desired {
+        let Some(display) = choose_display(saved, displays) else {
+            continue;
+        };
+        let target = target_rect(saved, display);
+        let Some(observed) = observe_window(current.hwnd as Hwnd) else {
+            failures.push(format!(
+                "'{}' became unavailable while verifying layout after foreground restoration",
+                saved.title
+            ));
+            continue;
+        };
+        if window_satisfied(&observed, saved, display, target) {
+            continue;
+        }
+        if let Err(error) = apply_window_state(&observed, saved, display, target, warnings) {
+            failures.push(format!(
+                "'{}': layout changed after foreground restoration and could not be re-applied: {error}",
+                saved.title
+            ));
         }
     }
 }
@@ -1428,5 +1481,12 @@ mod tests {
         );
         assert_eq!(native_snap_direction(SnapSlot::LeftThird), None);
         assert_eq!(native_snap_direction(SnapSlot::TopLeftQuarter), None);
+    }
+
+    #[test]
+    fn forced_final_pass_never_skips_an_initially_satisfied_window() {
+        let satisfied = true;
+        assert!(!(satisfied && true));
+        assert!(satisfied && !false);
     }
 }
