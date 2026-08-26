@@ -2,7 +2,7 @@
 mod legacy;
 #[path = "powershell_runspace.rs"]
 mod powershell_runspace;
-#[path = "powershell_ui_probe.rs"]
+#[path = "powershell_ui_probe_v2.rs"]
 mod powershell_ui_probe;
 
 use crate::{
@@ -103,6 +103,17 @@ fn enrich_exact_powershell_locations_with<F>(
 }
 
 fn ui_probe_is_safe(safety_snapshot: &TerminalSnapshot, stage: &str) -> bool {
+    ui_probe_is_safe_with(safety_snapshot, stage, powershell_runspace::is_idle)
+}
+
+fn ui_probe_is_safe_with<F>(
+    safety_snapshot: &TerminalSnapshot,
+    stage: &str,
+    idle_probe: F,
+) -> bool
+where
+    F: Fn(&TerminalSession) -> Option<bool>,
+{
     for session in safety_snapshot
         .sessions
         .iter()
@@ -119,27 +130,40 @@ fn ui_probe_is_safe(safety_snapshot: &TerminalSnapshot, stage: &str) -> bool {
             return false;
         }
 
-        match powershell_runspace::is_idle(session) {
-            Some(true) => {}
+        match idle_probe(session) {
+            Some(true) => {
+                logging::info(
+                    TERMINAL_LOG_COMPONENT,
+                    format!(
+                        "{stage}: PowerShell UI CWD safety gate pid={:?}: runspace explicitly Available",
+                        session.pid,
+                    ),
+                );
+            }
             Some(false) => {
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
                     format!(
-                        "{stage}: PowerShell UI CWD fallback skipped because pid={:?} runspace is busy",
+                        "{stage}: PowerShell UI CWD fallback skipped because pid={:?} runspace is explicitly Busy",
                         session.pid,
                     ),
                 );
                 return false;
             }
             None => {
+                // The process-attach API is known to be incomplete on some
+                // Windows PowerShell 5.1 hosts (the same hosts that cannot expose
+                // SessionStateProxy/$PWD). Treating that API failure as a veto
+                // made the UI fallback unreachable. We still refuse any session
+                // with a discovered foreground child command, while the UI probe
+                // itself verifies foreground ownership before every SendInput.
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
                     format!(
-                        "{stage}: PowerShell UI CWD fallback skipped because idle state could not be proven for pid={:?}",
+                        "{stage}: PowerShell UI CWD safety gate pid={:?}: idle API unavailable; continuing because process inventory shows no foreground child command",
                         session.pid,
                     ),
                 );
-                return false;
             }
         }
     }
@@ -163,6 +187,10 @@ fn enrich_exact_powershell_locations_from_ui(
         return;
     }
 
+    logging::info(
+        TERMINAL_LOG_COMPONENT,
+        format!("{stage}: entering PowerShell UI CWD fallback"),
+    );
     let exact_by_pid = powershell_ui_probe::working_directories(safety_snapshot);
     if exact_by_pid.is_empty() {
         logging::info(
@@ -189,7 +217,7 @@ fn enrich_exact_powershell_locations_from_ui(
             session,
             directory,
             stage,
-            "PowerShellUiProbe",
+            "PowerShellUiProbeV2",
             previous_directory,
             previous_source,
         );
@@ -287,7 +315,7 @@ mod tests {
                 session,
                 directory,
                 "test",
-                "PowerShellUiProbe",
+                "PowerShellUiProbeV2",
                 previous_directory,
                 previous_source,
             );
@@ -321,6 +349,26 @@ mod tests {
             session.working_directory_source,
             WorkingDirectorySource::WindowsTerminalState
         );
+    }
+
+    #[test]
+    fn unavailable_idle_api_no_longer_suppresses_ui_fallback() {
+        let snapshot = snapshot_with(fake_windows_terminal_powershell());
+        assert!(ui_probe_is_safe_with(&snapshot, "test", |_| None));
+    }
+
+    #[test]
+    fn explicitly_busy_runspace_still_blocks_ui_fallback() {
+        let snapshot = snapshot_with(fake_windows_terminal_powershell());
+        assert!(!ui_probe_is_safe_with(&snapshot, "test", |_| Some(false)));
+    }
+
+    #[test]
+    fn foreground_child_command_still_blocks_ui_fallback() {
+        let mut session = fake_windows_terminal_powershell();
+        session.foreground_command = Some("node server.js".to_owned());
+        let snapshot = snapshot_with(session);
+        assert!(!ui_probe_is_safe_with(&snapshot, "test", |_| None));
     }
 
     #[test]
