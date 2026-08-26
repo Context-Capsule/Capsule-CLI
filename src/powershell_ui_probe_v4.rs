@@ -516,9 +516,6 @@ fn focus_window_without_geometry_change(hwnd: Hwnd) -> bool {
         return false;
     }
 
-    // Never restore/minimize/maximize/reposition a window as part of save-time
-    // terminal probing. A minimized Terminal is skipped rather than having its
-    // layout mutated just so Context Capsule can inspect it.
     if unsafe { IsIconic(hwnd) } != 0 {
         logging::info(
             TERMINAL_LOG_COMPONENT,
@@ -805,6 +802,7 @@ mod tests {
         assert!(!command.contains("Clear-Host"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn initial_active_probe_does_not_define_tab_order() {
         let expected = [10_u32, 20_u32].into_iter().collect::<HashSet<_>>();
