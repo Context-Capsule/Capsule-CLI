@@ -13,6 +13,7 @@ pub mod desktop;
 pub mod diagnostics;
 pub mod diff;
 pub mod explorer;
+#[path = "git_context_v3.rs"]
 pub mod git_context;
 pub mod logging;
 pub mod persistence;
