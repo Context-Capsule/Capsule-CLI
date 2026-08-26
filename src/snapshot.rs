@@ -1,10 +1,15 @@
+#[path = "display_setup.rs"]
+mod display_setup;
+#[path = "terminal_context.rs"]
+mod terminal_context;
+
 use crate::{
     adapters::terminal::{TerminalHost, TerminalSnapshot},
     desktop::{ApplicationInfo, DesktopSnapshot, DisplayInfo, IgnoredCandidate, Rect, WindowInfo},
     discovery::{DiscoverySnapshot, GitState},
     persistence::{PersistenceError, StoredCapsuleSnapshot},
 };
-use context_capsule::{browser, explorer, vscode};
+use context_capsule::{browser, chrome, explorer, vscode};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -96,7 +101,6 @@ pub fn capture_snapshot_with_options(
         .unwrap_or_default();
 
     let docker = serde_json::to_value(&discovery.docker)?;
-    let terminals = serde_json::to_value(filtered_terminal_snapshot(&discovery.terminals, &ignored))?;
     let explorer = if ignored.iter().any(|application| is_explorer(application)) {
         json!({
             "schema_version": 1,
@@ -107,10 +111,21 @@ pub fn capture_snapshot_with_options(
     } else {
         serde_json::to_value(explorer::discover())?
     };
-    let firefox = if ignored.iter().any(|application| is_firefox_family(application)) {
+    let firefox_ignored = ignored.iter().any(|application| is_firefox_family(application));
+    let firefox_running = discovery
+        .desktop
+        .as_ref()
+        .ok()
+        .is_some_and(|desktop| desktop.applications.iter().any(is_firefox_family));
+    let firefox = if firefox_ignored {
         None
     } else {
-        browser::load_recent_firefox_state()
+        firefox_state_for_capture(browser::load_recent_firefox_state(), firefox_running)?
+    };
+    let chrome = if ignored.iter().any(|application| is_chrome(application)) {
+        None
+    } else {
+        chrome::load_recent_chrome_state()
             .ok()
             .flatten()
             .map(serde_json::to_value)
@@ -125,6 +140,13 @@ pub fn capture_snapshot_with_options(
             .map(serde_json::to_value)
             .transpose()?
     };
+
+    let filtered_terminals = filtered_terminal_snapshot(&discovery.terminals, &ignored);
+    let prepared_terminals =
+        terminal_context::prepare_for_capture(&filtered_terminals, vscode.is_some());
+    let terminals = serde_json::to_value(&prepared_terminals)?;
+    let display_setup = display_setup::capture(&discovery.desktop);
+
     let ignored_names = ignored
         .iter()
         .map(|application| application.name.clone())
@@ -148,12 +170,23 @@ pub fn capture_snapshot_with_options(
             "value": hint.value,
         })).collect::<Vec<_>>(),
         "desktop": desktop_value(&discovery.desktop, options),
+        "display_setup": display_setup,
         "explorer": explorer,
         "docker": docker,
         "terminals": terminals,
         "browsers": { "firefox": firefox },
         "editors": { "vscode": vscode },
     });
+
+    // Chrome is purely additive. When no live Chrome adapter exists, keep the
+    // historical browsers object exactly as it was before Chrome support.
+    if let Some(chrome) = chrome {
+        snapshot
+            .pointer_mut("/browsers")
+            .and_then(Value::as_object_mut)
+            .expect("browsers is an object")
+            .insert("chrome".to_owned(), chrome);
+    }
 
     // Keep the default payload shape identical to pre-exclusion capsules. The
     // additive metadata exists only when the user explicitly chose exclusions.
@@ -165,6 +198,26 @@ pub fn capture_snapshot_with_options(
     }
 
     Ok(StoredCapsuleSnapshot::new(snapshot))
+}
+
+fn firefox_state_for_capture(
+    state: Result<Option<browser::FirefoxSnapshot>, browser::BrowserError>,
+    firefox_running: bool,
+) -> Result<Option<Value>, PersistenceError> {
+    match state {
+        Ok(Some(snapshot)) => serde_json::to_value(snapshot)
+            .map(Some)
+            .map_err(PersistenceError::Json),
+        Ok(None) if firefox_running => Err(PersistenceError::InvalidPayload(
+            "Zen/Firefox is running, but no fresh semantic browser state is available. Context Capsule refused to save an incomplete capsule because it would not be able to restore missing browser tabs. Ensure the Context Capsule browser extension is installed and connected to the native host, then save again (or explicitly --ignore-app Zen/Firefox)."
+                .to_owned(),
+        )),
+        Ok(None) => Ok(None),
+        Err(error) if firefox_running => Err(PersistenceError::InvalidPayload(format!(
+            "Zen/Firefox is running, but its semantic browser state could not be captured: {error}. Context Capsule refused to save an incomplete capsule."
+        ))),
+        Err(_) => Ok(None),
+    }
 }
 
 fn filtered_terminal_snapshot(
@@ -289,6 +342,13 @@ fn is_firefox_family(application: &ApplicationInfo) -> bool {
     is_named_or_executable(
         application,
         &["zen", "Zen Browser", "zen.exe", "firefox", "Mozilla Firefox", "firefox.exe"],
+    )
+}
+
+fn is_chrome(application: &ApplicationInfo) -> bool {
+    is_named_or_executable(
+        application,
+        &["chrome", "Google Chrome", "chrome.exe"],
     )
 }
 
@@ -444,10 +504,31 @@ mod tests {
         assert_eq!(stored.snapshot["terminals"]["status"], "not-requested");
         assert_eq!(stored.snapshot["terminals"]["history"]["captured"], false);
         assert_eq!(stored.snapshot["git"]["status"], "not-repository");
+        assert_eq!(stored.snapshot["display_setup"]["status"], "available");
+        assert_eq!(stored.snapshot["display_setup"]["display_count"], 0);
         assert!(stored.snapshot.get("explorer").is_some());
         assert!(stored.snapshot.pointer("/browsers/firefox").is_some());
         assert!(stored.snapshot.pointer("/editors/vscode").is_some());
         assert!(stored.snapshot.get("capture_options").is_none());
+    }
+
+    #[test]
+    fn running_firefox_family_rejects_missing_semantic_state() {
+        let error = firefox_state_for_capture(Ok(None), true)
+            .expect_err("running Zen/Firefox must not silently produce a null browser slot");
+        assert!(matches!(
+            error,
+            PersistenceError::InvalidPayload(message)
+                if message.contains("no fresh semantic browser state")
+        ));
+    }
+
+    #[test]
+    fn stopped_firefox_family_allows_missing_semantic_state() {
+        assert_eq!(
+            firefox_state_for_capture(Ok(None), false).expect("missing inactive browser state"),
+            None
+        );
     }
 
     #[test]
@@ -458,6 +539,13 @@ mod tests {
         assert!(application_matches_selector(&app, "code"));
         assert!(application_matches_selector(&app, r"C:\Users\test\Code.exe"));
         assert!(!application_matches_selector(&app, "Visual Studio"));
+    }
+
+    #[test]
+    fn chrome_identity_is_detected_without_affecting_firefox_family() {
+        let chrome = test_application("Google Chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        assert!(is_chrome(&chrome));
+        assert!(!is_firefox_family(&chrome));
     }
 
     #[test]

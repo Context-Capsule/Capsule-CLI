@@ -1,4 +1,4 @@
-name: Firefox Native Host
+name: Chrome Native Host
 
 on:
   push:
@@ -37,23 +37,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'cargo is unavailable after rustup setup' }
       - run: cargo fmt --all -- --check
       - run: cargo check --all-targets
-      - run: cargo test
-      - run: cargo build --bin capsule-firefox-host
-      - name: Register, diagnose, and unregister Firefox/Zen host
+      - run: cargo test chrome -- --nocapture
+      - run: cargo build --bin capsule-chrome-host
+      - name: Register, diagnose, and unregister Chrome host
         shell: pwsh
         env:
-          CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH: ${{ runner.temp }}\com.contextcapsule.host.json
+          CONTEXT_CAPSULE_CHROME_MANIFEST_PATH: ${{ runner.temp }}\com.contextcapsule.chrome.json
         run: |
-          .\target\debug\capsule-firefox-host.exe --install
-          .\target\debug\capsule-firefox-host.exe --doctor
-          if (-not (Test-Path $env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH)) { throw 'native messaging manifest was not created' }
-          $registryPath = 'Registry::HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts\com.contextcapsule.host'
-          if (-not (Test-Path $registryPath)) { throw 'native messaging registry key was not created' }
+          .\target\debug\capsule-chrome-host.exe --install
+          .\target\debug\capsule-chrome-host.exe --doctor
+          if (-not (Test-Path $env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH)) { throw 'Chrome native messaging manifest was not created' }
+          $manifest = Get-Content $env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH -Raw | ConvertFrom-Json
+          if ($manifest.name -ne 'com.contextcapsule.chrome') { throw 'Chrome native host name mismatch' }
+          if ($manifest.allowed_origins.Count -ne 1 -or $manifest.allowed_origins[0] -ne 'chrome-extension://gmffhdppfaeonombpbbgnldagfeabiof/') { throw 'Chrome extension origin mismatch' }
+          $registryPath = 'Registry::HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\com.contextcapsule.chrome'
+          if (-not (Test-Path $registryPath)) { throw 'Chrome native messaging registry key was not created' }
           $registeredManifest = (Get-Item $registryPath).GetValue('')
-          if ($registeredManifest -ne $env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH) { throw "registry points to '$registeredManifest' instead of '$env:CONTEXT_CAPSULE_FIREFOX_MANIFEST_PATH'" }
-          .\target\debug\capsule-firefox-host.exe --uninstall
-          if (Test-Path $registryPath) { throw 'native messaging registry key remained after uninstall' }
-      - name: Publish Firefox Windows status
+          if ($registeredManifest -ne $env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH) { throw "registry points to '$registeredManifest' instead of '$env:CONTEXT_CAPSULE_CHROME_MANIFEST_PATH'" }
+          .\target\debug\capsule-chrome-host.exe --uninstall
+          if (Test-Path $registryPath) { throw 'Chrome native messaging registry key remained after uninstall' }
+      - name: Publish Chrome Windows status
         if: always()
         shell: pwsh
         env:
@@ -61,15 +64,16 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: |
           $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
-          $body = @{ state = $state; context = 'ci/potus-firefox-host'; description = "POTUS Firefox host: $($env:JOB_STATUS)" } | ConvertTo-Json
+          $body = @{ state = $state; context = 'ci/potus-chrome-host'; description = "POTUS Chrome host: $($env:JOB_STATUS)" } | ConvertTo-Json
           Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
 
   protocol-integration-linux:
     runs-on: [self-hosted, Linux, X64]
     env:
-      HOME: ${{ runner.temp }}/context-capsule-firefox-home
-      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-firefox.db
-      CONTEXT_CAPSULE_FIREFOX_STATE_PATH: ${{ runner.temp }}/context-capsule-firefox-state.json
+      HOME: ${{ runner.temp }}/context-capsule-chrome-home
+      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-chrome.db
+      CONTEXT_CAPSULE_CHROME_STATE_PATH: ${{ runner.temp }}/context-capsule-chrome-state.json
+      CONTEXT_CAPSULE_CHROME_MANIFEST_PATH: ${{ runner.temp }}/context-capsule-chrome-manifest.json
     steps:
       - name: Verify POTUS-linux runner
         shell: bash
@@ -79,24 +83,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --bins
-      - name: Install and diagnose native host manifest
+      - name: Install and diagnose Chrome native host manifest
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$HOME"
-          ./target/debug/capsule-firefox-host --install
-          ./target/debug/capsule-firefox-host --doctor
-          test -f "$HOME/.mozilla/native-messaging-hosts/com.contextcapsule.host.json"
-          grep -F 'firefox@contextcapsule.app' "$HOME/.mozilla/native-messaging-hosts/com.contextcapsule.host.json"
+          ./target/debug/capsule-chrome-host --install
+          ./target/debug/capsule-chrome-host --doctor
+          test -f "$CONTEXT_CAPSULE_CHROME_MANIFEST_PATH"
+          grep -F 'com.contextcapsule.chrome' "$CONTEXT_CAPSULE_CHROME_MANIFEST_PATH"
+          grep -F 'chrome-extension://gmffhdppfaeonombpbbgnldagfeabiof/' "$CONTEXT_CAPSULE_CHROME_MANIFEST_PATH"
       - name: Exercise framed ping and live-state update
         shell: bash
         run: |
           python3 - <<'PY'
           import json, struct, subprocess
-          host = './target/debug/capsule-firefox-host'
+          host = './target/debug/capsule-chrome-host'
           snapshot = {
               'schema_version': 1,
-              'browser': 'firefox',
+              'browser': 'chrome',
               'extension_version': 'ci',
               'captured_at_unix_ms': 1,
               'skipped_private_windows': 0,
@@ -104,7 +109,7 @@ jobs:
                   'key': 'window-0', 'focused': True, 'state': 'normal',
                   'left': 0, 'top': 0, 'width': 1200, 'height': 800,
                   'tabs': [{
-                      'index': 0, 'url': 'https://example.com', 'title': 'Example',
+                      'index': 0, 'url': 'https://chrome-native-host-ci.example/', 'title': 'Chrome CI',
                       'pinned': False, 'active': True, 'discarded': False,
                       'muted': False, 'restorable': True
                   }],
@@ -126,15 +131,15 @@ jobs:
           assert responses[0]['type'] == 'pong' and responses[0]['ok']
           assert responses[1]['type'] == 'browser.state.updated' and responses[1]['ok']
           PY
-      - name: Save live Firefox state into SQLite capsule
+      - name: Save live Chrome state into SQLite capsule
         shell: bash
         run: |
           set -euo pipefail
-          ./target/debug/capsule save firefox-ci
-          ./target/debug/capsule show firefox-ci --json > "$RUNNER_TEMP/firefox-capsule.json"
-          grep -F '"firefox"' "$RUNNER_TEMP/firefox-capsule.json"
-          grep -F 'https://example.com' "$RUNNER_TEMP/firefox-capsule.json"
-      - name: Publish Firefox Linux protocol status
+          ./target/debug/capsule save chrome-ci
+          ./target/debug/capsule show chrome-ci --json > "$RUNNER_TEMP/chrome-capsule.json"
+          grep -F '"chrome"' "$RUNNER_TEMP/chrome-capsule.json"
+          grep -F 'https://chrome-native-host-ci.example/' "$RUNNER_TEMP/chrome-capsule.json"
+      - name: Publish Chrome Linux protocol status
         if: always()
         shell: bash
         env:
@@ -144,4 +149,4 @@ jobs:
           state=failure
           [ "$JOB_STATUS" = success ] && state=success
           [ "$JOB_STATUS" = cancelled ] && state=error
-          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -d "{\"state\":\"$state\",\"context\":\"ci/potus-linux-firefox-protocol\",\"description\":\"POTUS-linux Firefox protocol: $JOB_STATUS\"}" >/dev/null
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -d "{\"state\":\"$state\",\"context\":\"ci/potus-linux-chrome-protocol\",\"description\":\"POTUS-linux Chrome protocol: $JOB_STATUS\"}" >/dev/null

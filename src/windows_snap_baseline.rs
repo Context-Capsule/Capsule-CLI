@@ -1,10 +1,4 @@
-use std::{
-    cell::Cell,
-    ffi::c_void,
-    mem::size_of,
-    thread,
-    time::Duration,
-};
+use std::{cell::Cell, ffi::c_void, mem::size_of, thread, time::Duration};
 
 use crate::windows_snap_core;
 
@@ -83,10 +77,7 @@ impl Drop for TargetWorkAreaGuard {
     }
 }
 
-pub(crate) fn with_target_work_area<T>(
-    work_area: [i32; 4],
-    action: impl FnOnce() -> T,
-) -> T {
+pub(crate) fn with_target_work_area<T>(work_area: [i32; 4], action: impl FnOnce() -> T) -> T {
     let previous = TARGET_WORK_AREA.with(|target| target.replace(Some(work_area)));
     let _guard = TargetWorkAreaGuard { previous };
     action()
@@ -115,10 +106,7 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
         let arranged = windows_snap_core::snap(hwnd, direction)?;
         let actual_work = monitor_work_area(hwnd);
 
-        if arranged
-            && actual_work
-                .is_some_and(|actual| same_work_area(actual, expected_work))
-        {
+        if arranged && actual_work.is_some_and(|actual| same_work_area(actual, expected_work)) {
             return Ok(true);
         }
 

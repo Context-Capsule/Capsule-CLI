@@ -17,7 +17,9 @@ fn active_terminal_metadata_round_trips() {
 
     let serialized = serde_json::to_value(terminal).unwrap();
     assert_eq!(
-        serialized.get("active").and_then(serde_json::Value::as_bool),
+        serialized
+            .get("active")
+            .and_then(serde_json::Value::as_bool),
         Some(true)
     );
 }

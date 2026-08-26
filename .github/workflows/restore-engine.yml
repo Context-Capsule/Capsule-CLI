@@ -5,11 +5,15 @@ on:
     branches:
       - main
       - 'agent/**'
+      - 'feature/**'
     paths:
       - 'src/restore/**'
       - 'src/commands.rs'
       - 'src/main.rs'
       - 'src/lib.rs'
+      - 'src/snapshot.rs'
+      - 'src/terminal_context.rs'
+      - 'src/display_setup.rs'
       - 'tests/restore_geometry.rs'
       - 'tests/restore_snapshot_schema.rs'
       - 'tests/restore_windows_process.rs'
@@ -20,19 +24,99 @@ on:
       - 'src/commands.rs'
       - 'src/main.rs'
       - 'src/lib.rs'
+      - 'src/snapshot.rs'
+      - 'src/terminal_context.rs'
+      - 'src/display_setup.rs'
       - 'tests/restore_geometry.rs'
       - 'tests/restore_snapshot_schema.rs'
       - 'tests/restore_windows_process.rs'
       - '.github/workflows/restore-engine.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  validate:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  validate-windows:
+    runs-on: [self-hosted, Windows, X64]
     steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+      - uses: actions/checkout@v4
+      - name: Ensure stable Rust toolchain
+        shell: pwsh
+        run: |
+          Get-Command rustup -ErrorAction Stop | Format-List Source
+          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+          rustc --version
+          if ($LASTEXITCODE -ne 0) { throw 'rustc is unavailable after rustup setup' }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo is unavailable after rustup setup' }
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --all-targets
+      - name: Restore unit tests
+        run: cargo test restore
+      - name: Terminal ownership and CWD regression tests
+        run: cargo test terminal_context::tests -- --nocapture
+      - name: Display topology regression tests
+        run: cargo test display_setup::tests -- --nocapture
+      - name: Restore geometry integration tests
+        run: cargo test --test restore_geometry
+      - name: Persisted restore schema tests
+        run: cargo test --test restore_snapshot_schema
+      - name: Windows already-running process idempotence
+        run: cargo test --test restore_windows_process
+      - name: CLI restore parser tests
+        run: cargo test restore_parser
+      - name: Build capsule
+        run: cargo build --bin capsule
+      - name: Safe save -> restore dry-run lifecycle
+        shell: pwsh
+        env:
+          CONTEXT_CAPSULE_DB: ${{ runner.temp }}\restore-engine.db
+        run: |
+          Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
+          $saveOutput = cargo run --quiet -- save restore-engine-ci | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'save failed' }
+          if ($saveOutput -match '(?m)^\s*Docker:') { throw 'save emitted the Docker-unavailable warning that should be suppressed' }
+          $jsonText = cargo run --quiet -- show restore-engine-ci --json | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'show --json failed' }
+          $stored = $jsonText | ConvertFrom-Json
+          if (-not $stored.snapshot.display_setup) { throw 'saved capsule is missing display_setup' }
+          if ($stored.snapshot.display_setup.schema_version -ne 1) { throw 'display_setup schema version mismatch' }
+          cargo run --quiet -- restore restore-engine-ci --dry-run
+          if ($LASTEXITCODE -ne 0) { throw 'restore dry run failed' }
+      - name: Publish Windows restore status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } elseif ($env:JOB_STATUS -eq 'cancelled') { 'error' } else { 'failure' }
+          $body = @{ state = $state; context = 'ci/potus-restore-windows'; description = "POTUS restore Windows: $($env:JOB_STATUS)"; target_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } -ContentType 'application/json' -Body $body | Out-Null
+
+  validate-linux:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Verify POTUS-linux runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,31 +131,36 @@ jobs:
         run: cargo test --test restore_geometry
       - name: Persisted restore schema tests
         run: cargo test --test restore_snapshot_schema
-      - name: Windows already-running process idempotence
-        if: runner.os == 'Windows'
-        run: cargo test --test restore_windows_process
       - name: CLI restore parser tests
         run: cargo test restore_parser
       - name: Build capsule
         run: cargo build --bin capsule
-
-      - name: Safe save -> restore dry-run lifecycle (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          CONTEXT_CAPSULE_DB: ${{ runner.temp }}\restore-engine.db
-        run: |
-          cargo run --quiet -- save restore-engine-ci
-          if ($LASTEXITCODE -ne 0) { throw 'save failed' }
-          cargo run --quiet -- restore restore-engine-ci --dry-run
-          if ($LASTEXITCODE -ne 0) { throw 'restore dry run failed' }
-
-      - name: Safe save -> restore dry-run lifecycle (Linux)
-        if: runner.os == 'Linux'
+      - name: Safe save -> restore dry-run lifecycle
         shell: bash
         env:
           CONTEXT_CAPSULE_DB: ${{ runner.temp }}/restore-engine.db
         run: |
           set -euo pipefail
+          rm -f "$CONTEXT_CAPSULE_DB"
           cargo run --quiet -- save restore-engine-ci
+          cargo run --quiet -- show restore-engine-ci --json | grep -F '"display_setup"'
           cargo run --quiet -- restore restore-engine-ci --dry-run
+      - name: Publish Linux restore status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          state=failure
+          [ "$JOB_STATUS" = success ] && state=success
+          [ "$JOB_STATUS" = cancelled ] && state=error
+          target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"$state\",\"context\":\"ci/potus-restore-linux\",\"description\":\"POTUS-linux restore: $JOB_STATUS\",\"target_url\":\"$target_url\"}" >/dev/null
+
+# rerun requested after self-hosted runner dependency setup

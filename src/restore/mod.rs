@@ -85,10 +85,7 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
         Ok(Some(desktop)) => {
             full_application_count = desktop.applications.len();
             let zen_semantic_owner = has_browser_semantic
-                && desktop
-                    .applications
-                    .iter()
-                    .any(is_zen_semantic_application);
+                && desktop.applications.iter().any(is_zen_semantic_application);
 
             #[cfg(windows)]
             if zen_semantic_owner {
@@ -97,9 +94,10 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 report.failures.extend(zen_bootstrap.failures.clone());
             }
 
-            // Semantic adapters own host/window creation first: keep Zen and
-            // the VS Code Dev Host out of the prerequisite desktop pass so the
-            // generic launcher cannot race their richer restore logic.
+            // Semantic adapters own host/window creation first: keep Windows
+            // Terminal, Zen and the VS Code Dev Host out of the prerequisite
+            // desktop pass so generic launching cannot race their richer restore
+            // logic or create an extra default terminal tab.
             let prerequisite = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
@@ -107,13 +105,16 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 zen_semantic_owner,
             );
 
-            // After semantic restore has recreated browser/editor topology, the
-            // final Win32 pass owns only physical desktop convergence. Include
-            // Zen here so newly recreated windows get their saved monitor,
-            // rectangle and native Windows snap state without touching tabs.
+            // After semantic restore has recreated browser/editor/terminal
+            // topology, the final Win32 pass owns physical desktop convergence.
+            // Windows Terminal must be included here: semantic terminal restore
+            // creates the right tabs and CWDs, while this pass restores the saved
+            // monitor, rectangle, maximized state and genuine Windows snap state.
+            // This mirrors the original staged-restore contract: defer Terminal
+            // startup, never defer its final placement.
             let mut final_target = desktop_without_semantic_owned_hosts(
                 &desktop,
-                defer_windows_terminal,
+                false,
                 saved_devhost && !has_vscode_semantic,
                 false,
             );
@@ -241,7 +242,11 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             let initial_planned = report.desktop.applications_planned_to_launch;
 
             let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
-            let mut final_desktop = windows::restore_desktop(desktop, false);
+            // Never skip the final physical pass merely because the inventory
+            // captured before foreground/focus work already looked correct. The
+            // saved geometry and window state are deliberately replayed after all
+            // semantic tab/terminal work has finished.
+            let mut final_desktop = windows::restore_desktop_forced(desktop, false);
             final_desktop.applications_total = full_application_count;
             final_desktop.applications_launched += initial_launched;
             final_desktop.applications_already_running = initial_already_running;
@@ -415,7 +420,12 @@ fn executable_basename(application: &SavedApplication) -> Option<&str> {
     application
         .executable_path
         .as_deref()
-        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .or_else(|| {
+            application
+                .launch
+                .as_ref()
+                .map(|launch| launch.target.as_str())
+        })
         .and_then(|value| value.rsplit(['\\', '/']).next())
 }
 
@@ -526,10 +536,12 @@ mod tests {
             RestoreOptions { dry_run: true },
         );
         assert!(report.success());
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Firefox semantic restore")));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Firefox semantic restore"))
+        );
     }
 
     #[test]
@@ -539,19 +551,42 @@ mod tests {
             displays: Vec::new(),
             applications: vec![
                 application("zen", Some(r"C:\Program Files\Zen Browser\zen.exe")),
-                application("Mozilla Firefox", Some(r"C:\Program Files\Mozilla Firefox\firefox.exe")),
+                application(
+                    "Mozilla Firefox",
+                    Some(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
+                ),
                 application("Spotify", Some(r"C:\Users\me\Spotify.exe")),
             ],
         };
         let prerequisite = desktop_without_semantic_owned_hosts(&desktop, false, false, true);
         assert_eq!(prerequisite.applications.len(), 2);
-        assert!(prerequisite.applications.iter().any(|application| application.name == "Mozilla Firefox"));
-        assert!(prerequisite.applications.iter().any(|application| application.name == "Spotify"));
-        assert!(!prerequisite.applications.iter().any(is_zen_semantic_application));
+        assert!(
+            prerequisite
+                .applications
+                .iter()
+                .any(|application| application.name == "Mozilla Firefox")
+        );
+        assert!(
+            prerequisite
+                .applications
+                .iter()
+                .any(|application| application.name == "Spotify")
+        );
+        assert!(
+            !prerequisite
+                .applications
+                .iter()
+                .any(is_zen_semantic_application)
+        );
 
         let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
         assert_eq!(final_placement.applications.len(), 3);
-        assert!(final_placement.applications.iter().any(is_zen_semantic_application));
+        assert!(
+            final_placement
+                .applications
+                .iter()
+                .any(is_zen_semantic_application)
+        );
     }
 
     #[test]
@@ -584,8 +619,16 @@ mod tests {
             .iter()
             .find(|application| is_zen_semantic_application(application))
             .unwrap();
-        assert!(zen_physical.windows.iter().all(|window| window.title.is_empty()));
-        assert_eq!(physical.applications[1].windows[0].title, "notes.txt - Notepad");
+        assert!(
+            zen_physical
+                .windows
+                .iter()
+                .all(|window| window.title.is_empty())
+        );
+        assert_eq!(
+            physical.applications[1].windows[0].title,
+            "notes.txt - Notepad"
+        );
         assert_eq!(
             desktop.applications[0]
                 .windows
@@ -604,6 +647,29 @@ mod tests {
         assert!(!should_defer_windows_terminal(&json!({
             "terminals": { "sessions": [{ "host": "windows-terminal", "restart": null }] }
         })));
+    }
+
+    #[test]
+    fn windows_terminal_is_deferred_for_startup_but_included_for_final_placement() {
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: Vec::new(),
+            applications: vec![
+                application(
+                    "Windows Terminal",
+                    Some(r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"),
+                ),
+                application("Notepad", Some(r"C:\Windows\System32\notepad.exe")),
+            ],
+        };
+
+        let prerequisite = desktop_without_semantic_owned_hosts(&desktop, true, false, false);
+        assert!(!prerequisite.applications.iter().any(is_windows_terminal_application));
+        assert!(prerequisite.applications.iter().any(|app| app.name == "Notepad"));
+
+        let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
+        assert!(final_placement.applications.iter().any(is_windows_terminal_application));
+        assert!(final_placement.applications.iter().any(|app| app.name == "Notepad"));
     }
 
     #[test]
@@ -754,8 +820,7 @@ mod tests {
 
         let mut packaged = base.clone();
         packaged.executable_path = None;
-        packaged.app_user_model_id =
-            Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned());
+        packaged.app_user_model_id = Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned());
         assert!(is_windows_terminal_application(&packaged));
     }
 }

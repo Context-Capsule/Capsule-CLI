@@ -34,15 +34,23 @@ pub struct CapsuleDiff {
 
 impl CapsuleDiff {
     pub fn is_empty(&self) -> bool {
-        self.sections.iter().all(|section| section.changes.is_empty())
+        self.sections
+            .iter()
+            .all(|section| section.changes.is_empty())
     }
 
     pub fn change_count(&self) -> usize {
-        self.sections.iter().map(|section| section.changes.len()).sum()
+        self.sections
+            .iter()
+            .map(|section| section.changes.len())
+            .sum()
     }
 }
 
-pub fn diff_snapshots(before: &StoredCapsuleSnapshot, after: &StoredCapsuleSnapshot) -> CapsuleDiff {
+pub fn diff_snapshots(
+    before: &StoredCapsuleSnapshot,
+    after: &StoredCapsuleSnapshot,
+) -> CapsuleDiff {
     let mut sections = Vec::new();
 
     push_section(
@@ -688,7 +696,11 @@ mod tests {
             ], "groups": [] }] } }
         }));
         let diff = diff_snapshots(&before, &after);
-        let browser = diff.sections.iter().find(|section| section.name == "Browser").unwrap();
+        let browser = diff
+            .sections
+            .iter()
+            .find(|section| section.name == "Browser")
+            .unwrap();
         assert_eq!(
             browser
                 .changes

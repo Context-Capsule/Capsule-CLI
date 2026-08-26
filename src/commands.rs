@@ -117,12 +117,9 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     );
     println!("  database: {database_path}");
 
-    if matches!(discovery.docker.status, DockerStatus::Unavailable) {
-        println!(
-            "  Docker: {}",
-            discovery.docker.message.as_deref().unwrap_or("unavailable")
-        );
-    }
+    // Docker is optional. A save should not look unhealthy just because Docker
+    // is not installed or its daemon is not running. Explicit Docker inspection
+    // and `capsule doctor` still report Docker availability when requested.
     if matches!(discovery.terminals.status, TerminalStatus::Degraded) {
         println!("  terminals: captured with warnings; use 'capsule terminal inspect' for details");
     }

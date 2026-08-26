@@ -725,10 +725,8 @@ fn build_window_info(
         window.bounds
     };
     let normalized = NormalizedRect::from_rect(geometry_bounds, display.work_area);
-    let detected_snap = snap_from_arrangement(
-        normalized,
-        crate::windows_snap::is_arranged(window.hwnd),
-    );
+    let detected_snap =
+        snap_from_arrangement(normalized, crate::windows_snap::is_arranged(window.hwnd));
     let state = if window.minimized {
         WindowState::Minimized
     } else if rect_matches(window.bounds, display.bounds, 4) {

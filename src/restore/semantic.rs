@@ -6,7 +6,7 @@ use crate::{
             TerminalSnapshot, TerminalStatus,
         },
     },
-    restore_bus,
+    restore_bus, terminal_context,
 };
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
@@ -14,17 +14,18 @@ use std::{collections::HashSet, time::Duration};
 #[cfg(windows)]
 use std::{
     os::windows::process::CommandExt,
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::Instant,
 };
 
 const VSCODE_ADAPTER_TIMEOUT: Duration = Duration::from_secs(25);
 const FIREFOX_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
+const CHROME_ADAPTER_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const TERMINAL_LAUNCH_SPACING: Duration = Duration::from_millis(120);
 #[cfg(windows)]
-const TERMINAL_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
+const TERMINAL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const TERMINAL_VERIFY_POLL: Duration = Duration::from_millis(250);
 #[cfg(windows)]
@@ -41,12 +42,10 @@ pub struct SemanticRestoreReport {
 pub fn restore(snapshot: &Value, dry_run: bool) -> SemanticRestoreReport {
     let mut report = SemanticRestoreReport::default();
 
-    // Docker can be restored without a GUI host, so converge it first. The GUI
-    // adapters are then handled one at a time to avoid a large browser + editor
-    // state restore hitting the machine simultaneously. External terminals are last.
     restore_docker(snapshot, dry_run, &mut report);
     restore_vscode(snapshot, dry_run, &mut report);
     restore_firefox(snapshot, dry_run, &mut report);
+    restore_chrome(snapshot, dry_run, &mut report);
     restore_terminals(snapshot, dry_run, &mut report);
 
     report
@@ -69,13 +68,27 @@ fn restore_firefox(snapshot: &Value, dry_run: bool, report: &mut SemanticRestore
         return;
     }
 
-    run_bus_adapter(
-        "firefox",
-        "Firefox",
-        saved,
-        FIREFOX_ADAPTER_TIMEOUT,
-        report,
-    );
+    run_bus_adapter("firefox", "Firefox", saved, FIREFOX_ADAPTER_TIMEOUT, report);
+}
+
+fn restore_chrome(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
+    let Some(saved) = snapshot
+        .pointer("/browsers/chrome")
+        .cloned()
+        .filter(|value| !value.is_null())
+    else {
+        return;
+    };
+
+    if dry_run {
+        report.warnings.push(
+            "Chrome semantic restore: would reconcile saved tabs, tab groups and browser windows"
+                .to_owned(),
+        );
+        return;
+    }
+
+    run_bus_adapter("chrome", "Chrome", saved, CHROME_ADAPTER_TIMEOUT, report);
 }
 
 fn restore_vscode(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
@@ -162,14 +175,14 @@ fn run_bus_adapter(
         )),
         Ok(None) => {
             let _ = restore_bus::cancel_request(adapter, &request.request_id);
+            let diagnostic_hint = match adapter {
+                "firefox" => "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore",
+                "chrome" => "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore",
+                _ => "",
+            };
             report.failures.push(format!(
-                "{label} semantic restore timed out after {} seconds waiting for its Context Capsule adapter{}",
+                "{label} semantic restore timed out after {} seconds waiting for its Context Capsule adapter{diagnostic_hint}",
                 timeout.as_secs(),
-                if adapter == "firefox" {
-                    "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore"
-                } else {
-                    ""
-                }
             ));
         }
         Err(error) => {
@@ -252,10 +265,9 @@ fn missing_docker_resources(saved: &DockerSnapshot, current: &DockerSnapshot) ->
             .compose_projects
             .iter()
             .filter(|saved_project| {
-                !current
-                    .compose_projects
-                    .iter()
-                    .any(|current_project| compose_project_satisfied(saved_project, current_project))
+                !current.compose_projects.iter().any(|current_project| {
+                    compose_project_satisfied(saved_project, current_project)
+                })
             })
             .cloned()
             .collect(),
@@ -290,20 +302,28 @@ fn compose_project_satisfied(saved: &ComposeProject, current: &ComposeProject) -
         .iter()
         .map(|container| container.name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    saved.containers.iter().all(|container| {
-        current_names.contains(&container.name.to_ascii_lowercase())
-    })
+    saved
+        .containers
+        .iter()
+        .all(|container| current_names.contains(&container.name.to_ascii_lowercase()))
 }
 
 fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreReport) {
     let Some(saved) = terminal_snapshot(snapshot) else {
         return;
     };
-    if !matches!(saved.status, TerminalStatus::Available | TerminalStatus::Degraded) {
+    if !matches!(
+        saved.status,
+        TerminalStatus::Available | TerminalStatus::Degraded
+    ) {
         return;
     }
 
-    let current = terminal::discover();
+    // Exact CWD enrichment is intentionally done once for initial matching.
+    // It may need a safe interactive PowerShell fallback when Windows Terminal
+    // exposes no exact $PWD through its non-interactive paths. Launch polling
+    // below never repeats that interactive probe.
+    let current = terminal_context::enrich_for_matching(&terminal::discover());
     let mut used = HashSet::new();
     let mut missing: Vec<(TerminalSession, RestartPlan)> = Vec::new();
     let mut cursor_warning_added = false;
@@ -336,7 +356,13 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
             continue;
         }
 
-        if let Some(plan) = saved_session.restart.clone() {
+        if let Some(plan) = safe_restart_plan(saved_session) {
+            if windows_terminal_powershell_has_untrusted_directory(saved_session) {
+                report.warnings.push(
+                    "Terminal restore: a saved Windows Terminal PowerShell session had only a Win32/process working-directory fallback. That value is not PowerShell $PWD, so Context Capsule ignored it instead of restoring a known-wrong directory. Configure Windows Terminal PowerShell CWD reporting (OSC 9;9) for exact directory restore."
+                        .to_owned(),
+                );
+            }
             missing.push((saved_session.clone(), plan));
         } else {
             report.warnings.push(format!(
@@ -410,6 +436,91 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
     }
 }
 
+fn windows_terminal_powershell(session: &TerminalSession) -> bool {
+    session.host == TerminalHost::WindowsTerminal
+        && matches!(session.environment, TerminalEnvironment::Windows)
+        && matches!(
+            session.shell,
+            crate::adapters::terminal::ShellKind::PowerShell
+                | crate::adapters::terminal::ShellKind::WindowsPowerShell
+        )
+}
+
+fn windows_terminal_powershell_has_untrusted_directory(session: &TerminalSession) -> bool {
+    windows_terminal_powershell(session)
+        && session.working_directory.is_some()
+        && !matches!(
+            session.working_directory_source,
+            crate::adapters::terminal::WorkingDirectorySource::WindowsTerminalState
+        )
+}
+
+fn trusted_saved_working_directory(session: &TerminalSession) -> Option<&str> {
+    if windows_terminal_powershell(session)
+        && !matches!(
+            session.working_directory_source,
+            crate::adapters::terminal::WorkingDirectorySource::WindowsTerminalState
+        )
+    {
+        return None;
+    }
+    session.working_directory.as_deref()
+}
+
+fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
+    if saved.host != TerminalHost::WindowsTerminal
+        || !matches!(saved.environment, TerminalEnvironment::Windows)
+    {
+        return saved.restart.clone();
+    }
+
+    // Explicitly target the most recently used existing Windows Terminal
+    // window. Without -w, Windows Terminal's windowingBehavior setting controls
+    // whether wt.exe creates a new window or a tab; its default is useNew.
+    let mut args = vec![
+        "-w".to_owned(),
+        "0".to_owned(),
+        "new-tab".to_owned(),
+    ];
+    if let Some(profile) = saved
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("-p".to_owned());
+        args.push(profile.to_owned());
+    }
+    if let Some(directory) = trusted_saved_working_directory(saved)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("-d".to_owned());
+        args.push(directory.to_owned());
+    }
+
+    if saved.profile.as_deref().is_none_or(|profile| profile.trim().is_empty()) {
+        let executable = saved
+            .shell_executable
+            .as_deref()
+            .or_else(|| saved.restart.as_ref().map(|plan| plan.executable.as_str()))?;
+        if !direct_shell_process(executable) {
+            return None;
+        }
+        args.push(executable.to_owned());
+    }
+
+    Some(RestartPlan {
+        executable: "wt.exe".to_owned(),
+        args,
+        working_directory: None,
+        note: Some(
+            "Reopens the captured Windows Terminal session through wt.exe in the most recently used existing Terminal window, so the restore cannot attach an interactive shell to the terminal running Context Capsule."
+                .to_owned(),
+        ),
+    })
+}
+
 fn terminal_snapshot(snapshot: &Value) -> Option<TerminalSnapshot> {
     let value = snapshot.get("terminals")?.clone();
     serde_json::from_value(value).ok()
@@ -436,13 +547,45 @@ fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) 
             return false;
         }
     }
-    match saved.working_directory.as_deref() {
+    match trusted_saved_working_directory(saved) {
         Some(directory) => current
             .working_directory
             .as_deref()
             .is_some_and(|value| paths_equivalent(value, directory)),
         None => true,
     }
+}
+
+/// Lightweight observation used only after Context Capsule has issued a
+/// restart command itself. For Windows Terminal, `wt.exe new-tab -d <saved>` is
+/// the authoritative CWD action, so verification only needs to observe a new
+/// session with the expected host/environment/shell/profile. Re-running the UI
+/// CWD probe here would type PowerShell commands repeatedly while polling.
+fn terminal_launch_observation_matches(
+    saved: &TerminalSession,
+    current: &TerminalSession,
+) -> bool {
+    if saved.host != TerminalHost::WindowsTerminal {
+        return terminal_session_matches(saved, current);
+    }
+    if current.host != TerminalHost::WindowsTerminal
+        || !environment_matches(&saved.environment, &current.environment)
+    {
+        return false;
+    }
+    if saved.shell != current.shell
+        && saved.shell.as_str() != "Unknown shell"
+        && current.shell.as_str() != "Unknown shell"
+    {
+        return false;
+    }
+    if let Some(profile) = saved.profile.as_deref() {
+        return current
+            .profile
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(profile));
+    }
+    true
 }
 
 #[cfg(any(windows, test))]
@@ -456,13 +599,13 @@ fn launched_session_matches(saved: &TerminalSession, current: &TerminalSession) 
     {
         return false;
     }
-    match (saved.working_directory.as_deref(), current.working_directory.as_deref()) {
+    match (
+        trusted_saved_working_directory(saved),
+        current.working_directory.as_deref(),
+    ) {
         (Some(saved_directory), Some(current_directory)) => {
             paths_equivalent(current_directory, saved_directory)
         }
-        // This is only used after Context Capsule itself created this exact
-        // child PID and set Command::current_dir from the restart plan. Windows
-        // process discovery may temporarily be unable to read that CWD back.
         (Some(_), None) | (None, _) => true,
     }
 }
@@ -479,13 +622,12 @@ fn terminal_hosts_compatible(saved: &TerminalHost, current: &TerminalHost) -> bo
 fn environment_matches(left: &TerminalEnvironment, right: &TerminalEnvironment) -> bool {
     match (left, right) {
         (TerminalEnvironment::Windows, TerminalEnvironment::Windows) => true,
-        (
-            TerminalEnvironment::Wsl { distro: left },
-            TerminalEnvironment::Wsl { distro: right },
-        ) => match (left.as_deref(), right.as_deref()) {
-            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
-            _ => true,
-        },
+        (TerminalEnvironment::Wsl { distro: left }, TerminalEnvironment::Wsl { distro: right }) => {
+            match (left.as_deref(), right.as_deref()) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                _ => true,
+            }
+        }
         _ => false,
     }
 }
@@ -506,7 +648,7 @@ fn matching_terminal_count(saved: &TerminalSession) -> usize {
     terminal::discover()
         .sessions
         .iter()
-        .filter(|current| terminal_session_matches(saved, current))
+        .filter(|current| terminal_launch_observation_matches(saved, current))
         .count()
 }
 
@@ -523,6 +665,9 @@ fn wait_for_terminal_launch(
         needs_fresh_console_window(saved, plan) && direct_shell_process(&plan.executable);
 
     loop {
+        // Poll only process/session inventory. Exact PowerShell CWD enrichment
+        // can type into live panes, so it must never be used as a 250 ms launch
+        // heartbeat.
         let current = terminal::discover();
         if direct_shell {
             if current.sessions.iter().any(|session| {
@@ -533,7 +678,7 @@ fn wait_for_terminal_launch(
         } else if current
             .sessions
             .iter()
-            .filter(|session| terminal_session_matches(saved, session))
+            .filter(|session| terminal_launch_observation_matches(saved, session))
             .count()
             > baseline
         {
@@ -549,13 +694,25 @@ fn wait_for_terminal_launch(
 
 #[cfg(windows)]
 fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<u32, String> {
+    if session.host == TerminalHost::WindowsTerminal && !windows_terminal_launcher(&plan.executable) {
+        return Err(format!(
+            "refusing unsafe Windows Terminal restart plan '{}'; Windows Terminal sessions must be launched through wt.exe",
+            plan.executable
+        ));
+    }
+
     let mut command = Command::new(&plan.executable);
     command.args(&plan.args);
     if let Some(directory) = plan.working_directory.as_deref() {
         command.current_dir(directory);
     }
 
-    if needs_fresh_console_window(session, plan) {
+    if windows_terminal_launcher(&plan.executable) {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else if needs_fresh_console_window(session, plan) {
         command.creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
     }
 
@@ -563,6 +720,15 @@ fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<
         .spawn()
         .map(|child| child.id())
         .map_err(|error| format!("failed to start '{}': {error}", plan.executable))
+}
+
+fn windows_terminal_launcher(executable: &str) -> bool {
+    let executable = executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    matches!(executable.as_str(), "wt.exe" | "wt")
 }
 
 #[cfg(windows)]
@@ -608,7 +774,6 @@ fn fresh_console_executable(executable: &str) -> bool {
     )
 }
 
-#[cfg(windows)]
 fn direct_shell_process(executable: &str) -> bool {
     let executable = executable
         .rsplit(['\\', '/'])
@@ -642,7 +807,7 @@ fn direct_shell_process(executable: &str) -> bool {
 mod tests {
     use super::*;
     use crate::adapters::{
-        docker::{ContainerResource, ComposeProject},
+        docker::{ComposeProject, ContainerResource},
         terminal::{ShellKind, WorkingDirectorySource},
     };
 
@@ -733,6 +898,123 @@ mod tests {
     }
 
     #[test]
+    fn windows_terminal_direct_powershell_plan_is_rewritten_through_wt() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        saved.profile = Some("Windows PowerShell".to_owned());
+        saved.working_directory = Some(r"D:\projects\capsule".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        saved.restart = Some(RestartPlan {
+            executable: r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
+            args: Vec::new(),
+            working_directory: Some(r"C:\Users\example".to_owned()),
+            note: None,
+        });
+
+        let plan = safe_restart_plan(&saved).expect("safe Windows Terminal plan");
+        assert_eq!(plan.executable, "wt.exe");
+        assert_eq!(
+            plan.args,
+            vec![
+                "-w".to_owned(),
+                "0".to_owned(),
+                "new-tab".to_owned(),
+                "-p".to_owned(),
+                "Windows PowerShell".to_owned(),
+                "-d".to_owned(),
+                r"D:\projects\capsule".to_owned(),
+            ]
+        );
+        assert!(plan.working_directory.is_none());
+    }
+
+    #[test]
+    fn windows_terminal_without_profile_uses_only_safe_shell_executable() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        saved.working_directory = Some(r"D:\projects\capsule".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        saved.startup_command = Some("powershell.exe -NoExit -Command dangerous-user-history".to_owned());
+        saved.restart = Some(RestartPlan {
+            executable: saved.shell_executable.clone().unwrap(),
+            args: Vec::new(),
+            working_directory: None,
+            note: None,
+        });
+
+        let plan = safe_restart_plan(&saved).expect("safe Windows Terminal plan");
+        assert_eq!(plan.executable, "wt.exe");
+        assert_eq!(
+            plan.args,
+            vec![
+                "-w".to_owned(),
+                "0".to_owned(),
+                "new-tab".to_owned(),
+                "-d".to_owned(),
+                r"D:\projects\capsule".to_owned(),
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
+            ]
+        );
+        assert!(!plan.args.iter().any(|arg| arg.contains("dangerous-user-history")));
+    }
+
+    #[test]
+    fn windows_terminal_powershell_ignores_untrusted_process_directory() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        saved.profile = Some("Windows PowerShell".to_owned());
+        saved.working_directory = Some(r"C:\Users\monji".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::Unknown;
+        saved.restart = Some(RestartPlan {
+            executable: saved.shell_executable.clone().unwrap(),
+            args: Vec::new(),
+            working_directory: Some(r"C:\Users\monji".to_owned()),
+            note: None,
+        });
+
+        let plan = safe_restart_plan(&saved).expect("safe Windows Terminal plan");
+        assert_eq!(
+            plan.args,
+            vec![
+                "-w".to_owned(),
+                "0".to_owned(),
+                "new-tab".to_owned(),
+                "-p".to_owned(),
+                "Windows PowerShell".to_owned(),
+            ]
+        );
+        assert!(windows_terminal_powershell_has_untrusted_directory(&saved));
+
+        let mut current = saved.clone();
+        current.working_directory = Some(r"D:\actual-project".to_owned());
+        current.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+        assert!(
+            terminal_session_matches(&saved, &current),
+            "an untrusted Win32 PowerShell directory must not make a live semantic session look different"
+        );
+    }
+
+    #[test]
+    fn windows_terminal_launch_observation_uses_identity_not_interactive_cwd() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::PowerShell);
+        saved.profile = Some("PowerShell".to_owned());
+        saved.working_directory = Some(r"D:\saved-project".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+
+        let mut current = saved.clone();
+        current.working_directory = Some(r"C:\process-fallback".to_owned());
+        current.working_directory_source = WorkingDirectorySource::Unknown;
+        assert!(terminal_launch_observation_matches(&saved, &current));
+
+        current.profile = Some("Command Prompt".to_owned());
+        assert!(!terminal_launch_observation_matches(&saved, &current));
+
+        current.profile = Some("PowerShell".to_owned());
+        current.host = TerminalHost::ConsoleHost;
+        assert!(!terminal_launch_observation_matches(&saved, &current));
+    }
+
+    #[test]
     fn console_host_and_unknown_are_compatible_for_standalone_shells() {
         let saved = terminal_session(TerminalHost::ConsoleHost, ShellKind::CommandPrompt);
         let current = terminal_session(TerminalHost::Unknown, ShellKind::CommandPrompt);
@@ -750,6 +1032,21 @@ mod tests {
         let mut wrong = current;
         wrong.working_directory = Some(r"C:\Other".to_owned());
         assert!(!launched_session_matches(&saved, &wrong));
+    }
+
+    #[test]
+    fn chrome_dry_run_is_reported_without_touching_firefox() {
+        let snapshot = json!({
+            "browsers": {
+                "chrome": { "browser": "chrome", "windows": [] },
+                "firefox": null
+            }
+        });
+        let mut report = SemanticRestoreReport::default();
+        restore_chrome(&snapshot, true, &mut report);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].starts_with("Chrome semantic restore:"));
+        assert!(report.failures.is_empty());
     }
 
     #[cfg(windows)]
@@ -775,5 +1072,6 @@ mod tests {
         };
         assert!(!needs_fresh_console_window(&session, &wt));
         assert!(!direct_shell_process(&wt.executable));
+        assert!(windows_terminal_launcher(&wt.executable));
     }
 }

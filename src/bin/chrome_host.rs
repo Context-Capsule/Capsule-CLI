@@ -1,11 +1,10 @@
-use context_capsule::browser;
+use context_capsule::chrome;
 use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 fn main() -> ExitCode {
@@ -16,12 +15,12 @@ fn main() -> ExitCode {
     }
 
     match arguments.as_slice() {
-        [option] if option == "--install" => match install_native_host() {
+        [option] if option == "--install" => match chrome::install_native_host() {
             Ok(path) => match doctor() {
                 Ok(report) => {
-                    println!("Installed and verified Firefox/Zen native messaging host.");
+                    println!("Installed and verified Chrome native messaging host.");
                     print_doctor_report(&report);
-                    println!("  extension: {}", browser::FIREFOX_EXTENSION_ID);
+                    println!("  extension: {}", chrome::CHROME_EXTENSION_ID);
                     println!("  manifest: {}", path.display());
                     ExitCode::SUCCESS
                 }
@@ -29,34 +28,34 @@ fn main() -> ExitCode {
                     "native host files were written, but validation failed: {error}"
                 )),
             },
-            Err(error) => fail(error),
+            Err(error) => fail(error.to_string()),
         },
         [option] if option == "--doctor" => match doctor() {
             Ok(report) => {
-                println!("Firefox/Zen native messaging host: healthy");
+                println!("Chrome native messaging host: healthy");
                 print_doctor_report(&report);
                 ExitCode::SUCCESS
             }
-            Err(error) => fail(format!("native host is not healthy: {error}")),
+            Err(error) => fail(format!("Chrome native host is not healthy: {error}")),
         },
-        [option] if option == "--uninstall" => match browser::uninstall_native_host() {
+        [option] if option == "--uninstall" => match chrome::uninstall_native_host() {
             Ok(path) => {
-                println!("Removed Firefox/Zen native messaging host registration.");
+                println!("Removed Chrome native messaging host registration.");
                 println!("  manifest: {}", path.display());
                 ExitCode::SUCCESS
             }
             Err(error) => fail(error.to_string()),
         },
-        [option] if option == "--status" => match browser::load_recent_firefox_state() {
+        [option] if option == "--status" => match chrome::load_recent_chrome_state() {
             Ok(Some(snapshot)) => {
-                println!("Firefox/Zen adapter: live");
+                println!("Chrome adapter: live");
                 println!("  windows: {}", snapshot.windows.len());
                 println!("  tabs: {}", snapshot.tab_count());
                 println!("  extension: {}", snapshot.extension_version);
                 ExitCode::SUCCESS
             }
             Ok(None) => {
-                println!("Firefox/Zen adapter: no recent state");
+                println!("Chrome adapter: no recent state");
                 ExitCode::SUCCESS
             }
             Err(error) => fail(error.to_string()),
@@ -66,145 +65,34 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("error: invalid native-host arguments: {arguments:?}\n");
+            eprintln!("error: invalid Chrome native-host arguments: {arguments:?}\n");
             print_usage();
             ExitCode::from(2)
         }
     }
 }
 
-fn install_native_host() -> Result<PathBuf, String> {
-    let manifest_path = browser::install_native_host().map_err(|error| error.to_string())?;
-
-    #[cfg(windows)]
-    pin_windows_native_host_executable(&manifest_path)?;
-
-    Ok(manifest_path)
-}
-
-#[cfg(windows)]
-fn pin_windows_native_host_executable(manifest_path: &Path) -> Result<PathBuf, String> {
-    let source = env::current_exe()
-        .map_err(|error| format!("cannot locate the native-host executable: {error}"))?;
-    if !source.is_file() {
-        return Err(format!(
-            "native-host executable does not exist at '{}'",
-            source.display()
-        ));
-    }
-
-    let local_app_data = env::var_os("LOCALAPPDATA")
-        .ok_or_else(|| "LOCALAPPDATA is not available".to_owned())?;
-    let install_dir = PathBuf::from(local_app_data)
-        .join("ContextCapsule")
-        .join("native-messaging")
-        .join("bin");
-    fs::create_dir_all(&install_dir).map_err(|error| {
-        format!(
-            "cannot create native-host install directory '{}': {error}",
-            install_dir.display()
-        )
-    })?;
-
-    // Never point Firefox at target/debug or target/release. Cargo clean and
-    // branch switching are normal development operations and must not make an
-    // already-installed browser extension lose its native host. Use a unique
-    // filename so reinstalling also works while an older host process is still
-    // open and therefore locked by Windows.
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let installed = install_dir.join(format!(
-        "capsule-firefox-host-{}-{nonce}.exe",
-        std::process::id()
-    ));
-    fs::copy(&source, &installed).map_err(|error| {
-        format!(
-            "cannot copy native host from '{}' to '{}': {error}",
-            source.display(),
-            installed.display()
-        )
-    })?;
-
-    let manifest_bytes = fs::read(manifest_path).map_err(|error| {
-        format!(
-            "cannot read native manifest '{}': {error}",
-            manifest_path.display()
-        )
-    })?;
-    let mut manifest: Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("native manifest is invalid JSON: {error}"))?;
-    let object = manifest
-        .as_object_mut()
-        .ok_or_else(|| "native manifest root is not an object".to_owned())?;
-    object.insert(
-        "path".to_owned(),
-        Value::String(installed.to_string_lossy().to_string()),
-    );
-    fs::write(
-        manifest_path,
-        serde_json::to_vec_pretty(&manifest)
-            .map_err(|error| format!("cannot encode native manifest: {error}"))?,
-    )
-    .map_err(|error| {
-        format!(
-            "cannot update native manifest '{}': {error}",
-            manifest_path.display()
-        )
-    })?;
-
-    cleanup_stale_windows_host_copies(&install_dir, &installed);
-    Ok(installed)
-}
-
-#[cfg(windows)]
-fn cleanup_stale_windows_host_copies(directory: &Path, keep: &Path) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if same_windows_path(&path, keep) {
-            continue;
-        }
-        let is_host_copy = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.starts_with("capsule-firefox-host-")
-                    && name.to_ascii_lowercase().ends_with(".exe")
-            });
-        if is_host_copy {
-            // An older host may still be serving an open Zen/Firefox instance,
-            // in which case Windows keeps the executable locked. Leaving that
-            // one file until a later reinstall is harmless.
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 fn run_protocol() -> ExitCode {
-    match browser::run_native_host() {
+    match chrome::run_native_host() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Context Capsule Firefox/Zen native host failed: {error}");
+            eprintln!("Context Capsule Chrome native host failed: {error}");
             ExitCode::from(1)
         }
     }
 }
 
+fn extension_origin() -> String {
+    format!("chrome-extension://{}/", chrome::CHROME_EXTENSION_ID)
+}
+
 fn is_native_messaging_invocation(arguments: &[String]) -> bool {
-    if arguments.len() != 2 || arguments[1] != browser::FIREFOX_EXTENSION_ID {
+    if arguments.is_empty() || arguments.len() > 2 || arguments[0] != extension_origin() {
         return false;
     }
-
-    Path::new(&arguments[0])
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.eq_ignore_ascii_case(&format!("{}.json", browser::NATIVE_HOST_NAME))
-        })
+    arguments
+        .get(1)
+        .is_none_or(|argument| argument.starts_with("--parent-window="))
 }
 
 #[derive(Debug)]
@@ -216,7 +104,7 @@ struct DoctorReport {
 }
 
 fn doctor() -> Result<DoctorReport, String> {
-    let manifest_path = browser::native_manifest_path().map_err(|error| error.to_string())?;
+    let manifest_path = chrome::native_manifest_path().map_err(|error| error.to_string())?;
     if !manifest_path.is_file() {
         return Err(format!(
             "manifest is missing at '{}'. Run --install first",
@@ -229,18 +117,16 @@ fn doctor() -> Result<DoctorReport, String> {
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("manifest is invalid JSON: {error}"))?;
 
-    require_string(&manifest, "name", browser::NATIVE_HOST_NAME)?;
+    require_string(&manifest, "name", chrome::NATIVE_HOST_NAME)?;
     require_string(&manifest, "type", "stdio")?;
 
     let allowed = manifest
-        .get("allowed_extensions")
+        .get("allowed_origins")
         .and_then(Value::as_array)
-        .ok_or_else(|| "manifest has no allowed_extensions array".to_owned())?;
-    if allowed.len() != 1 || allowed[0].as_str() != Some(browser::FIREFOX_EXTENSION_ID) {
-        return Err(format!(
-            "manifest must authorize only '{}'",
-            browser::FIREFOX_EXTENSION_ID
-        ));
+        .ok_or_else(|| "manifest has no allowed_origins array".to_owned())?;
+    let expected_origin = extension_origin();
+    if allowed.len() != 1 || allowed[0].as_str() != Some(expected_origin.as_str()) {
+        return Err(format!("manifest must authorize only '{expected_origin}'"));
     }
 
     let executable_path = manifest
@@ -269,7 +155,7 @@ fn doctor() -> Result<DoctorReport, String> {
         registered
     };
 
-    probe_native_host(&executable_path, &manifest_path)?;
+    probe_native_host(&executable_path)?;
 
     Ok(DoctorReport {
         manifest_path,
@@ -289,10 +175,13 @@ fn require_string(manifest: &Value, field: &str, expected: &str) -> Result<(), S
     }
 }
 
-fn probe_native_host(executable: &Path, manifest_path: &Path) -> Result<(), String> {
-    let mut child = Command::new(executable)
-        .arg(manifest_path)
-        .arg(browser::FIREFOX_EXTENSION_ID)
+fn probe_native_host(executable: &Path) -> Result<(), String> {
+    let mut command = Command::new(executable);
+    command.arg(extension_origin());
+    #[cfg(windows)]
+    command.arg("--parent-window=0");
+
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -305,7 +194,7 @@ fn probe_native_host(executable: &Path, manifest_path: &Path) -> Result<(), Stri
         })?;
 
     let request = serde_json::to_vec(&json!({
-        "protocol_version": browser::NATIVE_PROTOCOL_VERSION,
+        "protocol_version": chrome::NATIVE_PROTOCOL_VERSION,
         "request_id": "doctor",
         "type": "ping"
     }))
@@ -364,13 +253,13 @@ fn probe_native_host(executable: &Path, manifest_path: &Path) -> Result<(), Stri
 #[cfg(windows)]
 fn read_windows_registration() -> Result<PathBuf, String> {
     let key = format!(
-        r"HKCU\Software\Mozilla\NativeMessagingHosts\{}",
-        browser::NATIVE_HOST_NAME
+        r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{}",
+        chrome::NATIVE_HOST_NAME
     );
     let output = Command::new("reg.exe")
         .args(["query", &key, "/ve"])
         .output()
-        .map_err(|error| format!("cannot query native-host registry key: {error}"))?;
+        .map_err(|error| format!("cannot query Chrome native-host registry key: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "Windows registry key '{}' is missing. Run --install first. {}",
@@ -404,8 +293,8 @@ fn print_doctor_report(report: &DoctorReport) {
     println!("  executable: {}", report.executable_path.display());
     #[cfg(windows)]
     println!(
-        "  registry: HKCU\\Software\\Mozilla\\NativeMessagingHosts\\{} -> {}",
-        browser::NATIVE_HOST_NAME,
+        "  registry: HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\{} -> {}",
+        chrome::NATIVE_HOST_NAME,
         report.registry_manifest_path.display()
     );
     println!("  browser-style protocol ping: ok");
@@ -417,66 +306,60 @@ fn fail(message: String) -> ExitCode {
 }
 
 fn print_usage() {
-    println!("Context Capsule Firefox/Zen native host");
+    println!("Context Capsule Chrome native host");
     println!();
     println!("Usage:");
-    println!("  capsule-firefox-host --install");
-    println!("  capsule-firefox-host --doctor");
-    println!("  capsule-firefox-host --status");
-    println!("  capsule-firefox-host --uninstall");
+    println!("  capsule-chrome-host --install");
+    println!("  capsule-chrome-host --doctor");
+    println!("  capsule-chrome-host --status");
+    println!("  capsule-chrome-host --uninstall");
     println!();
+    println!("--install writes the Chrome native manifest, registers it, and validates it.");
     println!(
-        "--install copies the host to a durable per-user location, writes and registers the native manifest, and validates the result."
-    );
-    println!(
-        "--doctor verifies the manifest, executable, Windows registration, and the exact browser-style protocol launch."
-    );
-    println!();
-    println!(
-        "Firefox/Zen also launches this executable internally with the native manifest path and extension ID; those arguments enter protocol mode automatically."
+        "--doctor verifies the manifest, executable, Windows registration, and protocol launch."
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_native_messaging_invocation;
-    use context_capsule::browser;
+    use super::{extension_origin, is_native_messaging_invocation};
 
     #[test]
-    fn recognizes_firefox_browser_invocation_arguments() {
-        let arguments = vec![
-            format!("{}.json", browser::NATIVE_HOST_NAME),
-            browser::FIREFOX_EXTENSION_ID.to_owned(),
-        ];
-        assert!(is_native_messaging_invocation(&arguments));
+    fn recognizes_chrome_browser_invocation_arguments() {
+        assert!(is_native_messaging_invocation(&[extension_origin()]));
+        assert!(is_native_messaging_invocation(&[
+            extension_origin(),
+            "--parent-window=0".to_owned(),
+        ]));
     }
 
     #[test]
-    fn rejects_wrong_extension_or_manifest_name() {
-        let wrong_extension = vec![
-            format!("{}.json", browser::NATIVE_HOST_NAME),
-            "other@example.test".to_owned(),
-        ];
-        assert!(!is_native_messaging_invocation(&wrong_extension));
-
-        let wrong_manifest = vec![
-            "other-host.json".to_owned(),
-            browser::FIREFOX_EXTENSION_ID.to_owned(),
-        ];
-        assert!(!is_native_messaging_invocation(&wrong_manifest));
+    fn rejects_wrong_origin_or_extra_arguments() {
+        assert!(!is_native_messaging_invocation(&[
+            "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned()
+        ]));
+        assert!(!is_native_messaging_invocation(&[
+            extension_origin(),
+            "--unexpected".to_owned(),
+        ]));
+        assert!(!is_native_messaging_invocation(&[
+            extension_origin(),
+            "--parent-window=0".to_owned(),
+            "extra".to_owned(),
+        ]));
     }
 
     #[cfg(windows)]
     #[test]
     fn parses_windows_registry_default_value() {
         let output = r#"
-HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts\com.contextcapsule.host
-    (Default)    REG_SZ    C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.host.json
+HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\com.contextcapsule.chrome
+    (Default)    REG_SZ    C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.chrome.json
 "#;
         assert_eq!(
             super::parse_registry_default(output).as_deref(),
             Some(
-                r"C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.host.json"
+                r"C:\Users\test\AppData\Local\ContextCapsule\native-messaging\com.contextcapsule.chrome.json"
             )
         );
     }

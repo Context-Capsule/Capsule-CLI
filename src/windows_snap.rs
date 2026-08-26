@@ -4,7 +4,7 @@ use std::{
     mem::{size_of, transmute},
     sync::OnceLock,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type Hwnd = *mut c_void;
@@ -34,6 +34,8 @@ const HTTOP: i32 = 12;
 const HTBOTTOM: i32 = 15;
 
 const FOREGROUND_SETTLE: Duration = Duration::from_millis(45);
+const FOREGROUND_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(1_400);
+const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SNAP_SETTLE: Duration = Duration::from_millis(220);
 const DIVIDER_HOVER_SETTLE: Duration = Duration::from_millis(90);
 const DIVIDER_STEP_SETTLE: Duration = Duration::from_millis(12);
@@ -157,6 +159,8 @@ impl Drop for CursorRestoreGuard {
 unsafe extern "system" {
     fn GetForegroundWindow() -> Hwnd;
     fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
+    fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
+    fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: Bool) -> Bool;
     fn SendInput(count: u32, inputs: *const NativeInput, size: i32) -> u32;
     fn SetCursorPos(x: i32, y: i32) -> Bool;
     fn GetCursorPos(point: *mut Point) -> Bool;
@@ -176,6 +180,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> Handle;
     fn GetProcAddress(module: Handle, procedure_name: *const u8) -> *mut c_void;
+    fn GetCurrentThreadId() -> u32;
 }
 
 #[link(name = "dwmapi")]
@@ -216,15 +221,9 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
         );
     }
 
-    if unsafe { GetForegroundWindow() } != hwnd {
-        if unsafe { SetForegroundWindow(hwnd) } == 0 {
-            return Err("Windows foreground-lock policy refused focus for native snap".to_owned());
-        }
-        thread::sleep(FOREGROUND_SETTLE);
-    }
-    if unsafe { GetForegroundWindow() } != hwnd {
+    if !focus_window_without_geometry_change(hwnd) {
         return Err(
-            "the intended window did not become foreground; native snap shortcut was not sent"
+            "Windows foreground-lock policy prevented focusing the intended window for native snap"
                 .to_owned(),
         );
     }
@@ -238,6 +237,80 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
     send_chord(modifiers, arrow)?;
     thread::sleep(SNAP_SETTLE);
     Ok(is_arranged(hwnd).unwrap_or(false))
+}
+
+fn focus_window_without_geometry_change(hwnd: Hwnd) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    if unsafe { GetForegroundWindow() } == hwnd {
+        return true;
+    }
+
+    unsafe {
+        SetForegroundWindow(hwnd);
+    }
+    if wait_until_foreground(hwnd, Duration::from_millis(250)) {
+        return true;
+    }
+
+    // Windows can reject SetForegroundWindow even for a visible interactive
+    // window. Temporarily join the caller's input queue with the foreground and
+    // target window threads, retry focus, then detach immediately. This changes
+    // only keyboard focus/z-order; it does not restore, resize or reposition the
+    // window, so a saved Snap layout cannot be destroyed by focus acquisition.
+    let current_thread = unsafe { GetCurrentThreadId() };
+    let foreground = unsafe { GetForegroundWindow() };
+    let foreground_thread = if foreground.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) }
+    };
+    let target_thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+
+    let attach_foreground = foreground_thread != 0 && foreground_thread != current_thread;
+    let attach_target = target_thread != 0
+        && target_thread != current_thread
+        && target_thread != foreground_thread;
+
+    if attach_foreground {
+        unsafe {
+            AttachThreadInput(current_thread, foreground_thread, 1);
+        }
+    }
+    if attach_target {
+        unsafe {
+            AttachThreadInput(current_thread, target_thread, 1);
+        }
+    }
+
+    unsafe {
+        SetForegroundWindow(hwnd);
+    }
+
+    if attach_target {
+        unsafe {
+            AttachThreadInput(current_thread, target_thread, 0);
+        }
+    }
+    if attach_foreground {
+        unsafe {
+            AttachThreadInput(current_thread, foreground_thread, 0);
+        }
+    }
+
+    wait_until_foreground(hwnd, FOREGROUND_ACQUIRE_TIMEOUT)
+}
+
+fn wait_until_foreground(hwnd: Hwnd, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if unsafe { GetForegroundWindow() } == hwnd {
+            return true;
+        }
+        thread::sleep(FOREGROUND_POLL_INTERVAL);
+    }
+    false
 }
 
 pub(crate) fn restore_resized_pair(
@@ -293,8 +366,7 @@ pub(crate) fn restore_resized_pair(
                 }
 
                 if is_arranged(primary) == Some(true) && is_arranged(secondary) == Some(true) {
-                    if let Err(error) =
-                        drag_saved_edge(secondary, !first_side, orientation, target)
+                    if let Err(error) = drag_saved_edge(secondary, !first_side, orientation, target)
                     {
                         errors.push(format!(
                             "{} edge reached the target but the partner edge could not be resized: {error}",
@@ -342,11 +414,7 @@ pub(crate) fn restore_resized_pair(
     ))
 }
 
-fn establish_pair(
-    first: Hwnd,
-    second: Hwnd,
-    orientation: SplitOrientation,
-) -> Result<(), String> {
+fn establish_pair(first: Hwnd, second: Hwnd, orientation: SplitOrientation) -> Result<(), String> {
     let (first_direction, second_direction) = match orientation {
         SplitOrientation::SideBySide => (SnapDirection::LeftHalf, SnapDirection::RightHalf),
         SplitOrientation::Stacked => (SnapDirection::TopHalf, SnapDirection::BottomHalf),
@@ -380,8 +448,8 @@ fn drag_saved_edge(
     orientation: SplitOrientation,
     target: i32,
 ) -> Result<(), String> {
-    let rect = frame_bounds(hwnd)
-        .ok_or_else(|| "could not read the arranged window frame".to_owned())?;
+    let rect =
+        frame_bounds(hwnd).ok_or_else(|| "could not read the arranged window frame".to_owned())?;
     let expected_hit = resize_hit_code(first_side, orientation);
     let start = find_resize_handle(hwnd, rect, first_side, orientation).ok_or_else(|| {
         format!(
@@ -472,11 +540,7 @@ fn non_client_hit_test(hwnd: Hwnd, point: (i32, i32)) -> Option<i32> {
 }
 
 fn screen_point_lparam(x: i32, y: i32) -> Option<isize> {
-    if x < i16::MIN as i32
-        || x > i16::MAX as i32
-        || y < i16::MIN as i32
-        || y > i16::MAX as i32
-    {
+    if x < i16::MIN as i32 || x > i16::MAX as i32 || y < i16::MIN as i32 || y > i16::MAX as i32 {
         return None;
     }
     let low = x as i16 as u16 as u32;
@@ -490,11 +554,8 @@ fn drag_resize_handle(
     start: (i32, i32),
     end: (i32, i32),
 ) -> Result<(), String> {
-    if unsafe { GetForegroundWindow() } != hwnd {
-        unsafe {
-            SetForegroundWindow(hwnd);
-        }
-        thread::sleep(FOREGROUND_SETTLE);
+    if !focus_window_without_geometry_change(hwnd) {
+        return Err("Windows foreground-lock policy refused focus for snap resize drag".to_owned());
     }
 
     if non_client_hit_test(hwnd, start) != Some(expected_hit) {
@@ -536,7 +597,9 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
     };
 
     if unsafe { SetCursorPos(start.0, start.1) } == 0 {
-        return Err("SetCursorPos failed while targeting the Windows snap resize handle".to_owned());
+        return Err(
+            "SetCursorPos failed while targeting the Windows snap resize handle".to_owned(),
+        );
     }
     thread::sleep(DIVIDER_HOVER_SETTLE);
 
@@ -546,10 +609,8 @@ fn drag_divider(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
 
     let steps = 18_i32;
     for step in 1..=steps {
-        let x = start.0 as i64
-            + ((end.0 as i64 - start.0 as i64) * step as i64) / steps as i64;
-        let y = start.1 as i64
-            + ((end.1 as i64 - start.1 as i64) * step as i64) / steps as i64;
+        let x = start.0 as i64 + ((end.0 as i64 - start.0 as i64) * step as i64) / steps as i64;
+        let y = start.1 as i64 + ((end.1 as i64 - start.1 as i64) * step as i64) / steps as i64;
         if unsafe { SetCursorPos(x as i32, y as i32) } == 0 {
             let _ = send_mouse_button(false);
             return Err("SetCursorPos failed during the Windows snap resize drag".to_owned());
@@ -710,13 +771,7 @@ fn send_chord(modifiers: &[u16], key: u16) -> Result<(), String> {
     }
 
     let expected = inputs.len() as u32;
-    let sent = unsafe {
-        SendInput(
-            expected,
-            inputs.as_ptr(),
-            size_of::<NativeInput>() as i32,
-        )
-    };
+    let sent = unsafe { SendInput(expected, inputs.as_ptr(), size_of::<NativeInput>() as i32) };
     if sent == expected {
         return Ok(());
     }
@@ -745,7 +800,11 @@ mod tests {
 
     #[test]
     fn input_layout_matches_win32_abi() {
-        let expected = if cfg!(target_pointer_width = "64") { 40 } else { 28 };
+        let expected = if cfg!(target_pointer_width = "64") {
+            40
+        } else {
+            28
+        };
         assert_eq!(size_of::<NativeInput>(), expected);
     }
 
@@ -775,14 +834,8 @@ mod tests {
 
     #[test]
     fn resize_hit_codes_follow_divider_facing_edges() {
-        assert_eq!(
-            resize_hit_code(true, SplitOrientation::SideBySide),
-            HTRIGHT
-        );
-        assert_eq!(
-            resize_hit_code(false, SplitOrientation::SideBySide),
-            HTLEFT
-        );
+        assert_eq!(resize_hit_code(true, SplitOrientation::SideBySide), HTRIGHT);
+        assert_eq!(resize_hit_code(false, SplitOrientation::SideBySide), HTLEFT);
         assert_eq!(resize_hit_code(true, SplitOrientation::Stacked), HTBOTTOM);
         assert_eq!(resize_hit_code(false, SplitOrientation::Stacked), HTTOP);
     }
