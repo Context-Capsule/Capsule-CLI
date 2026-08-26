@@ -94,9 +94,10 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 report.failures.extend(zen_bootstrap.failures.clone());
             }
 
-            // Semantic adapters own host/window creation first: keep Zen and
-            // the VS Code Dev Host out of the prerequisite desktop pass so the
-            // generic launcher cannot race their richer restore logic.
+            // Semantic adapters own host/window creation first: keep Windows
+            // Terminal, Zen and the VS Code Dev Host out of the prerequisite
+            // desktop pass so generic launching cannot race their richer restore
+            // logic or create an extra default terminal tab.
             let prerequisite = desktop_without_semantic_owned_hosts(
                 &desktop,
                 defer_windows_terminal,
@@ -104,13 +105,16 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
                 zen_semantic_owner,
             );
 
-            // After semantic restore has recreated browser/editor topology, the
-            // final Win32 pass owns only physical desktop convergence. Include
-            // Zen here so newly recreated windows get their saved monitor,
-            // rectangle and native Windows snap state without touching tabs.
+            // After semantic restore has recreated browser/editor/terminal
+            // topology, the final Win32 pass owns physical desktop convergence.
+            // Windows Terminal must be included here: semantic terminal restore
+            // creates the right tabs and CWDs, while this pass restores the saved
+            // monitor, rectangle, maximized state and genuine Windows snap state.
+            // This mirrors the original staged-restore contract: defer Terminal
+            // startup, never defer its final placement.
             let mut final_target = desktop_without_semantic_owned_hosts(
                 &desktop,
-                defer_windows_terminal,
+                false,
                 saved_devhost && !has_vscode_semantic,
                 false,
             );
@@ -639,6 +643,29 @@ mod tests {
         assert!(!should_defer_windows_terminal(&json!({
             "terminals": { "sessions": [{ "host": "windows-terminal", "restart": null }] }
         })));
+    }
+
+    #[test]
+    fn windows_terminal_is_deferred_for_startup_but_included_for_final_placement() {
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: Vec::new(),
+            applications: vec![
+                application(
+                    "Windows Terminal",
+                    Some(r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"),
+                ),
+                application("Notepad", Some(r"C:\Windows\System32\notepad.exe")),
+            ],
+        };
+
+        let prerequisite = desktop_without_semantic_owned_hosts(&desktop, true, false, false);
+        assert!(!prerequisite.applications.iter().any(is_windows_terminal_application));
+        assert!(prerequisite.applications.iter().any(|app| app.name == "Notepad"));
+
+        let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
+        assert!(final_placement.applications.iter().any(is_windows_terminal_application));
+        assert!(final_placement.applications.iter().any(|app| app.name == "Notepad"));
     }
 
     #[test]
