@@ -34,6 +34,9 @@ pub(crate) mod windows_snap;
 #[path = "windows_snap_coord.rs"]
 pub(crate) mod windows_snap_coord;
 #[cfg(windows)]
+#[path = "windows_snap_drag.rs"]
+pub(crate) mod windows_snap_drag;
+#[cfg(windows)]
 #[path = "windows_snap.rs"]
 pub(crate) mod windows_snap_core;
 #[cfg(windows)]
