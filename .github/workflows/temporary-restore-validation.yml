@@ -1,0 +1,61 @@
+name: Temporary Restore Validation
+
+on:
+  push:
+    branches:
+      - feature/chrome-browser-adapter-20260822
+    paths:
+      - '.github/workflows/temporary-restore-validation.yml'
+      - 'src/restore/**'
+      - 'src/terminal_context.rs'
+      - 'src/adapters/terminal.rs'
+      - 'src/windows_snap*.rs'
+
+permissions:
+  contents: read
+
+jobs:
+  validate-windows-hosted:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --all-targets
+      - name: Full test suite
+        run: cargo test
+      - name: Restore regression tests
+        run: cargo test restore -- --nocapture
+      - name: Terminal regression tests
+        run: cargo test terminal_context::tests -- --nocapture
+      - name: Build all binaries
+        run: cargo build --bins
+      - name: Guard terminal launch polling against interactive enrichment
+        shell: pwsh
+        run: |
+          $source = Get-Content 'src/restore/semantic.rs' -Raw
+          $start = $source.IndexOf('fn wait_for_terminal_launch(')
+          $end = $source.IndexOf('#[cfg(windows)]', $start + 1)
+          if ($start -lt 0 -or $end -lt 0) { throw 'could not isolate wait_for_terminal_launch' }
+          $body = $source.Substring($start, $end - $start)
+          if ($body -match 'enrich_for_matching') {
+            throw 'terminal launch polling regressed to interactive CWD enrichment'
+          }
+          if ($body -notmatch 'terminal::discover\(\)') {
+            throw 'terminal launch polling is not using read-only terminal discovery'
+          }
+      - name: Guard final restore against satisfied-layout skipping
+        shell: pwsh
+        run: |
+          $mod = Get-Content 'src/restore/mod.rs' -Raw
+          if ($mod -notmatch 'restore_desktop_forced\(desktop, false\)') {
+            throw 'final placement is no longer forced'
+          }
+          $windows = Get-Content 'src/restore/windows.rs' -Raw
+          if ($windows -notmatch 'layout changed after foreground restoration') {
+            throw 'post-focus live layout verification is missing'
+          }
