@@ -11,8 +11,7 @@ const GIT_REPOSITORIES_SCHEMA_VERSION: u32 = 1;
 const MAX_REPOSITORIES: usize = 128;
 
 /// Captures branch-only Git context from VS Code, the serialized terminal
-/// snapshot, a fresh read-only live-terminal pass, and the CLI invocation
-/// directory.
+/// snapshot, a fresh live-terminal pass, and the CLI invocation directory.
 ///
 /// The live-terminal pass matters because the durable terminal snapshot is
 /// intentionally filtered for restore safety (for example the shell hosting
@@ -30,10 +29,21 @@ pub fn restore_from_snapshot(snapshot: &Value, dry_run: bool) -> GitRestoreRepor
 }
 
 fn augment_from_live_terminals(snapshot: &mut Value) {
+    // Only real workspace snapshots that actually requested terminal capture
+    // should trigger another live terminal discovery. This keeps generic
+    // persistence callers/tests and old/unsupported terminal snapshots free of
+    // environment-dependent capture side effects.
+    let terminal_status = snapshot
+        .pointer("/terminals/status")
+        .and_then(Value::as_str);
+    if !matches!(terminal_status, Some("available" | "degraded")) {
+        return;
+    }
+
     // Re-discover at the persistence boundary so Git capture is not limited by
     // the terminal sessions that were intentionally kept/removed for restore.
-    // enrich_for_matching is read-only and gives Windows Terminal PowerShell
-    // the same exact-CWD treatment already used by the terminal restore engine.
+    // enrich_for_matching gives Windows Terminal PowerShell the same exact-CWD
+    // treatment already used by the terminal restore engine.
     let discovered = crate::adapters::terminal::discover();
     let enriched = crate::terminal_context::enrich_for_matching(&discovered);
     let Ok(terminals) = serde_json::to_value(enriched) else {
@@ -45,8 +55,8 @@ fn augment_from_live_terminals(snapshot: &mut Value) {
 fn augment_from_terminal_value(snapshot: &mut Value, terminals: Value) {
     // Feed the live terminal inventory through the already-tested branch
     // probing implementation. This executes Git as a separate process using
-    // `git -C <terminal-cwd> ...`; it never types Git commands into a user's
-    // terminal and never mutates the terminal session during capture.
+    // `git -C <terminal-cwd> ...`; it never mutates repository state during
+    // capture.
     let mut terminal_only_snapshot = json!({
         "terminals": terminals,
         "editors": { "vscode": null }
@@ -162,7 +172,12 @@ fn normalized_repository_path(path: &str, environment: &GitRepositoryEnvironment
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, process::Command, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        path::PathBuf,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn git_available() -> bool {
         Command::new("git")
@@ -278,13 +293,30 @@ mod tests {
         let repositories = snapshot["git_repositories"]["repositories"]
             .as_array()
             .expect("repositories");
+        let expected_root = repo.to_string_lossy();
         assert!(repositories.iter().any(|repository| {
             repository["branch"] == "terminal-dev"
                 && repository["repository_root"]
                     .as_str()
-                    .is_some_and(|value| value == repo.to_string_lossy())
+                    .is_some_and(|value| value == expected_root.as_ref())
         }));
         let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn live_terminal_pass_is_gated_to_real_terminal_snapshots() {
+        let mut no_terminals = json!({
+            "git": { "status": "not-repository" }
+        });
+        augment_from_live_terminals(&mut no_terminals);
+        assert!(no_terminals.get("git_repositories").is_none());
+
+        let mut unsupported = json!({
+            "git": { "status": "not-repository" },
+            "terminals": { "status": "unsupported", "sessions": [] }
+        });
+        augment_from_live_terminals(&mut unsupported);
+        assert!(unsupported.get("git_repositories").is_none());
     }
 
     #[test]
