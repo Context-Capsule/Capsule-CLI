@@ -104,6 +104,9 @@ where
         .iter()
         .filter(|session| is_windows_terminal_powershell(session))
     {
+        // Process-tree evidence is authoritative for this UI safety gate. If an
+        // external child command is running under the interactive shell, typing
+        // into that terminal could queue a command behind the running process.
         if session.foreground_command.is_some() {
             logging::info(
                 TERMINAL_LOG_COMPONENT,
@@ -115,12 +118,19 @@ where
             return false;
         }
 
+        // The process-remoting management connection can expose several runspaces
+        // in one PowerShell host. A Busy value from the first enumerated runspace
+        // is therefore advisory only: it may describe the remoting/management
+        // runspace rather than the visible Windows Terminal prompt. The user's
+        // logs demonstrated exactly that false-positive. We still record the
+        // signal for diagnostics, but only independent process-tree evidence can
+        // suppress the UI fallback.
         match idle_probe(session) {
             Some(true) => {
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
                     format!(
-                        "{stage}: PowerShell UI CWD safety gate pid={:?}: runspace explicitly Available",
+                        "{stage}: PowerShell UI CWD safety gate pid={:?}: runspace reports Available; process inventory has no foreground child command",
                         session.pid,
                     ),
                 );
@@ -129,17 +139,16 @@ where
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
                     format!(
-                        "{stage}: PowerShell UI CWD fallback skipped because pid={:?} runspace is explicitly Busy",
+                        "{stage}: PowerShell UI CWD safety gate pid={:?}: runspace reports Busy, but that remoting signal is advisory; continuing because process inventory has no foreground child command",
                         session.pid,
                     ),
                 );
-                return false;
             }
             None => {
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
                     format!(
-                        "{stage}: PowerShell UI CWD safety gate pid={:?}: idle API unavailable; continuing because process inventory shows no foreground child command",
+                        "{stage}: PowerShell UI CWD safety gate pid={:?}: idle API unavailable; continuing because process inventory has no foreground child command",
                         session.pid,
                     ),
                 );
@@ -327,23 +336,23 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_idle_api_no_longer_suppresses_ui_fallback() {
+    fn unavailable_idle_api_does_not_suppress_ui_fallback() {
         let snapshot = snapshot_with(fake_windows_terminal_powershell());
         assert!(ui_probe_is_safe_with(&snapshot, "test", |_| None));
     }
 
     #[test]
-    fn explicitly_busy_runspace_still_blocks_ui_fallback() {
+    fn advisory_busy_runspace_does_not_suppress_ui_fallback_without_process_activity() {
         let snapshot = snapshot_with(fake_windows_terminal_powershell());
-        assert!(!ui_probe_is_safe_with(&snapshot, "test", |_| Some(false)));
+        assert!(ui_probe_is_safe_with(&snapshot, "test", |_| Some(false)));
     }
 
     #[test]
-    fn foreground_child_command_still_blocks_ui_fallback() {
+    fn foreground_child_command_still_blocks_ui_fallback_even_if_runspace_looks_available() {
         let mut session = fake_windows_terminal_powershell();
         session.foreground_command = Some("node server.js".to_owned());
         let snapshot = snapshot_with(session);
-        assert!(!ui_probe_is_safe_with(&snapshot, "test", |_| None));
+        assert!(!ui_probe_is_safe_with(&snapshot, "test", |_| Some(true)));
     }
 
     #[test]
