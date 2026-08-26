@@ -319,6 +319,10 @@ fn restore_terminals(snapshot: &Value, dry_run: bool, report: &mut SemanticResto
         return;
     }
 
+    // Exact CWD enrichment is intentionally done once for initial matching.
+    // It may need a safe interactive PowerShell fallback when Windows Terminal
+    // exposes no exact $PWD through its non-interactive paths. Launch polling
+    // below never repeats that interactive probe.
     let current = terminal_context::enrich_for_matching(&terminal::discover());
     let mut used = HashSet::new();
     let mut missing: Vec<(TerminalSession, RestartPlan)> = Vec::new();
@@ -552,6 +556,38 @@ fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) 
     }
 }
 
+/// Lightweight observation used only after Context Capsule has issued a
+/// restart command itself. For Windows Terminal, `wt.exe new-tab -d <saved>` is
+/// the authoritative CWD action, so verification only needs to observe a new
+/// session with the expected host/environment/shell/profile. Re-running the UI
+/// CWD probe here would type PowerShell commands repeatedly while polling.
+fn terminal_launch_observation_matches(
+    saved: &TerminalSession,
+    current: &TerminalSession,
+) -> bool {
+    if saved.host != TerminalHost::WindowsTerminal {
+        return terminal_session_matches(saved, current);
+    }
+    if current.host != TerminalHost::WindowsTerminal
+        || !environment_matches(&saved.environment, &current.environment)
+    {
+        return false;
+    }
+    if saved.shell != current.shell
+        && saved.shell.as_str() != "Unknown shell"
+        && current.shell.as_str() != "Unknown shell"
+    {
+        return false;
+    }
+    if let Some(profile) = saved.profile.as_deref() {
+        return current
+            .profile
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(profile));
+    }
+    true
+}
+
 #[cfg(any(windows, test))]
 fn launched_session_matches(saved: &TerminalSession, current: &TerminalSession) -> bool {
     if !environment_matches(&saved.environment, &current.environment) {
@@ -609,10 +645,10 @@ fn paths_equivalent(left: &str, right: &str) -> bool {
 
 #[cfg(windows)]
 fn matching_terminal_count(saved: &TerminalSession) -> usize {
-    terminal_context::enrich_for_matching(&terminal::discover())
+    terminal::discover()
         .sessions
         .iter()
-        .filter(|current| terminal_session_matches(saved, current))
+        .filter(|current| terminal_launch_observation_matches(saved, current))
         .count()
 }
 
@@ -629,7 +665,10 @@ fn wait_for_terminal_launch(
         needs_fresh_console_window(saved, plan) && direct_shell_process(&plan.executable);
 
     loop {
-        let current = terminal_context::enrich_for_matching(&terminal::discover());
+        // Poll only process/session inventory. Exact PowerShell CWD enrichment
+        // can type into live panes, so it must never be used as a 250 ms launch
+        // heartbeat.
+        let current = terminal::discover();
         if direct_shell {
             if current.sessions.iter().any(|session| {
                 session.pid == Some(spawned_pid) && launched_session_matches(saved, session)
@@ -639,7 +678,7 @@ fn wait_for_terminal_launch(
         } else if current
             .sessions
             .iter()
-            .filter(|session| terminal_session_matches(saved, session))
+            .filter(|session| terminal_launch_observation_matches(saved, session))
             .count()
             > baseline
         {
@@ -953,6 +992,26 @@ mod tests {
             terminal_session_matches(&saved, &current),
             "an untrusted Win32 PowerShell directory must not make a live semantic session look different"
         );
+    }
+
+    #[test]
+    fn windows_terminal_launch_observation_uses_identity_not_interactive_cwd() {
+        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::PowerShell);
+        saved.profile = Some("PowerShell".to_owned());
+        saved.working_directory = Some(r"D:\saved-project".to_owned());
+        saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+
+        let mut current = saved.clone();
+        current.working_directory = Some(r"C:\process-fallback".to_owned());
+        current.working_directory_source = WorkingDirectorySource::Unknown;
+        assert!(terminal_launch_observation_matches(&saved, &current));
+
+        current.profile = Some("Command Prompt".to_owned());
+        assert!(!terminal_launch_observation_matches(&saved, &current));
+
+        current.profile = Some("PowerShell".to_owned());
+        current.host = TerminalHost::ConsoleHost;
+        assert!(!terminal_launch_observation_matches(&saved, &current));
     }
 
     #[test]
