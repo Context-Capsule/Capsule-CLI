@@ -837,9 +837,14 @@ mod tests {
     #[test]
     fn probe_source_contains_no_geometry_mutation_api() {
         let source = include_str!("powershell_ui_probe_v4.rs");
-        assert!(!source.contains("ShowWindow("));
-        assert!(!source.contains("SW_RESTORE"));
-        assert!(!source.contains("SetWindowPos("));
-        assert!(!source.contains("MoveWindow("));
+        let forbidden = [
+            ["Show", "Window("].concat(),
+            ["SW_", "RESTORE"].concat(),
+            ["SetWindow", "Pos("].concat(),
+            ["Move", "Window("].concat(),
+        ];
+        for needle in forbidden {
+            assert!(!source.contains(&needle), "geometry mutation API leaked into probe: {needle}");
+        }
     }
 }
