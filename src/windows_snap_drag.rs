@@ -128,7 +128,7 @@ impl InputQueueAttachment {
 
         let target_thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
         if target_thread == 0 {
-            return Err("could not resolve Zen window thread for snap drag".to_owned());
+            return Err("could not resolve target window thread for snap drag".to_owned());
         }
         threads.push((target_thread, true));
 
@@ -146,7 +146,7 @@ impl InputQueueAttachment {
                         AttachThreadInput(current_thread, *attached, 0);
                     }
                 }
-                return Err("AttachThreadInput failed for Zen snap drag".to_owned());
+                return Err("AttachThreadInput failed for native snap drag".to_owned());
             }
         }
 
@@ -209,15 +209,15 @@ pub(crate) fn snap_half_by_drag(hwnd: Hwnd, direction: SnapDirection) -> Result<
     let _attachment = InputQueueAttachment::for_window(hwnd)?;
     focus_without_geometry_change(hwnd)?;
 
-    let rect = window_rect(hwnd).ok_or_else(|| "could not read Zen window bounds".to_owned())?;
+    let rect = window_rect(hwnd).ok_or_else(|| "could not read target window bounds".to_owned())?;
     let caption = find_caption_point(hwnd, rect).ok_or_else(|| {
-        "Zen exposed no safe HTCAPTION point; refusing to drag tabs or browser content"
+        "target window exposed no safe HTCAPTION point; refusing to drag application content"
             .to_owned()
     })?;
-    let work = monitor_work_area(hwnd)
-        .ok_or_else(|| "could not read the monitor work area for Zen".to_owned())?;
+    let monitor = monitor_bounds(hwnd)
+        .ok_or_else(|| "could not read physical monitor bounds for native snap".to_owned())?;
 
-    let target = drag_target(work, caption, direction);
+    let target = drag_target(monitor, caption, direction);
     drag_caption(caption, target)?;
     thread::sleep(SNAP_SETTLE);
     Ok(windows_snap_coord::is_arranged(hwnd) == Some(true))
@@ -237,7 +237,7 @@ fn focus_without_geometry_change(hwnd: Hwnd) -> Result<(), String> {
         }
         thread::sleep(FOCUS_POLL);
     }
-    Err("Windows foreground-lock policy prevented focusing Zen for snap drag".to_owned())
+    Err("Windows foreground-lock policy prevented focusing target window for snap drag".to_owned())
 }
 
 fn window_rect(hwnd: Hwnd) -> Option<NativeRect> {
@@ -248,14 +248,14 @@ fn window_rect(hwnd: Hwnd) -> Option<NativeRect> {
         .then_some(rect)
 }
 
-fn monitor_work_area(hwnd: Hwnd) -> Option<NativeRect> {
+fn monitor_bounds(hwnd: Hwnd) -> Option<NativeRect> {
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     if monitor.is_null() {
         return None;
     }
     let mut info: MonitorInfo = unsafe { zeroed() };
     info.size = size_of::<MonitorInfo>() as u32;
-    (unsafe { GetMonitorInfoW(monitor, &mut info) } != 0).then_some(info.work)
+    (unsafe { GetMonitorInfoW(monitor, &mut info) } != 0).then_some(info.monitor)
 }
 
 fn find_caption_point(hwnd: Hwnd, rect: NativeRect) -> Option<(i32, i32)> {
@@ -284,14 +284,14 @@ fn find_caption_point(hwnd: Hwnd, rect: NativeRect) -> Option<(i32, i32)> {
     None
 }
 
-fn drag_target(work: NativeRect, caption: (i32, i32), direction: SnapDirection) -> (i32, i32) {
+fn drag_target(monitor: NativeRect, caption: (i32, i32), direction: SnapDirection) -> (i32, i32) {
     let x = match direction {
-        SnapDirection::LeftHalf => work.left,
-        SnapDirection::RightHalf => work.right.saturating_sub(1),
+        SnapDirection::LeftHalf => monitor.left,
+        SnapDirection::RightHalf => monitor.right.saturating_sub(1),
         _ => caption.0,
     };
-    let min_y = work.top.saturating_add(8);
-    let max_y = work.bottom.saturating_sub(8).max(min_y);
+    let min_y = monitor.top.saturating_add(8);
+    let max_y = monitor.bottom.saturating_sub(8).max(min_y);
     (x, caption.1.clamp(min_y, max_y))
 }
 
@@ -328,7 +328,7 @@ fn drag_caption(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
     };
 
     if unsafe { SetCursorPos(start.0, start.1) } == 0 {
-        return Err("SetCursorPos failed while targeting Zen title bar".to_owned());
+        return Err("SetCursorPos failed while targeting window caption".to_owned());
     }
     thread::sleep(DRAG_HOVER_SETTLE);
     send_mouse_button(true)?;
@@ -339,7 +339,7 @@ fn drag_caption(start: (i32, i32), end: (i32, i32)) -> Result<(), String> {
         let y = start.1 as i64 + ((end.1 as i64 - start.1 as i64) * step) / steps;
         if unsafe { SetCursorPos(x as i32, y as i32) } == 0 {
             let _ = send_mouse_button(false);
-            return Err("SetCursorPos failed during Zen snap drag".to_owned());
+            return Err("SetCursorPos failed during native snap drag".to_owned());
         }
         thread::sleep(DRAG_STEP_SETTLE);
     }
@@ -374,7 +374,7 @@ fn send_mouse_button(down: bool) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Windows rejected synthetic mouse {} for Zen snap drag (possibly UIPI)",
+            "Windows rejected synthetic mouse {} for native snap drag (possibly UIPI)",
             if down { "down" } else { "up" }
         ))
     }
@@ -385,15 +385,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drag_target_uses_monitor_edge_without_changing_vertical_caption_coordinate() {
-        let work = NativeRect {
+    fn drag_target_uses_physical_monitor_edge_without_changing_vertical_caption_coordinate() {
+        let monitor = NativeRect {
             left: -1920,
             top: 0,
             right: 0,
-            bottom: 1040,
+            bottom: 1080,
         };
-        assert_eq!(drag_target(work, (-900, 40), SnapDirection::LeftHalf), (-1920, 40));
-        assert_eq!(drag_target(work, (-900, 40), SnapDirection::RightHalf), (-1, 40));
+        assert_eq!(drag_target(monitor, (-900, 40), SnapDirection::LeftHalf), (-1920, 40));
+        assert_eq!(drag_target(monitor, (-900, 40), SnapDirection::RightHalf), (-1, 40));
     }
 
     #[test]
@@ -401,5 +401,11 @@ mod tests {
         let packed = screen_point_lparam(-120, 45).expect("packed") as u32;
         assert_eq!(packed as u16 as i16, -120);
         assert_eq!((packed >> 16) as u16 as i16, 45);
+    }
+
+    #[test]
+    fn input_layout_matches_win32_abi() {
+        let expected = if cfg!(target_pointer_width = "64") { 40 } else { 28 };
+        assert_eq!(size_of::<NativeInput>(), expected);
     }
 }
