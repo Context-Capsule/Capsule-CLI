@@ -242,7 +242,11 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             let initial_planned = report.desktop.applications_planned_to_launch;
 
             let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
-            let mut final_desktop = windows::restore_desktop(desktop, false);
+            // Never skip the final physical pass merely because the inventory
+            // captured before foreground/focus work already looked correct. The
+            // saved geometry and window state are deliberately replayed after all
+            // semantic tab/terminal work has finished.
+            let mut final_desktop = windows::restore_desktop_forced(desktop, false);
             final_desktop.applications_total = full_application_count;
             final_desktop.applications_launched += initial_launched;
             final_desktop.applications_already_running = initial_already_running;
