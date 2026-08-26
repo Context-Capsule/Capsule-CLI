@@ -471,7 +471,7 @@ fn probe_active_pane(hwnd: Hwnd, nonce: &str, step: usize) -> Option<(u32, Strin
 
 fn probe_command(nonce: &str, step: usize) -> String {
     format!(
-        "&{{$f=Join-Path $env:TEMP ('context-capsule-cwd-{nonce}-{step}-'+$PID+'.txt');[IO.File]::WriteAllText($f,[string]$PWD.Path);$e=[char]27;[Console]::Write($e+'[1A'+$e+'[2K'+$e+'[1G'+$e+'[1B'+$e+'[2K'+$e+'[1G')}}"
+        "&{{$f=Join-Path $env:TEMP ('context-capsule-cwd-{nonce}-{step}-'+$PID+'.txt');[IO.File]::WriteAllText($f,[string]$PWD.Path);Clear-Host}}"
     )
 }
 
@@ -795,11 +795,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_command_writes_pid_scoped_file_and_requests_real_pwd() {
+    fn probe_command_writes_pwd_before_clearing_host() {
         let command = probe_command("123-0-456", 7);
         assert!(command.contains("$PID+'.txt'"));
         assert!(command.contains("[string]$PWD.Path"));
-        assert!(!command.contains("Clear-Host"));
+        assert!(command.contains("Clear-Host"));
+        assert!(command.find("WriteAllText").unwrap() < command.find("Clear-Host").unwrap());
+        assert!(!command.contains("Set-Location"));
+        assert!(!command.contains("Invoke-Expression"));
     }
 
     #[cfg(windows)]
