@@ -3,6 +3,7 @@ use crate::{
         docker::{self, DockerSnapshot, DockerStatus},
         terminal::{self, RestartPlan, TerminalEnvironment, TerminalSnapshot, TerminalStatus},
     },
+    continuation_notes,
     discovery,
     persistence::{CapsuleStore, StoredCapsuleSnapshot},
     snapshot::{self, CaptureOptions},
@@ -19,6 +20,7 @@ struct SaveArguments {
     name: String,
     force: bool,
     ignored_applications: Vec<String>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -35,12 +37,29 @@ struct RestoreArguments {
     mode: RestoreMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteArguments {
+    name: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreCompletion {
+    Complete,
+    SuccessfulWithWarnings,
+}
+
 pub fn save(arguments: Vec<String>) -> ExitCode {
     let parsed = match parse_save_arguments(arguments) {
         Ok(parsed) => parsed,
         Err(error) => return usage_error(error),
     };
-    let name = parsed.name;
+    let SaveArguments {
+        name,
+        force,
+        ignored_applications,
+        message,
+    } = parsed;
 
     println!("Discovering workspace for capsule '{name}'...");
     let discovery = match discovery::discover(true, true, true, true) {
@@ -49,13 +68,13 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     };
     let ignored_names = match snapshot::validate_ignored_applications(
         &discovery,
-        &parsed.ignored_applications,
+        &ignored_applications,
     ) {
         Ok(names) => names,
         Err(error) => return usage_error(error),
     };
     let capture_options = CaptureOptions {
-        ignored_applications: parsed.ignored_applications,
+        ignored_applications,
     };
     let stored = match snapshot::capture_snapshot_with_options(&discovery, &capture_options) {
         Ok(snapshot) => snapshot,
@@ -67,8 +86,19 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     };
     let database_path = store.path().display().to_string();
 
-    if let Err(error) = store.save(&name, &stored, parsed.force) {
-        return command_error(error.to_string());
+    let summary = match store.save(&name, &stored, force) {
+        Ok(summary) => summary,
+        Err(error) => return command_error(error.to_string()),
+    };
+
+    if let Some(message) = message.as_deref() {
+        let reference = format!("{}@{}", summary.name, summary.current_revision);
+        if let Err(error) = continuation_notes::set(&reference, message) {
+            return command_error(format!(
+                "capsule '{}' was saved as revision {}, but its continuation note could not be stored: {error}",
+                summary.name, summary.current_revision
+            ));
+        }
     }
 
     let applications = stored
@@ -115,6 +145,9 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
         "  running containers: {}",
         discovery.docker.running_container_count()
     );
+    if let Some(message) = message.as_deref() {
+        print_indented_message("continuation note", message, "  ");
+    }
     println!("  database: {database_path}");
 
     // Docker is optional. A save should not look unhealthy just because Docker
@@ -142,6 +175,13 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         Ok(snapshot) => snapshot,
         Err(error) => return command_error(error.to_string()),
     };
+    let continuation_note = match continuation_notes::get(&name) {
+        Ok(note) => note,
+        Err(error) => {
+            eprintln!("warning: continuation note could not be read: {error}");
+            None
+        }
+    };
 
     if parsed.dry_run {
         println!("Planning restore for capsule '{name}' (dry run)...");
@@ -155,6 +195,9 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
             RestoreMode::Replace => "replace (close unrelated running applications first)",
         }
     );
+    if let Some(note) = continuation_note.as_ref() {
+        print_indented_message("Last note", &note.message, "  ");
+    }
 
     if parsed.mode == RestoreMode::Replace {
         let cleanup = cleanup::close_unrelated_applications(&stored.snapshot, parsed.dry_run);
@@ -185,9 +228,11 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         }
     }
 
-    // Keep the proven restore engine unchanged. Append mode reaches exactly the
-    // same call it did before this feature; replace mode differs only by the
-    // opt-in cleanup pass above.
+    // The restore engine already isolates subsystem failures and continues with
+    // the remaining resources. Full-capsule restore therefore treats those
+    // resource-level failures as a successful-with-warnings outcome. Hard
+    // failures that prevent the pass from starting (database/load errors and a
+    // failed replace cleanup) still return before this call.
     let report = restore::restore_snapshot(
         &stored.snapshot,
         RestoreOptions {
@@ -239,15 +284,74 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         eprintln!("  failed: {failure}");
     }
 
-    if report.success() {
-        if parsed.dry_run {
-            println!("Dry run complete; no applications or windows were changed.");
-        } else {
-            println!("Restore pass complete.");
+    match classify_restore_completion(&report) {
+        RestoreCompletion::Complete => {
+            if parsed.dry_run {
+                println!("Dry run complete; no applications or windows were changed.");
+            } else {
+                println!("Restore pass complete.");
+            }
         }
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
+        RestoreCompletion::SuccessfulWithWarnings => {
+            let failures = restore_failure_count(&report);
+            if parsed.dry_run {
+                println!(
+                    "Dry run complete (successful-with-warnings); {failures} resource issue(s) were isolated and did not prevent the remaining restore plan from being evaluated."
+                );
+            } else {
+                println!(
+                    "Restore pass complete (successful-with-warnings); {failures} resource issue(s) were isolated and other resources were restored where possible."
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+pub fn note(arguments: Vec<String>) -> ExitCode {
+    let parsed = match parse_note_arguments(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => return usage_error(error),
+    };
+
+    // Open the primary store first so legacy databases receive their normal
+    // revision migration before the additive continuation-note table resolves
+    // a revision reference.
+    let store = match CapsuleStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return command_error(error.to_string()),
+    };
+    if let Err(error) = store.load(&parsed.name) {
+        return command_error(error.to_string());
+    }
+
+    match parsed.message.as_deref() {
+        Some(message) => match continuation_notes::set(&parsed.name, message) {
+            Ok(note) => {
+                println!(
+                    "Saved continuation note for '{}@{}'.",
+                    note.capsule_name, note.revision
+                );
+                print_indented_message("note", &note.message, "  ");
+                ExitCode::SUCCESS
+            }
+            Err(error) => command_error(error.to_string()),
+        },
+        None => match continuation_notes::get(&parsed.name) {
+            Ok(Some(note)) => {
+                println!(
+                    "Continuation note for '{}@{}':",
+                    note.capsule_name, note.revision
+                );
+                print_message_block(&note.message, "  ");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                println!("No continuation note is saved for '{}'.", parsed.name);
+                ExitCode::SUCCESS
+            }
+            Err(error) => command_error(error.to_string()),
+        },
     }
 }
 
@@ -304,6 +408,11 @@ pub fn show(arguments: Vec<String>) -> ExitCode {
     }
 
     print_capsule_summary(&name, &stored);
+    match continuation_notes::get(&name) {
+        Ok(Some(note)) => print_indented_message("Last note", &note.message, "  "),
+        Ok(None) => {}
+        Err(error) => println!("  warning: continuation note could not be read: {error}"),
+    }
     ExitCode::SUCCESS
 }
 
@@ -617,16 +726,55 @@ fn print_capsule_summary(name: &str, stored: &StoredCapsuleSnapshot) {
     println!("  use 'capsule show {name} --json' for the complete stored snapshot");
 }
 
+fn classify_restore_completion(report: &restore::RestoreReport) -> RestoreCompletion {
+    if report.success() {
+        RestoreCompletion::Complete
+    } else {
+        RestoreCompletion::SuccessfulWithWarnings
+    }
+}
+
+fn restore_failure_count(report: &restore::RestoreReport) -> usize {
+    report.failures.len()
+        + report.desktop.failures.len()
+        + report.desktop.applications_failed
+}
+
+fn print_indented_message(label: &str, message: &str, indent: &str) {
+    let mut lines = message.lines();
+    if let Some(first) = lines.next() {
+        println!("{indent}{label}: {first}");
+    }
+    let continuation_indent = " ".repeat(label.chars().count() + 2);
+    for line in lines {
+        println!("{indent}{continuation_indent}{line}");
+    }
+}
+
+fn print_message_block(message: &str, indent: &str) {
+    for line in message.lines() {
+        println!("{indent}{line}");
+    }
+}
+
 fn parse_save_arguments(arguments: Vec<String>) -> Result<SaveArguments, String> {
     let mut name = None;
     let mut force = false;
     let mut ignored_applications = Vec::new();
+    let mut message = None;
     let mut index = 0;
 
     while index < arguments.len() {
         let argument = &arguments[index];
         match argument.as_str() {
             "--force" | "-f" => force = true,
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = arguments.get(index) else {
+                    return Err("-m/--message requires a continuation note".to_owned());
+                };
+                set_message(&mut message, value)?;
+            }
             "--ignore-app" => {
                 index += 1;
                 let Some(selector) = arguments.get(index) else {
@@ -636,6 +784,9 @@ fn parse_save_arguments(arguments: Vec<String>) -> Result<SaveArguments, String>
                     return Err("--ignore-app requires an application name, executable, path, or AUMID".to_owned());
                 }
                 ignored_applications.push(selector.clone());
+            }
+            value if value.starts_with("--message=") => {
+                set_message(&mut message, value.trim_start_matches("--message="))?;
             }
             value if value.starts_with("--ignore-app=") => {
                 let selector = value.trim_start_matches("--ignore-app=").trim();
@@ -657,9 +808,11 @@ fn parse_save_arguments(arguments: Vec<String>) -> Result<SaveArguments, String>
         name,
         force,
         ignored_applications,
+        message,
     })
     .ok_or_else(|| {
-        "usage: capsule save <name> [--force] [--ignore-app <application>]...".to_owned()
+        "usage: capsule save <name> [-m <note>] [--force] [--ignore-app <application>]..."
+            .to_owned()
     })
 }
 
@@ -704,6 +857,49 @@ fn parse_restore_arguments(arguments: Vec<String>) -> Result<RestoreArguments, S
     })
 }
 
+fn parse_note_arguments(arguments: Vec<String>) -> Result<NoteArguments, String> {
+    let mut name = None;
+    let mut message = None;
+    let mut index = 0;
+
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        match argument.as_str() {
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = arguments.get(index) else {
+                    return Err("-m/--message requires a continuation note".to_owned());
+                };
+                set_message(&mut message, value)?;
+            }
+            value if value.starts_with("--message=") => {
+                set_message(&mut message, value.trim_start_matches("--message="))?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown note option '{value}'"));
+            }
+            value if name.is_none() => name = Some(value.to_owned()),
+            value => return Err(format!("unexpected note argument '{value}'")),
+        }
+        index += 1;
+    }
+
+    name.map(|name| NoteArguments { name, message })
+        .ok_or_else(|| "usage: capsule note <name[@revision]> [-m <note>]".to_owned())
+}
+
+fn set_message(target: &mut Option<String>, value: &str) -> Result<(), String> {
+    if target.is_some() {
+        return Err("continuation note may be specified only once".to_owned());
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("continuation note cannot be empty".to_owned());
+    }
+    *target = Some(value.to_owned());
+    Ok(())
+}
+
 fn parse_show_arguments(arguments: Vec<String>) -> Result<(String, bool), String> {
     let mut name = None;
     let mut json = false;
@@ -738,11 +934,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn save_parser_requires_one_name_and_supports_force_and_repeated_ignores() {
+    fn save_parser_requires_one_name_and_supports_force_repeated_ignores_and_message() {
         assert_eq!(
             parse_save_arguments(vec![
                 "demo".to_owned(),
                 "--force".to_owned(),
+                "-m".to_owned(),
+                "Fix the next failing integration test".to_owned(),
                 "--ignore-app".to_owned(),
                 "Zen".to_owned(),
                 "--ignore-app=Code.exe".to_owned(),
@@ -752,11 +950,22 @@ mod tests {
                 name: "demo".to_owned(),
                 force: true,
                 ignored_applications: vec!["Zen".to_owned(), "Code.exe".to_owned()],
+                message: Some("Fix the next failing integration test".to_owned()),
             }
         );
         assert!(parse_save_arguments(Vec::new()).is_err());
         assert!(parse_save_arguments(vec!["a".to_owned(), "b".to_owned()]).is_err());
         assert!(parse_save_arguments(vec!["demo".to_owned(), "--ignore-app".to_owned()]).is_err());
+        assert!(parse_save_arguments(vec!["demo".to_owned(), "-m".to_owned()]).is_err());
+        assert!(
+            parse_save_arguments(vec![
+                "demo".to_owned(),
+                "-m".to_owned(),
+                "one".to_owned(),
+                "--message=two".to_owned(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -798,6 +1007,49 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn resource_failures_are_classified_as_successful_with_warnings() {
+        let mut report = restore::RestoreReport::default();
+        assert_eq!(
+            classify_restore_completion(&report),
+            RestoreCompletion::Complete
+        );
+
+        report.failures.push("Docker adapter unavailable".to_owned());
+        assert_eq!(
+            classify_restore_completion(&report),
+            RestoreCompletion::SuccessfulWithWarnings
+        );
+        assert_eq!(restore_failure_count(&report), 1);
+
+        report.desktop.applications_failed = 2;
+        assert_eq!(restore_failure_count(&report), 3);
+    }
+
+    #[test]
+    fn note_parser_supports_read_and_message_modes() {
+        assert_eq!(
+            parse_note_arguments(vec!["demo@2".to_owned()]).unwrap(),
+            NoteArguments {
+                name: "demo@2".to_owned(),
+                message: None,
+            }
+        );
+        assert_eq!(
+            parse_note_arguments(vec![
+                "demo".to_owned(),
+                "--message=continue with auth tests".to_owned(),
+            ])
+            .unwrap(),
+            NoteArguments {
+                name: "demo".to_owned(),
+                message: Some("continue with auth tests".to_owned()),
+            }
+        );
+        assert!(parse_note_arguments(vec!["demo".to_owned(), "-m".to_owned()]).is_err());
+        assert!(parse_note_arguments(vec!["--bad".to_owned()]).is_err());
     }
 
     #[test]
