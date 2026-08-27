@@ -290,16 +290,38 @@ mod tests {
 
         augment_from_terminal_value(&mut snapshot, terminals);
 
-        let repositories = snapshot["git_repositories"]["repositories"]
-            .as_array()
-            .expect("repositories");
-        let expected_root = repo.to_string_lossy();
-        assert!(repositories.iter().any(|repository| {
-            repository["branch"] == "terminal-dev"
-                && repository["repository_root"]
-                    .as_str()
-                    .is_some_and(|value| value == expected_root.as_ref())
-        }));
+        let section: GitRepositoriesSnapshot =
+            serde_json::from_value(snapshot["git_repositories"].clone())
+                .expect("git repositories snapshot");
+        let expected = SavedGitRepository {
+            repository_root: repo.to_string_lossy().into_owned(),
+            branch: "terminal-dev".to_owned(),
+            environment: GitRepositoryEnvironment::Local,
+        };
+        let captured = section
+            .repositories
+            .iter()
+            .find(|repository| {
+                repository.branch == "terminal-dev" && same_repository(repository, &expected)
+            })
+            .expect("live terminal repository should be captured");
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&captured.repository_root)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("captured repository root should be usable by git");
+        assert!(
+            output.status.success(),
+            "git could not use captured repository root {:?}: {}",
+            captured.repository_root,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "terminal-dev"
+        );
         let _ = fs::remove_dir_all(repo);
     }
 
