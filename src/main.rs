@@ -1,5 +1,6 @@
 mod adapters;
 mod commands;
+mod continuation_notes;
 mod desktop;
 mod diagnostics;
 mod diff;
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
         Some("list") => commands::list(args.collect()),
         Some("history") => lifecycle::history(args.collect()),
         Some("show") => commands::show(args.collect()),
+        Some("note") => commands::note(args.collect()),
         Some("diff") => lifecycle::diff(args.collect()),
         Some("delete") => commands::delete(args.collect()),
         Some("doctor") => lifecycle::doctor(args.collect()),
@@ -571,12 +573,13 @@ fn print_usage() {
     println!("Context Capsule CLI\n");
     println!("Usage:");
     println!("  capsule inspect [options]");
-    println!("  capsule save <name> [--force] [--ignore-app <application>]...");
+    println!("  capsule save <name> [-m <note>] [--force] [--ignore-app <application>]...");
     println!("  capsule update <name>");
     println!("  capsule restore <name[@revision]> [--dry-run] [--append | --replace]");
     println!("  capsule list");
     println!("  capsule history <name>");
     println!("  capsule show <name[@revision]> [--json]");
+    println!("  capsule note <name[@revision]> [-m <note>]");
     println!("  capsule diff <before> <after> [--json]");
     println!("  capsule delete <name>");
     println!("  capsule doctor [-v|--verbose] [--json]");
@@ -588,12 +591,13 @@ fn print_usage() {
     println!(
         "  inspect    Discover current workspace, tools, terminals, applications, windows, displays and Docker"
     );
-    println!("  save       Capture a new capsule; repeat --ignore-app to exclude selected applications");
+    println!("  save       Capture a new capsule; -m stores its continuation note and --ignore-app excludes selected applications");
     println!("  update     Capture the current workspace as the next revision of an existing capsule");
-    println!("  restore    Restore a capsule; append is default, --replace closes unrelated applications first");
+    println!("  restore    Restore as much of a capsule as possible; resource failures are isolated and reported as warnings");
     println!("  list       List saved capsules");
     println!("  history    List immutable revisions for a capsule");
     println!("  show       Show a saved capsule or revision; --json prints the complete stored payload");
+    println!("  note       Read or replace the continuation note for an existing capsule revision");
     println!("  diff       Compare two capsule states semantically");
     println!("  delete     Delete a saved capsule and all of its revisions");
     println!("  doctor     Check local database, adapters, native host, Git, Docker and logging");
@@ -602,6 +606,7 @@ fn print_usage() {
     println!("  apps       Compatibility alias for 'capsule inspect --apps'");
     println!();
     println!("Save/restore options:");
+    println!("  -m, --message <note>    Store a continuation note on the saved capsule revision");
     println!("      --ignore-app <app>  Omit a discovered application from a saved capsule; repeatable");
     println!("      --append            Preserve unrelated running applications during restore (default)");
     println!("      --replace           Close unrelated running applications before restore");
