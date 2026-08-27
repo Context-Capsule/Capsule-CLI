@@ -20,7 +20,9 @@ pub mod logging;
 pub mod persistence;
 pub mod restore;
 pub mod restore_bus;
+pub mod service_policy;
 pub(crate) mod terminal_context;
+pub mod terminal_interrupt;
 pub mod vscode;
 
 #[cfg(windows)]
