@@ -1,6 +1,9 @@
+#[path = "terminal_context.rs"]
+mod terminal_context;
+
 use crate::{
     adapters::terminal::{self, TerminalEnvironment, TerminalHost, TerminalSession},
-    commands, persistence, terminal_context,
+    commands, persistence,
 };
 use context_capsule::{
     restore_bus,
@@ -641,10 +644,10 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
 
     let mut captured = Vec::new();
     if vscode_foreground > 0 {
-        let mut vscode = interrupt_vscode_services(caller_shell_pid)?;
-        if vscode.len() < vscode_foreground {
+        let mut vscode = interrupt_vscode_services(caller_shell_pid, vscode_foreground)?;
+        if vscode.len() != vscode_foreground {
             return Err(format!(
-                "VS Code reported {} safely interruptible running command(s), but process discovery observed {vscode_foreground}; save was stopped rather than interrupting commands that cannot be restored safely",
+                "VS Code returned {} interrupted running command(s), but process discovery observed {vscode_foreground}; save was stopped because the adapter result was incomplete",
                 vscode.len()
             ));
         }
@@ -694,7 +697,10 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
     Ok(captured)
 }
 
-fn interrupt_vscode_services(caller_shell_pid: Option<u32>) -> Result<Vec<CapturedService>, String> {
+fn interrupt_vscode_services(
+    caller_shell_pid: Option<u32>,
+    expected_running_services: usize,
+) -> Result<Vec<CapturedService>, String> {
     let editor = vscode::load_recent_vscode_state()
         .map_err(|error| format!("could not read live VS Code state: {error}"))?
         .ok_or_else(|| {
@@ -708,6 +714,7 @@ fn interrupt_vscode_services(caller_shell_pid: Option<u32>) -> Result<Vec<Captur
             "terminal_control": {
                 "action": "interrupt-running-services",
                 "caller_shell_pid": caller_shell_pid,
+                "expected_running_services": expected_running_services,
             }
         }),
     )
