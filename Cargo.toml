@@ -10,6 +10,10 @@ name = "capsule"
 path = "src/capsule_main.rs"
 
 [[bin]]
+name = "capsule-agent-worker"
+path = "src/agent_worker_main.rs"
+
+[[bin]]
 name = "capsule-firefox-host"
 path = "src/bin/firefox_host.rs"
 
