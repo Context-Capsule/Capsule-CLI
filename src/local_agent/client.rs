@@ -1,20 +1,30 @@
-use crate::local_agent::{
-    AgentError, ipc, paths,
-    protocol::{
-        AgentAction, AgentRequest, AgentResponse, AgentState, CliInvocation, EnvironmentEntry,
-        PROTOCOL_VERSION,
+use crate::{
+    local_agent::{
+        AgentError, ipc, paths,
+        protocol::{
+            AgentAction, AgentRequest, AgentResponse, AgentState, CliInvocation, EnvironmentEntry,
+            PROTOCOL_VERSION,
+        },
+    },
+    service_policy::{
+        CALLER_PID_ENV, RestartPolicy, RestoreDecision, RestoreDecisionFile, RestoreDecisionKind,
+        SERVICE_DECISIONS_ENV, ServicePlan,
     },
 };
 use std::{
     env, fs,
-    io::{self, Write},
+    fs::OpenOptions,
+    io::{self, IsTerminal, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
+    path::PathBuf,
     process::{Command, ExitCode, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -31,7 +41,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
         return run_agent_command(&args[1..]);
     }
 
-    let invocation = match capture_invocation(args) {
+    let mut invocation = match capture_invocation(args) {
         Ok(invocation) => invocation,
         Err(error) => return print_agent_error(error),
     };
@@ -39,15 +49,22 @@ pub fn run(args: Vec<String>) -> ExitCode {
         Ok(state) => state,
         Err(error) => return print_agent_error(error),
     };
-    let response = match request(
+    let decision_file = match prepare_service_decisions(&state, &mut invocation) {
+        Ok(path) => path,
+        Err(error) => return print_agent_error(error),
+    };
+    let response = request(
         &state,
         AgentAction::Execute { invocation },
         RESPONSE_TIMEOUT,
-    ) {
-        Ok(response) => response,
-        Err(error) => return print_agent_error(error),
-    };
-    render_response(response)
+    );
+    if let Some(path) = decision_file {
+        let _ = fs::remove_file(path);
+    }
+    match response {
+        Ok(response) => render_response(response),
+        Err(error) => print_agent_error(error),
+    }
 }
 
 fn run_agent_command(args: &[String]) -> ExitCode {
@@ -121,19 +138,148 @@ fn capture_invocation(args: Vec<String>) -> Result<CliInvocation, AgentError> {
         .map_err(|error| AgentError::Runtime(format!("could not read current directory: {error}")))?
         .to_string_lossy()
         .into_owned();
-    let environment = env::vars_os()
+    let mut environment = env::vars_os()
         .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            if key == CALLER_PID_ENV || key == SERVICE_DECISIONS_ENV {
+                return None;
+            }
             Some(EnvironmentEntry {
-                key: key.into_string().ok()?,
+                key,
                 value: value.into_string().ok()?,
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    environment.push(EnvironmentEntry {
+        key: CALLER_PID_ENV.to_owned(),
+        value: std::process::id().to_string(),
+    });
     Ok(CliInvocation {
         args,
         current_directory,
         environment,
     })
+}
+
+fn prepare_service_decisions(
+    state: &AgentState,
+    invocation: &mut CliInvocation,
+) -> Result<Option<PathBuf>, AgentError> {
+    if invocation.args.first().map(String::as_str) != Some("restore")
+        || invocation.args.iter().any(|value| value == "--dry-run")
+    {
+        return Ok(None);
+    }
+
+    let mut plan_args = vec!["__service-plan".to_owned()];
+    plan_args.extend(invocation.args.clone());
+    let plan_invocation = CliInvocation {
+        args: plan_args,
+        current_directory: invocation.current_directory.clone(),
+        environment: invocation.environment.clone(),
+    };
+    let response = match request(
+        state,
+        AgentAction::Execute {
+            invocation: plan_invocation,
+        },
+        Duration::from_secs(15),
+    ) {
+        Ok(response) if response.ok && response.exit_code == 0 => response,
+        _ => return Ok(None),
+    };
+    let plan: ServicePlan = match serde_json::from_str(response.stdout.trim()) {
+        Ok(plan) => plan,
+        Err(_) => return Ok(None),
+    };
+    if plan.services.is_empty() {
+        return Ok(None);
+    }
+
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let mut decisions = Vec::new();
+    let mut skipped_noninteractive = false;
+    for service in &plan.services {
+        if service.restart_policy == RestartPolicy::Always {
+            continue;
+        }
+        if !interactive {
+            skipped_noninteractive = true;
+            continue;
+        }
+        if let Some(pre_start) = service.pre_start_command.as_deref() {
+            println!("  pre-start: {pre_start}");
+        }
+        let decision = prompt_service_decision(&service.command)?;
+        decisions.push(RestoreDecision {
+            service_index: service.service_index,
+            decision,
+        });
+    }
+    if skipped_noninteractive {
+        eprintln!(
+            "warning: saved service restart prompts were skipped because stdin/stdout are not interactive; services configured as Always still start"
+        );
+    }
+    if decisions.is_empty() {
+        return Ok(None);
+    }
+
+    let decision_file = RestoreDecisionFile {
+        capsule_name: plan.capsule_name,
+        revision: plan.revision,
+        decisions,
+    };
+    let path = decision_file_path();
+    let bytes = serde_json::to_vec(&decision_file)
+        .map_err(|error| AgentError::Protocol(format!("could not encode service decisions: {error}")))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(AgentError::Io)?;
+    file.write_all(&bytes).map_err(AgentError::Io)?;
+    file.flush().map_err(AgentError::Io)?;
+    #[cfg(unix)]
+    {
+        let mut permissions = file.metadata().map_err(AgentError::Io)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).map_err(AgentError::Io)?;
+    }
+    invocation.environment.retain(|entry| entry.key != SERVICE_DECISIONS_ENV);
+    invocation.environment.push(EnvironmentEntry {
+        key: SERVICE_DECISIONS_ENV.to_owned(),
+        value: path.to_string_lossy().into_owned(),
+    });
+    Ok(Some(path))
+}
+
+fn prompt_service_decision(command: &str) -> Result<RestoreDecisionKind, AgentError> {
+    loop {
+        print!(
+            "Start saved service? {command}  [Y] Once [A] Always for this capsule [N] Skip  "
+        );
+        io::stdout().flush().map_err(AgentError::Io)?;
+        let mut input = String::new();
+        let read = io::stdin().read_line(&mut input).map_err(AgentError::Io)?;
+        if read == 0 {
+            println!("N");
+            return Ok(RestoreDecisionKind::Skip);
+        }
+        match input.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(RestoreDecisionKind::StartOnce),
+            "a" | "always" => return Ok(RestoreDecisionKind::Always),
+            "n" | "no" | "" => return Ok(RestoreDecisionKind::Skip),
+            _ => println!("Please enter Y, A, or N."),
+        }
+    }
+}
+
+fn decision_file_path() -> PathBuf {
+    env::temp_dir().join(format!(
+        "context-capsule-service-decisions-{}.json",
+        next_request_id()
+    ))
 }
 
 fn ensure_running() -> Result<AgentState, AgentError> {
@@ -337,9 +483,17 @@ mod tests {
     }
 
     #[test]
-    fn invocation_capture_preserves_arguments() {
+    fn invocation_capture_preserves_arguments_and_protects_caller_pid() {
         let invocation = capture_invocation(vec!["show".to_owned(), "demo@2".to_owned()]).unwrap();
         assert_eq!(invocation.args, vec!["show", "demo@2"]);
         assert!(!invocation.current_directory.is_empty());
+        assert!(invocation.environment.iter().any(|entry| {
+            entry.key == CALLER_PID_ENV && entry.value == std::process::id().to_string()
+        }));
+    }
+
+    #[test]
+    fn prompt_decision_file_name_is_unique_and_outside_capsule_database() {
+        assert_ne!(decision_file_path(), decision_file_path());
     }
 }
