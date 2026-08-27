@@ -1,3 +1,6 @@
+mod selective_restore;
+
+use self::selective_restore::RestoreSelection;
 use crate::{
     adapters::{
         docker::{self, DockerSnapshot, DockerStatus},
@@ -35,6 +38,7 @@ struct RestoreArguments {
     name: String,
     dry_run: bool,
     mode: RestoreMode,
+    only: Option<RestoreSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +199,9 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
             RestoreMode::Replace => "replace (close unrelated running applications first)",
         }
     );
+    if let Some(selection) = parsed.only.as_ref() {
+        println!("  only: {}", selection.display());
+    }
     if let Some(note) = continuation_note.as_ref() {
         print_indented_message("Last note", &note.message, "  ");
     }
@@ -228,13 +235,18 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         }
     }
 
+    let selected_snapshot = parsed
+        .only
+        .as_ref()
+        .map(|selection| selective_restore::filter_snapshot(&stored.snapshot, selection));
+    let restore_snapshot = selected_snapshot.as_ref().unwrap_or(&stored.snapshot);
+
     // The restore engine already isolates subsystem failures and continues with
-    // the remaining resources. Full-capsule restore therefore treats those
-    // resource-level failures as a successful-with-warnings outcome. Hard
-    // failures that prevent the pass from starting (database/load errors and a
-    // failed replace cleanup) still return before this call.
+    // the remaining resources. Selective restore supplies a filtered in-memory
+    // snapshot, leaving the persisted capsule untouched and reusing the same
+    // proven restore stages for the selected resources.
     let report = restore::restore_snapshot(
-        &stored.snapshot,
+        restore_snapshot,
         RestoreOptions {
             dry_run: parsed.dry_run,
         },
@@ -821,8 +833,11 @@ fn parse_restore_arguments(arguments: Vec<String>) -> Result<RestoreArguments, S
     let mut dry_run = false;
     let mut mode = RestoreMode::Append;
     let mut explicit_mode: Option<RestoreMode> = None;
+    let mut only = None;
+    let mut index = 0;
 
-    for argument in arguments {
+    while index < arguments.len() {
+        let argument = &arguments[index];
         match argument.as_str() {
             "--dry-run" => dry_run = true,
             "--append" => {
@@ -839,22 +854,54 @@ fn parse_restore_arguments(arguments: Vec<String>) -> Result<RestoreArguments, S
                 mode = RestoreMode::Replace;
                 explicit_mode = Some(RestoreMode::Replace);
             }
+            "--only" => {
+                index += 1;
+                let Some(value) = arguments.get(index) else {
+                    return Err("--only requires a restore target".to_owned());
+                };
+                if value.starts_with('-') {
+                    return Err("--only requires a restore target".to_owned());
+                }
+                add_restore_selection(&mut only, value)?;
+            }
+            value if value.starts_with("--only=") => {
+                add_restore_selection(&mut only, value.trim_start_matches("--only="))?;
+            }
             value if value.starts_with('-') => {
                 return Err(format!("unknown restore option '{value}'"));
             }
             value if name.is_none() => name = Some(value.to_owned()),
             value => return Err(format!("unexpected restore argument '{value}'")),
         }
+        index += 1;
+    }
+
+    if only.is_some() && mode == RestoreMode::Replace {
+        return Err(
+            "--only cannot be combined with --replace/--close-unrelated because selective restore must leave unselected applications untouched"
+                .to_owned(),
+        );
     }
 
     name.map(|name| RestoreArguments {
         name,
         dry_run,
         mode,
+        only,
     })
     .ok_or_else(|| {
-        "usage: capsule restore <name> [--dry-run] [--append | --replace]".to_owned()
+        "usage: capsule restore <name> [--dry-run] [--append | --replace] [--only <targets>]"
+            .to_owned()
     })
+}
+
+fn add_restore_selection(
+    target: &mut Option<RestoreSelection>,
+    value: &str,
+) -> Result<(), String> {
+    target
+        .get_or_insert_with(RestoreSelection::default)
+        .add_selector_list(value)
 }
 
 fn parse_note_arguments(arguments: Vec<String>) -> Result<NoteArguments, String> {
@@ -976,6 +1023,7 @@ mod tests {
                 name: "demo".to_owned(),
                 dry_run: true,
                 mode: RestoreMode::Append,
+                only: None,
             }
         );
         assert_eq!(
@@ -984,6 +1032,7 @@ mod tests {
                 name: "demo".to_owned(),
                 dry_run: false,
                 mode: RestoreMode::Replace,
+                only: None,
             }
         );
         assert_eq!(
@@ -1007,6 +1056,66 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn restore_parser_supports_comma_separated_and_repeated_only_targets() {
+        let parsed = parse_restore_arguments(vec![
+            "demo@2".to_owned(),
+            "--dry-run".to_owned(),
+            "--only".to_owned(),
+            "vscode,terminals".to_owned(),
+            "--only=git".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.name, "demo@2");
+        assert!(parsed.dry_run);
+        assert_eq!(parsed.mode, RestoreMode::Append);
+        assert_eq!(parsed.only.unwrap().display(), "vscode,terminals,git");
+    }
+
+    #[test]
+    fn restore_parser_rejects_invalid_only_and_replace_combination() {
+        assert!(
+            parse_restore_arguments(vec!["demo".to_owned(), "--only".to_owned()]).is_err()
+        );
+        assert!(
+            parse_restore_arguments(vec![
+                "demo".to_owned(),
+                "--only".to_owned(),
+                "vscode,unknown".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_restore_arguments(vec![
+                "demo".to_owned(),
+                "--only".to_owned(),
+                "vscode".to_owned(),
+                "--replace".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_restore_arguments(vec![
+                "demo".to_owned(),
+                "--replace".to_owned(),
+                "--only=git".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_append_can_be_combined_with_only() {
+        let parsed = parse_restore_arguments(vec![
+            "demo".to_owned(),
+            "--append".to_owned(),
+            "--only=browsers,git".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.mode, RestoreMode::Append);
+        assert_eq!(parsed.only.unwrap().display(), "firefox,chrome,git");
     }
 
     #[test]
