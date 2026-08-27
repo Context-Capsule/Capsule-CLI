@@ -71,6 +71,8 @@ impl RestoreReport {
 
 pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreReport {
     let mut report = RestoreReport::default();
+    let git = crate::git_context::restore_from_snapshot(snapshot, options.dry_run);
+    report.warnings.extend(git.warnings);
     let mut activation_desktop = None;
     let mut final_placement_desktop = None;
     let mut full_application_count = 0usize;
