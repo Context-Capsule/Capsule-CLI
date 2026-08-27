@@ -52,7 +52,10 @@ impl SqliteService {
 #[derive(Debug)]
 enum WorkerLaunch {
     Binary(PathBuf),
-    Cargo { manifest: PathBuf },
+    Cargo {
+        manifest: PathBuf,
+        target_dir: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -75,15 +78,21 @@ impl AdapterHost {
         })?;
         let sibling = sibling_worker_path(&executable);
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let cargo_worker = || WorkerLaunch::Cargo {
+            target_dir: cargo_worker_target_dir(&manifest),
+            manifest: manifest.clone(),
+        };
 
         // In debug/development builds always go through Cargo when the source
         // manifest is available. That prevents a previously-built worker from
         // becoming stale when only worker-owned source files change between
-        // `cargo run` invocations. Release/install builds use the sibling
-        // worker directly and pay no Cargo startup cost.
+        // `cargo run` invocations. The worker uses its own target directory so
+        // a CLI that itself was launched by Cargo cannot deadlock on Cargo's
+        // target-directory lock. Release/install builds use the sibling worker
+        // directly and pay no Cargo startup cost.
         if cfg!(debug_assertions) && manifest.is_file() {
             return Ok(Self {
-                worker: WorkerLaunch::Cargo { manifest },
+                worker: cargo_worker(),
             });
         }
         if sibling.is_file() {
@@ -94,10 +103,11 @@ impl AdapterHost {
 
         // A release-like development invocation may still have built only the
         // public `capsule` target. Lazily build the worker from the same
-        // manifest so existing `cargo run` smoke tests keep working.
+        // manifest in its isolated cache so existing `cargo run` smoke tests
+        // keep working without contending with the parent Cargo process.
         if manifest.is_file() {
             return Ok(Self {
-                worker: WorkerLaunch::Cargo { manifest },
+                worker: cargo_worker(),
             });
         }
 
@@ -121,13 +131,18 @@ impl AdapterHost {
 
         let mut command = match &self.worker {
             WorkerLaunch::Binary(path) => Command::new(path),
-            WorkerLaunch::Cargo { manifest } => {
+            WorkerLaunch::Cargo {
+                manifest,
+                target_dir,
+            } => {
                 let mut command = Command::new("cargo");
                 command
                     .arg("run")
                     .arg("--quiet")
                     .arg("--manifest-path")
                     .arg(manifest)
+                    .arg("--target-dir")
+                    .arg(target_dir)
                     .arg("--bin")
                     .arg(WORKER_BINARY)
                     .arg("--");
@@ -171,6 +186,14 @@ fn sibling_worker_path(current_executable: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(executable_name(WORKER_BINARY))
+}
+
+fn cargo_worker_target_dir(manifest: &Path) -> PathBuf {
+    manifest
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("target")
+        .join("local-agent-worker")
 }
 
 fn executable_name(base: &str) -> String {
@@ -273,5 +296,11 @@ mod tests {
         let current = Path::new("/tmp/context-capsule/capsule");
         let worker = sibling_worker_path(current);
         assert!(worker.to_string_lossy().contains("capsule-agent-worker"));
+    }
+
+    #[test]
+    fn cargo_worker_uses_an_isolated_target_directory() {
+        let target = cargo_worker_target_dir(Path::new("/tmp/context-capsule/Cargo.toml"));
+        assert!(target.ends_with("target/local-agent-worker"));
     }
 }
