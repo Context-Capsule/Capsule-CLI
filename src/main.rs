@@ -575,7 +575,7 @@ fn print_usage() {
     println!("  capsule inspect [options]");
     println!("  capsule save <name> [-m <note>] [--force] [--ignore-app <application>]...");
     println!("  capsule update <name>");
-    println!("  capsule restore <name[@revision]> [--dry-run] [--append | --replace]");
+    println!("  capsule restore <name[@revision]> [--dry-run] [--append | --replace] [--only <targets>]");
     println!("  capsule list");
     println!("  capsule history <name>");
     println!("  capsule show <name[@revision]> [--json]");
@@ -593,7 +593,7 @@ fn print_usage() {
     );
     println!("  save       Capture a new capsule; -m stores its continuation note and --ignore-app excludes selected applications");
     println!("  update     Capture the current workspace as the next revision of an existing capsule");
-    println!("  restore    Restore as much of a capsule as possible; resource failures are isolated and reported as warnings");
+    println!("  restore    Restore a full capsule or selected resources with --only; resource failures remain isolated");
     println!("  list       List saved capsules");
     println!("  history    List immutable revisions for a capsule");
     println!("  show       Show a saved capsule or revision; --json prints the complete stored payload");
@@ -611,6 +611,9 @@ fn print_usage() {
     println!("      --append            Preserve unrelated running applications during restore (default)");
     println!("      --replace           Close unrelated running applications before restore");
     println!("      --close-unrelated   Alias for --replace");
+    println!("      --only <targets>    Restore only selected resources; comma-separated and repeatable");
+    println!("                          targets: apps, vscode, firefox/zen, chrome, browsers, terminals, git, docker, explorer, all");
+    println!("                          cannot be combined with --replace/--close-unrelated");
     println!();
     print_inspect_usage();
 }
