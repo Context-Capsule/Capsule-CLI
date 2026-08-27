@@ -186,9 +186,12 @@ fn validate_message(message: &str) -> Result<&str, ContinuationNoteError> {
             "message cannot exceed {MAX_NOTE_CHARS} characters"
         )));
     }
-    if message.chars().any(|character| character == '\0') {
+    if message
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
         return Err(ContinuationNoteError::InvalidMessage(
-            "message cannot contain NUL characters".to_owned(),
+            "message cannot contain terminal control characters".to_owned(),
         ));
     }
     Ok(message)
@@ -301,9 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_oversized_notes_are_rejected() {
+    fn invalid_notes_are_rejected_without_blocking_normal_multiline_text() {
         assert!(validate_message("   ").is_err());
         assert!(validate_message(&"x".repeat(MAX_NOTE_CHARS + 1)).is_err());
-        assert!(validate_message("do the next useful thing").is_ok());
+        assert!(validate_message("unsafe\u{1b}[2J").is_err());
+        assert!(validate_message("next: tests\nthen:\tdocs").is_ok());
     }
 }
