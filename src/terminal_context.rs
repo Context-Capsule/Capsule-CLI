@@ -298,16 +298,14 @@ fn apply_exact_directory(
     // exact runspace probe, so replace any stale Win32 fallback in the restart
     // plan with the actual PowerShell $PWD selected above.
     if session.host != TerminalHost::WindowsTerminal {
-        if let Some(restart) = session
-            .restart
-            .as_mut()
-            .filter(|restart| direct_powershell_executable(&restart.executable))
-        {
-            restart.working_directory = Some(directory.clone());
-            restart.note = Some(
-                "Starts the captured interactive PowerShell in its exact captured $PWD without replaying shell history or foreground commands."
-                    .to_owned(),
-            );
+        if let Some(restart) = session.restart.as_mut() {
+            if direct_powershell_executable(&restart.executable) {
+                restart.working_directory = Some(directory.clone());
+                restart.note = Some(
+                    "Starts the captured interactive PowerShell in its exact captured $PWD without replaying shell history or foreground commands."
+                        .to_owned(),
+                );
+            }
         }
     }
 
