@@ -52,7 +52,13 @@ pub struct SavedService {
     pub profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// User-facing command spelling when it can be recovered safely.
     pub command: String,
+    /// Resolved process command proven to have been running at save time. This
+    /// is used for reliable execution while `command` remains what is shown to
+    /// the user. Older capsules omit it and automatically fall back to command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_start_command: Option<String>,
     pub restart_policy: RestartPolicy,
@@ -129,7 +135,12 @@ pub fn validate_restart_command(command: &str) -> Result<String, String> {
 }
 
 pub fn combined_command(service: &SavedService) -> Result<String, String> {
-    let service_command = validate_restart_command(&service.command)?;
+    let service_command = validate_restart_command(
+        service
+            .execution_command
+            .as_deref()
+            .unwrap_or(service.command.as_str()),
+    )?;
     let Some(pre_start) = service.pre_start_command.as_deref() else {
         return Ok(service_command);
     };
@@ -173,6 +184,7 @@ mod tests {
             profile: Some("PowerShell".to_owned()),
             working_directory: Some("C:/work".to_owned()),
             command: "npm run start:dev".to_owned(),
+            execution_command: None,
             pre_start_command: pre_start.map(str::to_owned),
             restart_policy: RestartPolicy::Ask,
         }
@@ -192,6 +204,26 @@ mod tests {
         assert!(validate_restart_command("tool --token abc").is_err());
         assert!(validate_restart_command("curl https://user:password@example.com").is_err());
         assert!(validate_restart_command("npm start\u{1b}[31m").is_err());
+    }
+
+    #[test]
+    fn resolved_execution_command_does_not_replace_user_facing_command() {
+        let mut saved = service("Windows PowerShell", None);
+        saved.command = "python -m app".to_owned();
+        saved.execution_command = Some(
+            r#""C:\work\venv\Scripts\python.exe" -m app"#.to_owned(),
+        );
+        assert_eq!(saved.command, "python -m app");
+        assert_eq!(
+            combined_command(&saved).unwrap(),
+            r#""C:\work\venv\Scripts\python.exe" -m app"#
+        );
+    }
+
+    #[test]
+    fn old_capsules_without_execution_command_still_execute_command() {
+        let saved = service("Windows PowerShell", None);
+        assert_eq!(combined_command(&saved).unwrap(), "npm run start:dev");
     }
 
     #[test]
