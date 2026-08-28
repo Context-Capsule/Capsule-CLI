@@ -370,7 +370,7 @@ mod tests {
         let script = caller_ancestry_script(4242);
         assert!(script.contains("$current=[uint32]4242"));
         assert!(script.contains("Get-CimInstance -ClassName Win32_Process"));
-        assert!(script.contains("Get-WmiObject -ClassName Win32_Process"));
+        assert!(script.contains("Get-WmiObject -Class Win32_Process"));
         assert!(script.contains("$pidKey=[uint32]$item.ProcessId"));
         assert!(script.contains("$p=$byPid[$current]"));
         assert!(!script.contains("-Filter"));
