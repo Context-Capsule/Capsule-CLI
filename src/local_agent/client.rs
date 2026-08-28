@@ -31,6 +31,7 @@ use std::os::windows::process::CommandExt;
 const SERVER_FLAG: &str = "--agent-serve";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const SERVICE_PLAN_TIMEOUT: Duration = RESPONSE_TIMEOUT;
 const START_ATTEMPTS: usize = 120;
 const START_POLL: Duration = Duration::from_millis(25);
 const EXISTING_START_ATTEMPTS: usize = 80;
@@ -178,12 +179,18 @@ fn prepare_service_decisions(
         current_directory: invocation.current_directory.clone(),
         environment: invocation.environment.clone(),
     };
+    // In debug/development mode the Local Agent intentionally launches the
+    // compatibility worker through Cargo in an isolated target directory. A
+    // cold/rebuilt worker can legitimately take well over 15 seconds to compile.
+    // The service-plan phase is part of the restore transaction, so give it the
+    // same bounded timeout as the actual restore instead of timing out early and
+    // silently losing the user's Ask decisions.
     let response = request(
         state,
         AgentAction::Execute {
             invocation: plan_invocation,
         },
-        Duration::from_secs(15),
+        SERVICE_PLAN_TIMEOUT,
     )
     .map_err(|error| {
         AgentError::Runtime(format!(
@@ -520,5 +527,11 @@ mod tests {
     #[test]
     fn prompt_decision_file_name_is_unique_and_outside_capsule_database() {
         assert_ne!(decision_file_path(), decision_file_path());
+    }
+
+    #[test]
+    fn service_plan_waits_as_long_as_the_restore_it_protects() {
+        assert_eq!(SERVICE_PLAN_TIMEOUT, RESPONSE_TIMEOUT);
+        assert!(SERVICE_PLAN_TIMEOUT >= Duration::from_secs(60));
     }
 }
