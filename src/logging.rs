@@ -88,6 +88,10 @@ pub fn info(component: &str, message: impl AsRef<str>) {
     let _ = append(component, LogLevel::Info, message);
 }
 
+pub fn debug(component: &str, message: impl AsRef<str>) {
+    let _ = append(component, LogLevel::Debug, message);
+}
+
 pub fn warn(component: &str, message: impl AsRef<str>) {
     let _ = append(component, LogLevel::Warn, message);
 }
