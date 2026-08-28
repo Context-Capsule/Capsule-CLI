@@ -233,6 +233,12 @@ fn handle_request_inner(request: NativeRequest) -> Result<NativeResponse, Browse
 
     match request.kind.as_str() {
         "ping" => {
+            // A connected extension may legitimately have no tab/window changes for
+            // longer than LIVE_STATE_MAX_AGE. Its periodic native ping is positive
+            // liveness evidence, so renew the lease on the last *validated* semantic
+            // snapshot without changing the snapshot's own captured_at timestamp.
+            // Missing/corrupt state is never manufactured or blessed by a heartbeat.
+            refresh_runtime_state_heartbeat();
             let mut response = success_response("pong");
             response.restore_request = restore_bus::read_request("firefox")?;
             Ok(response)
@@ -597,6 +603,41 @@ fn write_runtime_state_at(
     Ok(())
 }
 
+fn refresh_runtime_state_heartbeat() {
+    let path = match runtime_state_path() {
+        Ok(path) => path,
+        Err(error) => {
+            logging::warn(
+                "firefox",
+                format!("native heartbeat could not resolve runtime state path: {error}"),
+            );
+            return;
+        }
+    };
+    match refresh_runtime_state_heartbeat_at(&path, now_unix_ms()) {
+        Ok(true) => logging::debug(
+            "firefox",
+            "native heartbeat renewed the validated semantic-state freshness lease",
+        ),
+        Ok(false) => {}
+        Err(error) => logging::warn(
+            "firefox",
+            format!("native heartbeat could not renew semantic-state freshness: {error}"),
+        ),
+    }
+}
+
+fn refresh_runtime_state_heartbeat_at(path: &Path, updated_at: i64) -> Result<bool, BrowserError> {
+    let envelope = match read_runtime_state_at(path) {
+        Ok(envelope) => envelope,
+        Err(BrowserError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    validate_snapshot(&envelope.snapshot)?;
+    write_runtime_state_at(path, &envelope.snapshot, updated_at)?;
+    Ok(true)
+}
+
 fn read_runtime_state_at(path: &Path) -> Result<RuntimeStateEnvelope, BrowserError> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
@@ -806,6 +847,35 @@ mod tests {
         assert_eq!(loaded.updated_at_unix_ms, 42);
         assert_eq!(loaded.snapshot, snapshot);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_heartbeat_renews_existing_valid_state_without_changing_snapshot_time() {
+        let path = env::temp_dir().join(format!(
+            "context-capsule-firefox-heartbeat-{}-{}.json",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let snapshot = sample_snapshot();
+        write_runtime_state_at(&path, &snapshot, 42).expect("write state");
+        assert!(refresh_runtime_state_heartbeat_at(&path, 99).expect("refresh heartbeat"));
+        let loaded = read_runtime_state_at(&path).expect("read refreshed state");
+        assert_eq!(loaded.updated_at_unix_ms, 99);
+        assert_eq!(loaded.snapshot.captured_at_unix_ms, snapshot.captured_at_unix_ms);
+        assert_eq!(loaded.snapshot, snapshot);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_heartbeat_does_not_create_missing_semantic_state() {
+        let path = env::temp_dir().join(format!(
+            "context-capsule-firefox-missing-heartbeat-{}-{}.json",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let _ = fs::remove_file(&path);
+        assert!(!refresh_runtime_state_heartbeat_at(&path, 99).expect("missing heartbeat"));
+        assert!(!path.exists());
     }
 
     #[test]
