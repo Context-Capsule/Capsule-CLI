@@ -634,23 +634,26 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
     };
     let initial = terminal::discover();
 
-    let vscode_foreground = initial
+    // Windows process discovery can see nested/helper shells below Code.exe in
+    // addition to actual integrated-terminal shells (especially in Extension
+    // Development Hosts). Preserve the observed PIDs so the VS Code adapter can
+    // reconcile them against vscode.window.terminals[*].processId by identity
+    // instead of comparing an unreliable raw process count.
+    let mut vscode_running_shell_pids = initial
         .sessions
         .iter()
         .filter(|session| session.host == TerminalHost::VisualStudioCode)
         .filter(|session| session.pid != caller_shell_pid)
         .filter(|session| session.foreground_command.is_some())
-        .count();
+        .filter_map(|session| session.pid)
+        .collect::<Vec<_>>();
+    vscode_running_shell_pids.sort_unstable();
+    vscode_running_shell_pids.dedup();
 
     let mut captured = Vec::new();
-    if vscode_foreground > 0 {
-        let mut vscode = interrupt_vscode_services(caller_shell_pid, vscode_foreground)?;
-        if vscode.len() != vscode_foreground {
-            return Err(format!(
-                "VS Code returned {} interrupted running command(s), but process discovery observed {vscode_foreground}; save was stopped because the adapter result was incomplete",
-                vscode.len()
-            ));
-        }
+    if !vscode_running_shell_pids.is_empty() {
+        let mut vscode =
+            interrupt_vscode_services(caller_shell_pid, &vscode_running_shell_pids)?;
         captured.append(&mut vscode);
     }
 
@@ -699,7 +702,7 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
 
 fn interrupt_vscode_services(
     caller_shell_pid: Option<u32>,
-    expected_running_services: usize,
+    observed_running_shell_pids: &[u32],
 ) -> Result<Vec<CapturedService>, String> {
     let editor = vscode::load_recent_vscode_state()
         .map_err(|error| format!("could not read live VS Code state: {error}"))?
@@ -714,7 +717,7 @@ fn interrupt_vscode_services(
             "terminal_control": {
                 "action": "interrupt-running-services",
                 "caller_shell_pid": caller_shell_pid,
-                "expected_running_services": expected_running_services,
+                "observed_running_shell_pids": observed_running_shell_pids,
             }
         }),
     )
