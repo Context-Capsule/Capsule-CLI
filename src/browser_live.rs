@@ -316,16 +316,16 @@ mod tests {
     #[test]
     fn only_browser_style_native_arguments_can_prove_liveness() {
         assert!(is_native_messaging_arguments(&[
-            format!(r"C:\runtime\{NATIVE_HOST_NAME}.json"),
+            format!("/runtime/{NATIVE_HOST_NAME}.json"),
             FIREFOX_EXTENSION_ID.to_owned(),
         ]));
         assert!(!is_native_messaging_arguments(&[]));
         assert!(!is_native_messaging_arguments(&[
-            format!(r"C:\runtime\{NATIVE_HOST_NAME}.json"),
+            format!("/runtime/{NATIVE_HOST_NAME}.json"),
             "wrong@extension.invalid".to_owned(),
         ]));
         assert!(!is_native_messaging_arguments(&[
-            r"C:\runtime\other-host.json".to_owned(),
+            "/runtime/other-host.json".to_owned(),
             FIREFOX_EXTENSION_ID.to_owned(),
         ]));
     }
