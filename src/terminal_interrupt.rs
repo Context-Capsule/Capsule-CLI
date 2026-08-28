@@ -15,7 +15,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn caller_ancestry_script(caller_pid: u32) -> String {
     format!(
-        r#"$ErrorActionPreference='Stop'; $current=[uint32]{caller_pid}; $seen=@{{}}; $items=if(Get-Command Get-CimInstance -ErrorAction SilentlyContinue){{Get-CimInstance Win32_Process}}{{Get-WmiObject Win32_Process}}; $byPid=@{{}}; foreach($item in $items){{$byPid[[uint32]$item.ProcessId]=$item}}; for($i=0;$i -lt 32;$i++){{if($seen.ContainsKey($current)){{break}}; $seen[$current]=$true; $p=$byPid[$current]; if(-not $p){{break}}; $name=([string]$p.Name).ToLowerInvariant(); if($name -in @('pwsh.exe','powershell.exe','cmd.exe','bash.exe','zsh.exe','fish.exe','nu.exe','nushell.exe','sh.exe')){{[Console]::WriteLine([uint32]$p.ProcessId); break}}; $current=[uint32]$p.ParentProcessId}}"#
+        r#"$ErrorActionPreference='Stop'; $current=[uint32]{caller_pid}; $seen=@{{}}; $items=if(Get-Command Get-CimInstance -ErrorAction SilentlyContinue){{Get-CimInstance -ClassName Win32_Process}}{{Get-WmiObject -Class Win32_Process}}; $byPid=@{{}}; foreach($item in $items){{$pidKey=[uint32]$item.ProcessId; $byPid[$pidKey]=$item}}; for($i=0;$i -lt 32;$i++){{if($seen.ContainsKey($current)){{break}}; $seen[$current]=$true; $p=$byPid[$current]; if(-not $p){{break}}; $name=([string]$p.Name).ToLowerInvariant(); if($name -in @('pwsh.exe','powershell.exe','cmd.exe','bash.exe','zsh.exe','fish.exe','nu.exe','nushell.exe','sh.exe')){{[Console]::WriteLine([uint32]$p.ProcessId); break}}; $current=[uint32]$p.ParentProcessId}}"#
     )
 }
 
@@ -298,8 +298,9 @@ mod tests {
     fn caller_ancestry_script_uses_inventory_lookup_without_cim_filter_escaping() {
         let script = caller_ancestry_script(4242);
         assert!(script.contains("$current=[uint32]4242"));
-        assert!(script.contains("Get-CimInstance Win32_Process"));
-        assert!(script.contains("Get-WmiObject Win32_Process"));
+        assert!(script.contains("Get-CimInstance -ClassName Win32_Process"));
+        assert!(script.contains("Get-WmiObject -Class Win32_Process"));
+        assert!(script.contains("$pidKey=[uint32]$item.ProcessId"));
         assert!(script.contains("$p=$byPid[$current]"));
         assert!(!script.contains("-Filter"));
         assert!(!script.contains("\\\""));
