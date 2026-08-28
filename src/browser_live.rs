@@ -28,11 +28,13 @@ const NATIVE_SESSION_PREFIX: &str = "firefox-native-session-";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NativeSessionHeartbeat {
     pid: u32,
+    started_at_unix_ms: i64,
     updated_at_unix_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct RuntimeStateEnvelope {
+    updated_at_unix_ms: i64,
     snapshot: FirefoxSnapshot,
 }
 
@@ -46,7 +48,13 @@ impl NativeSessionLease {
     fn start() -> Result<Self, BrowserError> {
         let pid = std::process::id();
         let path = native_session_path(pid)?;
-        write_native_session_heartbeat(&path, pid, now_unix_ms())?;
+        let started_at_unix_ms = now_unix_ms();
+        write_native_session_heartbeat(
+            &path,
+            pid,
+            started_at_unix_ms,
+            started_at_unix_ms,
+        )?;
 
         let worker_path = path.clone();
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -59,6 +67,7 @@ impl NativeSessionLease {
                         let _ = write_native_session_heartbeat(
                             &worker_path,
                             pid,
+                            started_at_unix_ms,
                             now_unix_ms(),
                         );
                     }
@@ -120,32 +129,33 @@ pub fn run_native_host() -> Result<(), BrowserError> {
 
 /// Returns the latest validated Firefox/Zen semantic snapshot.
 ///
-/// The historical 90-second snapshot age rule remains the default. If that
-/// rule reports the state as stale, an older snapshot is accepted only while a
-/// currently running native-host session has a fresh liveness lease. This
-/// separates "the browser state did not change" from "the adapter is gone".
+/// The historical 90-second snapshot age rule remains the compatibility
+/// fallback when no native-session lease is available. While a current native
+/// session is proven, however, the semantic state must have been published at
+/// or after the newest live session started. That prevents a previous Zen
+/// session's still-fresh `firefox.json` from being mistaken for the newly
+/// connected browser before its extension has published current tabs.
 pub fn load_recent_firefox_state() -> Result<Option<FirefoxSnapshot>, BrowserError> {
-    match base::load_recent_firefox_state()? {
-        Some(snapshot) => return Ok(Some(snapshot)),
-        None => {}
-    }
-
     let state_path = runtime_state_path()?;
-    if !has_live_native_session_for_state(&state_path, now_unix_ms())? {
-        return Ok(None);
-    }
+    let now_ms = now_unix_ms();
+    let Some(session_started_at) = newest_live_native_session_for_state(&state_path, now_ms)? else {
+        return base::load_recent_firefox_state();
+    };
 
-    // A newly connected extension publishes state immediately, but process
-    // scheduling can still put the CLI preflight a few milliseconds ahead of
-    // that first update. Wait only when a real live native session is already
-    // proven, and keep the grace window bounded so missing/broken adapters fail
-    // quickly instead of masking the completeness guard.
+    // The extension publishes state immediately on native reconnect. Process
+    // scheduling can still put CLI preflight slightly ahead of that update, so
+    // wait only while a real live native session is already proven and keep the
+    // grace bounded. A broken/missing adapter therefore still fails quickly.
     let deadline = Instant::now() + NATIVE_SESSION_SYNC_GRACE;
     loop {
-        match load_validated_state_ignoring_age(&state_path)? {
-            Some(snapshot) => return Ok(Some(snapshot)),
-            None if Instant::now() < deadline => thread::sleep(NATIVE_SESSION_SYNC_POLL),
-            None => return Ok(None),
+        match load_validated_state_envelope(&state_path)? {
+            Some(envelope) if envelope.updated_at_unix_ms >= session_started_at => {
+                return Ok(Some(envelope.snapshot));
+            }
+            Some(_) | None if Instant::now() < deadline => {
+                thread::sleep(NATIVE_SESSION_SYNC_POLL)
+            }
+            Some(_) | None => return Ok(None),
         }
     }
 }
@@ -178,6 +188,7 @@ fn native_session_path(pid: u32) -> Result<PathBuf, BrowserError> {
 fn write_native_session_heartbeat(
     path: &Path,
     pid: u32,
+    started_at_unix_ms: i64,
     updated_at_unix_ms: i64,
 ) -> Result<(), BrowserError> {
     if let Some(parent) = path.parent() {
@@ -185,6 +196,7 @@ fn write_native_session_heartbeat(
     }
     let heartbeat = NativeSessionHeartbeat {
         pid,
+        started_at_unix_ms,
         updated_at_unix_ms,
     };
     let bytes = serde_json::to_vec(&heartbeat)?;
@@ -197,25 +209,28 @@ fn write_native_session_heartbeat(
     Ok(())
 }
 
-fn has_live_native_session_for_state(
+fn newest_live_native_session_for_state(
     state_path: &Path,
     now_ms: i64,
-) -> Result<bool, BrowserError> {
+) -> Result<Option<i64>, BrowserError> {
     let Some(directory) = state_path.parent() else {
-        return Ok(false);
+        return Ok(None);
     };
-    has_live_native_session_in(directory, now_ms)
+    newest_live_native_session_in(directory, now_ms)
 }
 
-fn has_live_native_session_in(directory: &Path, now_ms: i64) -> Result<bool, BrowserError> {
+fn newest_live_native_session_in(
+    directory: &Path,
+    now_ms: i64,
+) -> Result<Option<i64>, BrowserError> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(BrowserError::Io(error)),
     };
 
     let max_age_ms = NATIVE_SESSION_MAX_AGE.as_millis() as i64;
-    let mut live = false;
+    let mut newest_started_at = None::<i64>;
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -234,17 +249,21 @@ fn has_live_native_session_in(directory: &Path, now_ms: i64) -> Result<bool, Bro
         };
         let age_ms = now_ms.saturating_sub(heartbeat.updated_at_unix_ms);
         if age_ms <= max_age_ms {
-            live = true;
+            newest_started_at = Some(
+                newest_started_at
+                    .map(|value| value.max(heartbeat.started_at_unix_ms))
+                    .unwrap_or(heartbeat.started_at_unix_ms),
+            );
         } else {
             let _ = fs::remove_file(path);
         }
     }
-    Ok(live)
+    Ok(newest_started_at)
 }
 
-fn load_validated_state_ignoring_age(
+fn load_validated_state_envelope(
     path: &Path,
-) -> Result<Option<FirefoxSnapshot>, BrowserError> {
+) -> Result<Option<RuntimeStateEnvelope>, BrowserError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -252,7 +271,7 @@ fn load_validated_state_ignoring_age(
     };
     let envelope: RuntimeStateEnvelope = serde_json::from_slice(&bytes)?;
     validate_snapshot(&envelope.snapshot)?;
-    Ok(Some(envelope.snapshot))
+    Ok(Some(envelope))
 }
 
 fn validate_snapshot(snapshot: &FirefoxSnapshot) -> Result<(), BrowserError> {
@@ -331,21 +350,28 @@ mod tests {
     }
 
     #[test]
-    fn live_native_session_is_recognized_and_stale_lease_is_removed() {
+    fn newest_live_session_is_returned_and_stale_lease_is_removed() {
         let directory = temp_dir("lease");
         fs::create_dir_all(&directory).unwrap();
-        let live = directory.join(format!("{NATIVE_SESSION_PREFIX}10.json"));
-        let stale = directory.join(format!("{NATIVE_SESSION_PREFIX}11.json"));
-        write_native_session_heartbeat(&live, 10, 100_000).unwrap();
+        let first = directory.join(format!("{NATIVE_SESSION_PREFIX}10.json"));
+        let newest = directory.join(format!("{NATIVE_SESSION_PREFIX}11.json"));
+        let stale = directory.join(format!("{NATIVE_SESSION_PREFIX}12.json"));
+        write_native_session_heartbeat(&first, 10, 80_000, 99_000).unwrap();
+        write_native_session_heartbeat(&newest, 11, 90_000, 99_500).unwrap();
         write_native_session_heartbeat(
             &stale,
-            11,
+            12,
+            95_000,
             100_000 - NATIVE_SESSION_MAX_AGE.as_millis() as i64 - 1,
         )
         .unwrap();
 
-        assert!(has_live_native_session_in(&directory, 100_000).unwrap());
-        assert!(live.exists());
+        assert_eq!(
+            newest_live_native_session_in(&directory, 100_000).unwrap(),
+            Some(90_000)
+        );
+        assert!(first.exists());
+        assert!(newest.exists());
         assert!(!stale.exists());
         let _ = fs::remove_dir_all(directory);
     }
@@ -358,36 +384,43 @@ mod tests {
         write_native_session_heartbeat(
             &stale,
             12,
+            80_000,
             100_000 - NATIVE_SESSION_MAX_AGE.as_millis() as i64 - 1,
         )
         .unwrap();
-        assert!(!has_live_native_session_in(&directory, 100_000).unwrap());
+        assert_eq!(
+            newest_live_native_session_in(&directory, 100_000).unwrap(),
+            None
+        );
         assert!(!stale.exists());
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn stale_state_fallback_still_validates_snapshot_payload() {
+    fn semantic_state_envelope_preserves_update_time_for_session_binding() {
         let directory = temp_dir("state");
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("firefox.json");
         fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({
-                "updated_at_unix_ms": 1,
+                "updated_at_unix_ms": 42,
                 "snapshot": sample_snapshot(),
             }))
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            load_validated_state_ignoring_age(&path)
-                .unwrap()
-                .unwrap()
-                .browser,
-            "firefox"
-        );
+        let envelope = load_validated_state_envelope(&path).unwrap().unwrap();
+        assert_eq!(envelope.updated_at_unix_ms, 42);
+        assert_eq!(envelope.snapshot.browser, "firefox");
+        let _ = fs::remove_dir_all(directory);
+    }
 
+    #[test]
+    fn stale_state_fallback_still_validates_snapshot_payload() {
+        let directory = temp_dir("invalid-state");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("firefox.json");
         fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({
@@ -404,7 +437,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(load_validated_state_ignoring_age(&path).is_err());
+        assert!(load_validated_state_envelope(&path).is_err());
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -413,7 +446,7 @@ mod tests {
         let directory = temp_dir("missing");
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("firefox.json");
-        assert!(load_validated_state_ignoring_age(&path).unwrap().is_none());
+        assert!(load_validated_state_envelope(&path).unwrap().is_none());
         let _ = fs::remove_dir_all(directory);
     }
 }
