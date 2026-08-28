@@ -92,7 +92,8 @@ fn recent_psreadline_history() -> Option<Vec<String>> {
     file.seek(SeekFrom::Start(start)).ok()?;
 
     let mut bytes = Vec::with_capacity((length - start).min(MAX_HISTORY_BYTES) as usize);
-    file.take(MAX_HISTORY_BYTES).read_to_end(&mut bytes).ok()?;
+    let mut limited = file.take(MAX_HISTORY_BYTES);
+    limited.read_to_end(&mut bytes).ok()?;
     if bytes.is_empty() {
         return None;
     }
@@ -120,33 +121,26 @@ fn recent_psreadline_history() -> Option<Vec<String>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandToken {
     value: String,
-    raw_start: usize,
-    raw_end: usize,
 }
 
 fn tokenize_command_line(text: &str) -> Vec<CommandToken> {
     let mut tokens = Vec::new();
     let mut value = String::new();
-    let mut start = None;
-    let mut end = 0usize;
+    let mut started = false;
     let mut quote = None;
 
-    for (index, ch) in text.char_indices() {
+    for ch in text.chars() {
         if quote.is_none() && ch.is_whitespace() {
-            if let Some(raw_start) = start.take() {
+            if started {
                 tokens.push(CommandToken {
                     value: std::mem::take(&mut value),
-                    raw_start,
-                    raw_end: end,
                 });
+                started = false;
             }
             continue;
         }
 
-        if start.is_none() {
-            start = Some(index);
-        }
-        end = index + ch.len_utf8();
+        started = true;
         match quote {
             Some(active) if ch == active => quote = None,
             Some(_) => value.push(ch),
@@ -155,12 +149,8 @@ fn tokenize_command_line(text: &str) -> Vec<CommandToken> {
         }
     }
 
-    if let Some(raw_start) = start {
-        tokens.push(CommandToken {
-            value,
-            raw_start,
-            raw_end: end,
-        });
+    if started {
+        tokens.push(CommandToken { value });
     }
     tokens
 }
@@ -176,7 +166,9 @@ fn executable_key(value: &str) -> String {
 
 fn is_bare_executable_token(value: &str) -> bool {
     !value.is_empty()
-        && !value.contains(['\\', '/', ':'])
+        && !value.contains('\\')
+        && !value.contains('/')
+        && !value.contains(':')
         && !value.starts_with('.')
         && value
             .chars()
