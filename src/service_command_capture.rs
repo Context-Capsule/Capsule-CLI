@@ -164,7 +164,9 @@ fn executable_key(value: &str) -> String {
 
 fn is_bare_executable_token(value: &str) -> bool {
     !value.is_empty()
-        && !value.contains(['\\', '/', ':'])
+        && !value.contains('\\')
+        && !value.contains('/')
+        && !value.contains(':')
         && !value.starts_with('.')
         && value
             .chars()
