@@ -287,16 +287,8 @@ fn apply_exact_directory(
     previous_source: WorkingDirectorySource,
 ) {
     session.working_directory = Some(directory.clone());
-    // `WindowsTerminalState` is the existing serialized trust marker for an
-    // exact PowerShell location. The provenance log distinguishes whether that
-    // exact value came from Windows Terminal metadata, the runspace API, or the
-    // guarded Windows Terminal UI fallback without changing the snapshot schema.
     session.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
 
-    // Standalone PowerShell restart plans are launched directly with
-    // Command::current_dir. The legacy process-CWD enrichment runs before the
-    // exact runspace probe, so replace any stale Win32 fallback in the restart
-    // plan with the actual PowerShell $PWD selected above.
     if session.host != TerminalHost::WindowsTerminal {
         if let Some(restart) = session.restart.as_mut() {
             if direct_powershell_executable(&restart.executable) {
