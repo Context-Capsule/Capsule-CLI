@@ -13,12 +13,16 @@ const HELPER_COMMAND: &str = "__capsule-console-control";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+fn caller_ancestry_script(caller_pid: u32) -> String {
+    format!(
+        r#"$ErrorActionPreference='Stop'; $current=[uint32]{caller_pid}; $seen=@{{}}; $items=if(Get-Command Get-CimInstance -ErrorAction SilentlyContinue){{Get-CimInstance Win32_Process}}{{Get-WmiObject Win32_Process}}; $byPid=@{{}}; foreach($item in $items){{$byPid[[uint32]$item.ProcessId]=$item}}; for($i=0;$i -lt 32;$i++){{if($seen.ContainsKey($current)){{break}}; $seen[$current]=$true; $p=$byPid[$current]; if(-not $p){{break}}; $name=([string]$p.Name).ToLowerInvariant(); if($name -in @('pwsh.exe','powershell.exe','cmd.exe','bash.exe','zsh.exe','fish.exe','nu.exe','nushell.exe','sh.exe')){{[Console]::WriteLine([uint32]$p.ProcessId); break}}; $current=[uint32]$p.ParentProcessId}}"#
+    )
+}
+
 pub fn caller_shell_pid(caller_pid: u32) -> Result<Option<u32>, String> {
     #[cfg(windows)]
     {
-        let script = format!(
-            r#"$ErrorActionPreference='Stop'; $current={caller_pid}; $seen=@{{}}; for($i=0;$i -lt 32;$i++) {{ if($seen.ContainsKey($current)){{break}}; $seen[$current]=$true; $p=Get-CimInstance Win32_Process -Filter \"ProcessId=$current\"; if(-not $p){{break}}; $name=([string]$p.Name).ToLowerInvariant(); if($name -in @('pwsh.exe','powershell.exe','cmd.exe','bash.exe','zsh.exe','fish.exe','nu.exe','nushell.exe','sh.exe')){{ [Console]::WriteLine($p.ProcessId); break }}; $current=[uint32]$p.ParentProcessId }}"#
-        );
+        let script = caller_ancestry_script(caller_pid);
         let output = Command::new("powershell.exe")
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
             .creation_flags(CREATE_NO_WINDOW)
@@ -289,6 +293,17 @@ fn write_console_input(pid: u32, command: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_ancestry_script_uses_inventory_lookup_without_cim_filter_escaping() {
+        let script = caller_ancestry_script(4242);
+        assert!(script.contains("$current=[uint32]4242"));
+        assert!(script.contains("Get-CimInstance Win32_Process"));
+        assert!(script.contains("Get-WmiObject Win32_Process"));
+        assert!(script.contains("$p=$byPid[$current]"));
+        assert!(!script.contains("-Filter"));
+        assert!(!script.contains("\\\""));
+    }
 
     #[test]
     fn helper_rejects_bad_pid_without_touching_a_console() {
