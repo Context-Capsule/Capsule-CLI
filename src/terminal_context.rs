@@ -423,24 +423,26 @@ mod tests {
 
     #[test]
     fn standalone_powershell_exact_cwd_replaces_process_fallback_and_restart_directory() {
-        let mut snapshot = snapshot_with(fake_standalone_powershell(TerminalHost::Unknown));
-        enrich_exact_powershell_locations_with(&mut snapshot, "test", |session| {
-            (session.pid == Some(42)).then(|| r"D:\actual-project".to_owned())
-        });
+        for host in [TerminalHost::Unknown, TerminalHost::ConsoleHost] {
+            let mut snapshot = snapshot_with(fake_standalone_powershell(host));
+            enrich_exact_powershell_locations_with(&mut snapshot, "test", |session| {
+                (session.pid == Some(42)).then(|| r"D:\actual-project".to_owned())
+            });
 
-        let session = &snapshot.sessions[0];
-        assert_eq!(session.working_directory.as_deref(), Some(r"D:\actual-project"));
-        assert_eq!(
-            session
-                .restart
-                .as_ref()
-                .and_then(|plan| plan.working_directory.as_deref()),
-            Some(r"D:\actual-project")
-        );
-        assert_eq!(
-            session.working_directory_source,
-            WorkingDirectorySource::WindowsTerminalState
-        );
+            let session = &snapshot.sessions[0];
+            assert_eq!(session.working_directory.as_deref(), Some(r"D:\actual-project"));
+            assert_eq!(
+                session
+                    .restart
+                    .as_ref()
+                    .and_then(|plan| plan.working_directory.as_deref()),
+                Some(r"D:\actual-project")
+            );
+            assert_eq!(
+                session.working_directory_source,
+                WorkingDirectorySource::WindowsTerminalState
+            );
+        }
     }
 
     #[test]
