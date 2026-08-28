@@ -4,6 +4,11 @@
 // mirror structs distinct module-local types. The library crate already carries
 // this allowance; the standalone worker crate needs the same crate-level policy.
 #![allow(clashing_extern_declarations)]
+// The compatibility worker includes the full mature CLI module graph, so some
+// library/test entry points are intentionally unreachable from this binary.
+// Keep the allowance local to this worker instead of suppressing dead-code
+// diagnostics for the library or public CLI crate.
+#![allow(dead_code)]
 
 #[cfg(windows)]
 mod windows_snap;
