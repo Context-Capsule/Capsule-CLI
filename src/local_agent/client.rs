@@ -178,39 +178,64 @@ fn prepare_service_decisions(
         current_directory: invocation.current_directory.clone(),
         environment: invocation.environment.clone(),
     };
-    let response = match request(
+    let response = request(
         state,
         AgentAction::Execute {
             invocation: plan_invocation,
         },
         Duration::from_secs(15),
-    ) {
-        Ok(response) if response.ok && response.exit_code == 0 => response,
-        _ => return Ok(None),
-    };
-    let plan: ServicePlan = match serde_json::from_str(response.stdout.trim()) {
-        Ok(plan) => plan,
-        Err(_) => return Ok(None),
-    };
+    )
+    .map_err(|error| {
+        AgentError::Runtime(format!(
+            "could not prepare saved-service restart prompts before restore: {error}"
+        ))
+    })?;
+    if !response.ok || response.exit_code != 0 {
+        let detail = response
+            .error
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                let stderr = response.stderr.trim();
+                (!stderr.is_empty()).then_some(stderr)
+            })
+            .unwrap_or("the service-plan worker did not return a successful plan");
+        return Err(AgentError::Runtime(format!(
+            "could not prepare saved-service restart prompts before restore: {detail}"
+        )));
+    }
+    let plan: ServicePlan = serde_json::from_str(response.stdout.trim()).map_err(|error| {
+        AgentError::Protocol(format!(
+            "saved-service restart plan was invalid and restore was stopped before silently skipping services: {error}"
+        ))
+    })?;
     if plan.services.is_empty() {
         return Ok(None);
     }
 
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    // Only stdin needs to be interactive in order to ask the user. Requiring
+    // stdout to also be a terminal wrongly suppresses prompts under wrappers
+    // such as `cargo run` or when output is tee'd/redirected while input still
+    // comes from a real console.
+    let interactive = io::stdin().is_terminal();
     let mut decisions = Vec::new();
     let mut skipped_noninteractive = false;
     for service in &plan.services {
         if service.restart_policy == RestartPolicy::Always {
             continue;
         }
-        if !interactive {
+        let decision = if interactive {
+            if let Some(pre_start) = service.pre_start_command.as_deref() {
+                println!("  pre-start: {pre_start}");
+            }
+            prompt_service_decision(&service.command)?
+        } else {
             skipped_noninteractive = true;
-            continue;
-        }
-        if let Some(pre_start) = service.pre_start_command.as_deref() {
-            println!("  pre-start: {pre_start}");
-        }
-        let decision = prompt_service_decision(&service.command)?;
+            // Make the safe fallback explicit in the decision file rather than
+            // omitting the file and relying on the worker's missing-decision
+            // fallback. This keeps public-CLI behavior deterministic.
+            RestoreDecisionKind::Skip
+        };
         decisions.push(RestoreDecision {
             service_index: service.service_index,
             decision,
@@ -218,7 +243,7 @@ fn prepare_service_decisions(
     }
     if skipped_noninteractive {
         eprintln!(
-            "warning: saved service restart prompts were skipped because stdin/stdout are not interactive; services configured as Always still start"
+            "warning: saved service restart prompts were skipped because stdin is not interactive; Ask services were explicitly skipped and services configured as Always still start"
         );
     }
     if decisions.is_empty() {
