@@ -149,9 +149,27 @@ const KEY_EVENT: u16 = 0x0001;
 #[cfg(windows)]
 const VK_RETURN: u16 = 0x000D;
 #[cfg(windows)]
-const STD_INPUT_HANDLE: u32 = (-10_i32) as u32;
+const GENERIC_READ: u32 = 0x8000_0000;
+#[cfg(windows)]
+const GENERIC_WRITE: u32 = 0x4000_0000;
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+#[cfg(windows)]
+const OPEN_EXISTING: u32 = 3;
 #[cfg(windows)]
 const INVALID_HANDLE_VALUE: Handle = (-1_isize) as Handle;
+#[cfg(windows)]
+const CONSOLE_INPUT_NAME: [u16; 7] = [
+    b'C' as u16,
+    b'O' as u16,
+    b'N' as u16,
+    b'I' as u16,
+    b'N' as u16,
+    b'$' as u16,
+    0,
+];
 
 #[cfg(windows)]
 #[repr(C)]
@@ -198,7 +216,16 @@ unsafe extern "system" {
         handler: Option<unsafe extern "system" fn(u32) -> i32>,
         add: i32,
     ) -> i32;
-    fn GetStdHandle(std_handle: u32) -> Handle;
+    fn CreateFileW(
+        file_name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *mut c_void,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        template_file: Handle,
+    ) -> Handle;
+    fn CloseHandle(object: Handle) -> i32;
     fn WriteConsoleInputW(
         console_input: Handle,
         buffer: *const InputRecord,
@@ -255,35 +282,79 @@ fn key_record(unit: u16, down: bool) -> InputRecord {
 }
 
 #[cfg(windows)]
-fn write_console_input(pid: u32, command: &str) -> Result<(), String> {
-    attach_console(pid)?;
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        unsafe {
-            let _ = FreeConsole();
-        }
-        return Err(format!("terminal shell PID {pid} has no writable console input handle"));
-    }
-
+fn console_input_records(command: &str) -> Vec<InputRecord> {
     let mut records = Vec::new();
     for unit in command.encode_utf16().chain(std::iter::once(b'\r' as u16)) {
         records.push(key_record(unit, true));
         records.push(key_record(unit, false));
     }
+    records
+}
+
+#[cfg(windows)]
+fn open_console_input(pid: u32) -> Result<Handle, String> {
+    let handle = unsafe {
+        CreateFileW(
+            CONSOLE_INPUT_NAME.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return Err(format!(
+            "could not open CONIN$ for terminal shell PID {pid}: {error}"
+        ));
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn write_console_input(pid: u32, command: &str) -> Result<(), String> {
+    attach_console(pid)?;
+    let handle = match open_console_input(pid) {
+        Ok(handle) => handle,
+        Err(error) => {
+            unsafe {
+                let _ = FreeConsole();
+            }
+            return Err(error);
+        }
+    };
+
+    let records = console_input_records(command);
     let mut written = 0_u32;
     let ok = unsafe {
-        let result = WriteConsoleInputW(
+        WriteConsoleInputW(
             handle,
             records.as_ptr(),
             records.len().min(u32::MAX as usize) as u32,
             &mut written,
-        );
-        let _ = FreeConsole();
-        result
+        )
     };
-    if ok == 0 || written as usize != records.len() {
+    let write_error = if ok == 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+        let _ = FreeConsole();
+    }
+
+    if let Some(error) = write_error {
         return Err(format!(
-            "could not write restart command to terminal shell PID {pid} ({written}/{} input events written)",
+            "could not write restart command to terminal shell PID {pid} using CONIN$: {error} ({written}/{} input events written)",
+            records.len()
+        ));
+    }
+    if written as usize != records.len() {
+        return Err(format!(
+            "could not write complete restart command to terminal shell PID {pid} using CONIN$ ({written}/{} input events written)",
             records.len()
         ));
     }
@@ -299,7 +370,7 @@ mod tests {
         let script = caller_ancestry_script(4242);
         assert!(script.contains("$current=[uint32]4242"));
         assert!(script.contains("Get-CimInstance -ClassName Win32_Process"));
-        assert!(script.contains("Get-WmiObject -Class Win32_Process"));
+        assert!(script.contains("Get-WmiObject -ClassName Win32_Process"));
         assert!(script.contains("$pidKey=[uint32]$item.ProcessId"));
         assert!(script.contains("$p=$byPid[$current]"));
         assert!(!script.contains("-Filter"));
@@ -321,5 +392,25 @@ mod tests {
     #[test]
     fn send_text_rejects_control_characters_before_spawning_helper() {
         assert!(send_text(42, "npm start\nsecond").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_text_encodes_key_down_up_pairs_and_enter() {
+        let records = console_input_records("ab");
+        assert_eq!(records.len(), 6);
+        unsafe {
+            assert_eq!(records[0].event.key_event.key_down, 1);
+            assert_eq!(records[1].event.key_event.key_down, 0);
+            assert_eq!(records[4].event.key_event.virtual_key_code, VK_RETURN);
+            assert_eq!(records[5].event.key_event.virtual_key_code, VK_RETURN);
+            assert_eq!(records[4].event.key_event.character.unicode_char, b'\r' as u16);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_input_name_is_null_terminated_conin() {
+        assert_eq!(CONSOLE_INPUT_NAME, [67, 79, 78, 73, 78, 36, 0]);
     }
 }
