@@ -6,6 +6,7 @@
 extern crate self as context_capsule;
 
 pub mod adapters;
+#[path = "browser_live.rs"]
 pub mod browser;
 pub mod chrome;
 pub mod cleanup;
