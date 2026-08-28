@@ -937,7 +937,7 @@ fn start_vscode_services(
 }
 
 fn service_matches_terminal(service: &SavedService, session: &TerminalSession) -> bool {
-    if wire_host(&session.host) != service.host
+    if !service_host_matches(&service.host, &session.host)
         || !session.shell.as_str().eq_ignore_ascii_case(&service.shell)
     {
         return false;
@@ -961,6 +961,16 @@ fn service_matches_terminal(service: &SavedService, session: &TerminalSession) -
         }
     }
     true
+}
+
+fn service_host_matches(saved_host: &str, current_host: &TerminalHost) -> bool {
+    let saved = saved_host.trim().to_ascii_lowercase();
+    let current = wire_host(current_host).to_ascii_lowercase();
+    saved == current
+        || matches!(
+            (saved.as_str(), current.as_str()),
+            ("unknown", "console-host") | ("console-host", "unknown")
+        )
 }
 
 fn load_decisions(plan: &ServicePlan) -> Vec<(u32, RestoreDecisionKind)> {
@@ -1194,5 +1204,14 @@ mod tests {
     #[test]
     fn path_matching_is_case_and_separator_insensitive_on_windows_style_paths() {
         assert!(paths_equivalent("C:/Work/TriUp/", "c:\\work\\triup"));
+    }
+
+    #[test]
+    fn external_service_host_matching_accepts_only_unknown_console_host_alias() {
+        assert!(service_host_matches("unknown", &TerminalHost::ConsoleHost));
+        assert!(service_host_matches("console-host", &TerminalHost::Unknown));
+        assert!(service_host_matches("unknown", &TerminalHost::Unknown));
+        assert!(!service_host_matches("unknown", &TerminalHost::WindowsTerminal));
+        assert!(!service_host_matches("console-host", &TerminalHost::VisualStudioCode));
     }
 }
