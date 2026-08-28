@@ -3,10 +3,12 @@ mod terminal_context;
 
 use crate::{
     adapters::terminal::{self, TerminalEnvironment, TerminalHost, TerminalSession},
-    commands, persistence,
+    commands, discovery,
+    desktop::ApplicationInfo,
+    persistence, snapshot,
 };
 use context_capsule::{
-    restore_bus,
+    browser, restore_bus,
     service_policy::{
         CALLER_PID_ENV, RestartPolicy, RestoreDecisionFile, RestoreDecisionKind, SavedService,
         ServicePlan, ServiceSource, SERVICE_DECISIONS_ENV, combined_command,
@@ -309,6 +311,20 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
         return commands::save(clean_arguments);
     };
 
+    let ignored_applications = match force_save_ignored_applications(&clean_arguments) {
+        Ok(values) => values,
+        Err(error) => {
+            eprintln!("error: --cli-force preflight: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("--cli-force: checking save prerequisites before stopping terminal services...");
+    if let Err(error) = preflight_force_save(&ignored_applications) {
+        eprintln!("error: --cli-force preflight: {error}");
+        eprintln!("  no terminal service was interrupted");
+        return ExitCode::from(1);
+    }
+
     println!("--cli-force: capturing running terminal commands before workspace discovery...");
     let captured = match capture_and_interrupt_services() {
         Ok(captured) => captured,
@@ -322,9 +338,10 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
     if result != ExitCode::SUCCESS {
         if !captured.is_empty() {
             eprintln!(
-                "warning: {} terminal service(s) were interrupted before the save failed; Context Capsule did not create restart-policy metadata for an unsuccessful save",
+                "warning: save failed after {} terminal service(s) were interrupted; attempting to resume them now",
                 captured.len()
             );
+            resume_interrupted_services(&captured);
         }
         return result;
     }
@@ -623,6 +640,90 @@ pub fn command(arguments: Vec<String>) -> ExitCode {
     }
 }
 
+fn force_save_ignored_applications(arguments: &[String]) -> Result<Vec<String>, String> {
+    let mut ignored = Vec::new();
+    let mut index = 0usize;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--ignore-app" => {
+                index += 1;
+                let Some(selector) = arguments.get(index) else {
+                    return Err("--ignore-app requires an application name, executable, path, or AUMID".to_owned());
+                };
+                if selector.trim().is_empty() || selector.starts_with('-') {
+                    return Err("--ignore-app requires an application name, executable, path, or AUMID".to_owned());
+                }
+                ignored.push(selector.clone());
+            }
+            value if value.starts_with("--ignore-app=") => {
+                let selector = value.trim_start_matches("--ignore-app=").trim();
+                if selector.is_empty() {
+                    return Err("--ignore-app requires a non-empty selector".to_owned());
+                }
+                ignored.push(selector.to_owned());
+            }
+            "-m" | "--message" => {
+                index += 1;
+                if index >= arguments.len() {
+                    return Err("-m/--message requires a continuation note".to_owned());
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(ignored)
+}
+
+fn preflight_force_save(ignored_applications: &[String]) -> Result<(), String> {
+    let discovered = discovery::discover(true, true, true, true)
+        .map_err(|error| format!("discovery failed: {error}"))?;
+    let ignored_names = snapshot::validate_ignored_applications(&discovered, ignored_applications)?;
+    let desktop = discovered
+        .desktop
+        .as_ref()
+        .map_err(|error| format!("desktop discovery is unavailable: {error}"))?;
+    let running_firefox = desktop
+        .applications
+        .iter()
+        .filter(|application| is_firefox_family_application(application))
+        .filter(|application| {
+            !ignored_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&application.name))
+        })
+        .count();
+    if running_firefox == 0 {
+        return Ok(());
+    }
+
+    match browser::load_recent_firefox_state() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(
+            "Zen/Firefox is running, but no fresh semantic browser state is available. Context Capsule refused to save an incomplete capsule because it would not be able to restore missing browser tabs. Ensure the Context Capsule browser extension is installed and connected to the native host, then save again (or explicitly --ignore-app Zen/Firefox)."
+                .to_owned(),
+        ),
+        Err(error) => Err(format!(
+            "Zen/Firefox is running, but its semantic browser state could not be captured: {error}. Context Capsule refused to save an incomplete capsule."
+        )),
+    }
+}
+
+fn is_firefox_family_application(application: &ApplicationInfo) -> bool {
+    if ["zen", "Zen Browser", "zen.exe", "firefox", "Mozilla Firefox", "firefox.exe"]
+        .iter()
+        .any(|value| application.name.eq_ignore_ascii_case(value))
+    {
+        return true;
+    }
+    application
+        .executable_path
+        .as_deref()
+        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .and_then(|path| path.rsplit(['\\', '/']).find(|part| !part.is_empty()))
+        .is_some_and(|name| matches!(name.to_ascii_lowercase().as_str(), "zen.exe" | "zen" | "firefox.exe" | "firefox"))
+}
+
 fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
     let caller_pid = env::var(CALLER_PID_ENV)
         .ok()
@@ -704,12 +805,18 @@ fn interrupt_vscode_services(
     caller_shell_pid: Option<u32>,
     observed_running_shell_pids: &[u32],
 ) -> Result<Vec<CapturedService>, String> {
-    let editor = vscode::load_recent_vscode_state()
+    let editor = match vscode::load_recent_vscode_state()
         .map_err(|error| format!("could not read live VS Code state: {error}"))?
-        .ok_or_else(|| {
-            "a VS Code terminal has a running command, but no fresh Context Capsule VS Code adapter state is available"
-                .to_owned()
-        })?;
+    {
+        Some(editor) => editor,
+        None => {
+            eprintln!(
+                "warning: --cli-force: no fresh Context Capsule VS Code adapter state is available; leaving {} VS Code-descendant running-process observation(s) untouched",
+                observed_running_shell_pids.len()
+            );
+            return Ok(Vec::new());
+        }
+    };
     let request = restore_bus::write_request(
         "vscode",
         json!({
@@ -785,6 +892,88 @@ fn wait_until_shell_idle(pid: u32) -> Result<(), String> {
         }
         thread::sleep(INTERRUPT_POLL);
     }
+}
+
+fn resume_interrupted_services(captured: &[CapturedService]) {
+    let mut resumed = 0usize;
+    let mut failed = 0usize;
+    for service in captured
+        .iter()
+        .filter(|service| service.source == ServiceSource::ExternalTerminal)
+    {
+        let Some(pid) = service.captured_terminal_pid else {
+            failed += 1;
+            eprintln!("  warning: could not resume '{}': original terminal PID is unavailable", service.command);
+            continue;
+        };
+        let current = terminal::discover();
+        let Some(session) = current.sessions.iter().find(|session| session.pid == Some(pid)) else {
+            failed += 1;
+            eprintln!("  warning: could not resume '{}': original terminal PID {pid} is no longer observable", service.command);
+            continue;
+        };
+        if let Some(foreground) = session.foreground_command.as_deref() {
+            failed += 1;
+            eprintln!("  warning: could not resume '{}': terminal PID {pid} is already running '{foreground}'", service.command);
+            continue;
+        }
+        match terminal_interrupt::send_text(pid, &service.command) {
+            Ok(()) => resumed += 1,
+            Err(error) => {
+                failed += 1;
+                eprintln!("  warning: could not resume '{}' in terminal PID {pid}: {error}", service.command);
+            }
+        }
+    }
+
+    let vscode_services = captured
+        .iter()
+        .filter(|service| service.source == ServiceSource::VisualStudioCode)
+        .enumerate()
+        .map(|(index, service)| SavedService {
+            service_index: (index + 1) as u32,
+            source: ServiceSource::VisualStudioCode,
+            host: service.host.clone(),
+            shell: service.shell.clone(),
+            captured_terminal_pid: None,
+            vscode_terminal_index: service.vscode_terminal_index,
+            terminal_name: service.terminal_name.clone(),
+            profile: service.profile.clone(),
+            working_directory: service.working_directory.clone(),
+            command: service.command.clone(),
+            pre_start_command: None,
+            restart_policy: RestartPolicy::Ask,
+        })
+        .collect::<Vec<_>>();
+    if !vscode_services.is_empty() {
+        match vscode::load_recent_vscode_state() {
+            Ok(Some(editor)) => match start_vscode_services_with_editor(editor, &vscode_services) {
+                Ok((changed, warnings)) => {
+                    resumed += changed;
+                    if changed < vscode_services.len() {
+                        failed += vscode_services.len() - changed;
+                    }
+                    for warning in warnings {
+                        eprintln!("  warning: VS Code service recovery: {warning}");
+                    }
+                }
+                Err(error) => {
+                    failed += vscode_services.len();
+                    eprintln!("  warning: could not resume interrupted VS Code services: {error}");
+                }
+            },
+            Ok(None) => {
+                failed += vscode_services.len();
+                eprintln!("  warning: could not resume interrupted VS Code services because the adapter state disappeared");
+            }
+            Err(error) => {
+                failed += vscode_services.len();
+                eprintln!("  warning: could not read VS Code state while resuming interrupted services: {error}");
+            }
+        }
+    }
+
+    eprintln!("  interrupted-service recovery: {resumed} resumed, {failed} failed");
 }
 
 fn finalize_captured_services(
@@ -910,6 +1099,13 @@ fn start_vscode_services(
         .cloned()
         .filter(|value| !value.is_null())
         .ok_or_else(|| "capsule has no semantic VS Code snapshot for saved service restart".to_owned())?;
+    start_vscode_services_with_editor(editor, services)
+}
+
+fn start_vscode_services_with_editor(
+    editor: impl serde::Serialize,
+    services: &[SavedService],
+) -> Result<(usize, Vec<String>), String> {
     let request = restore_bus::write_request(
         "vscode",
         json!({
@@ -1179,6 +1375,29 @@ mod tests {
         assert!(force);
         assert_eq!(name.as_deref(), Some("demo"));
         assert_eq!(clean, vec!["demo", "-m", "continue"]);
+    }
+
+    #[test]
+    fn force_save_preflight_honors_both_ignore_app_forms() {
+        let ignored = force_save_ignored_applications(&[
+            "demo".to_owned(),
+            "--ignore-app".to_owned(),
+            "Zen Browser".to_owned(),
+            "--ignore-app=firefox.exe".to_owned(),
+            "-m".to_owned(),
+            "note".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(ignored, vec!["Zen Browser", "firefox.exe"]);
+    }
+
+    #[test]
+    fn force_save_preflight_rejects_missing_ignore_app_value() {
+        assert!(force_save_ignored_applications(&[
+            "demo".to_owned(),
+            "--ignore-app".to_owned(),
+        ])
+        .is_err());
     }
 
     #[test]
