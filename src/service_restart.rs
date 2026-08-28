@@ -1,5 +1,7 @@
 #[path = "terminal_context.rs"]
 mod terminal_context;
+#[path = "service_command_capture.rs"]
+mod service_command_capture;
 
 use crate::{
     adapters::terminal::{self, TerminalEnvironment, TerminalHost, TerminalSession},
@@ -8,7 +10,7 @@ use crate::{
     persistence, snapshot,
 };
 use context_capsule::{
-    browser, restore_bus,
+    browser, logging, restore_bus,
     service_policy::{
         CALLER_PID_ENV, RestartPolicy, RestoreDecisionFile, RestoreDecisionKind, SavedService,
         ServicePlan, ServiceSource, SERVICE_DECISIONS_ENV, combined_command,
@@ -31,6 +33,10 @@ const VSCODE_CONTROL_TIMEOUT: Duration = Duration::from_secs(12);
 const VSCODE_START_TIMEOUT: Duration = Duration::from_secs(25);
 const INTERRUPT_SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
 const INTERRUPT_POLL: Duration = Duration::from_millis(150);
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(8);
+const SERVICE_START_STABILITY: Duration = Duration::from_millis(650);
+const SERVICE_START_POLL: Duration = Duration::from_millis(125);
+const SERVICE_LOG_COMPONENT: &str = "services";
 
 #[derive(Debug, Clone)]
 struct CapturedService {
@@ -43,6 +49,7 @@ struct CapturedService {
     profile: Option<String>,
     working_directory: Option<String>,
     command: String,
+    execution_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +102,7 @@ impl ServiceStore {
                     profile TEXT,\n\
                     working_directory TEXT,\n\
                     command TEXT NOT NULL,\n\
+                    execution_command TEXT,\n\
                     pre_start_command TEXT,\n\
                     restart_policy TEXT NOT NULL DEFAULT 'ask',\n\
                     updated_at_unix_ms INTEGER NOT NULL,\n\
@@ -105,6 +113,7 @@ impl ServiceStore {
                     ON capsule_terminal_services(capsule_id, revision, service_index);",
             )
             .map_err(|error| format!("SQLite error: {error}"))?;
+        ensure_execution_command_column(&connection)?;
         Ok(Self { connection })
     }
 
@@ -156,7 +165,7 @@ impl ServiceStore {
             .prepare(
                 "SELECT service_index, source, host, shell, captured_terminal_pid,\n\
                         vscode_terminal_index, terminal_name, profile, working_directory,\n\
-                        command, pre_start_command, restart_policy\n\
+                        command, execution_command, pre_start_command, restart_policy\n\
                  FROM capsule_terminal_services\n\
                  WHERE capsule_id = ?1 AND revision = ?2\n\
                  ORDER BY service_index ASC",
@@ -165,7 +174,7 @@ impl ServiceStore {
         let rows = statement
             .query_map(params![capsule_id, revision], |row| {
                 let source: String = row.get(1)?;
-                let policy: String = row.get(11)?;
+                let policy: String = row.get(12)?;
                 Ok(SavedService {
                     service_index: row.get(0)?,
                     source: if source == "visual-studio-code" {
@@ -181,7 +190,8 @@ impl ServiceStore {
                     profile: row.get(7)?,
                     working_directory: row.get(8)?,
                     command: row.get(9)?,
-                    pre_start_command: row.get(10)?,
+                    execution_command: row.get(10)?,
+                    pre_start_command: row.get(11)?,
                     restart_policy: if policy == "always" {
                         RestartPolicy::Always
                     } else {
@@ -220,8 +230,9 @@ impl ServiceStore {
                     "INSERT INTO capsule_terminal_services\n\
                      (capsule_id, revision, service_index, source, host, shell,\n\
                       captured_terminal_pid, vscode_terminal_index, terminal_name, profile,\n\
-                      working_directory, command, pre_start_command, restart_policy, updated_at_unix_ms)\n\
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                      working_directory, command, execution_command, pre_start_command,\n\
+                      restart_policy, updated_at_unix_ms)\n\
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         capsule_id,
                         revision,
@@ -235,6 +246,7 @@ impl ServiceStore {
                         service.profile,
                         service.working_directory,
                         service.command,
+                        service.execution_command,
                         service.pre_start_command,
                         service.restart_policy.as_str(),
                         now,
@@ -302,6 +314,33 @@ impl ServiceStore {
     }
 }
 
+fn ensure_execution_command_column(connection: &Connection) -> Result<(), String> {
+    let has_column = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(capsule_terminal_services)")
+            .map_err(|error| format!("SQLite error: {error}"))?;
+        let columns = statement
+            .query_map(params![], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("SQLite error: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("SQLite error: {error}"))?;
+        columns.iter().any(|column| column == "execution_command")
+    };
+    if !has_column {
+        connection
+            .execute(
+                "ALTER TABLE capsule_terminal_services ADD COLUMN execution_command TEXT",
+                params![],
+            )
+            .map_err(|error| format!("SQLite error while adding execution_command: {error}"))?;
+        logging::info(
+            SERVICE_LOG_COMPONENT,
+            "database migration: added capsule_terminal_services.execution_command",
+        );
+    }
+    Ok(())
+}
+
 pub fn save(arguments: Vec<String>) -> ExitCode {
     let (clean_arguments, cli_force, name) = strip_cli_force(arguments);
     if !cli_force {
@@ -311,31 +350,50 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
         return commands::save(clean_arguments);
     };
 
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!("save.begin capsule={name:?} cli_force=true"),
+    );
     let ignored_applications = match force_save_ignored_applications(&clean_arguments) {
         Ok(values) => values,
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("save.preflight-parse failed: {error}"));
             eprintln!("error: --cli-force preflight: {error}");
+            print_service_log_hint();
             return ExitCode::from(1);
         }
     };
     println!("--cli-force: checking save prerequisites before stopping terminal services...");
     if let Err(error) = preflight_force_save(&ignored_applications) {
+        logging::error(SERVICE_LOG_COMPONENT, format!("save.preflight failed: {error}"));
         eprintln!("error: --cli-force preflight: {error}");
         eprintln!("  no terminal service was interrupted");
+        print_service_log_hint();
         return ExitCode::from(1);
     }
+    logging::info(SERVICE_LOG_COMPONENT, "save.preflight ok");
 
     println!("--cli-force: capturing running terminal commands before workspace discovery...");
     let captured = match capture_and_interrupt_services() {
         Ok(captured) => captured,
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("save.capture failed: {error}"));
             eprintln!("error: --cli-force: {error}");
+            print_service_log_hint();
             return ExitCode::from(1);
         }
     };
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!("save.capture complete services={}", captured.len()),
+    );
 
     let result = commands::save(clean_arguments);
     if result != ExitCode::SUCCESS {
+        logging::error(
+            SERVICE_LOG_COMPONENT,
+            format!("save.snapshot failed after capture services={}", captured.len()),
+        );
         if !captured.is_empty() {
             eprintln!(
                 "warning: save failed after {} terminal service(s) were interrupted; attempting to resume them now",
@@ -343,39 +401,70 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
             );
             resume_interrupted_services(&captured);
         }
+        print_service_log_hint();
         return result;
     }
 
     let store = match persistence::CapsuleStore::open_default() {
         Ok(store) => store,
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("save.attach open capsule failed: {error}"));
             eprintln!("error: capsule was saved, but terminal restart metadata could not be attached: {error}");
+            print_service_log_hint();
             return ExitCode::from(1);
         }
     };
     let stored = match store.load(&name) {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("save.attach load capsule failed: {error}"));
             eprintln!("error: capsule was saved, but terminal restart metadata could not be attached: {error}");
+            print_service_log_hint();
             return ExitCode::from(1);
         }
     };
     let services = match finalize_captured_services(captured, &stored.snapshot) {
         Ok(services) => services,
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("save.finalize failed: {error}"));
             eprintln!("error: capsule was saved, but terminal restart metadata could not be attached safely: {error}");
+            print_service_log_hint();
             return ExitCode::from(1);
         }
     };
     let mut service_store = match ServiceStore::open_default() {
         Ok(store) => store,
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("save.store open failed: {error}"));
             eprintln!("error: capsule was saved, but terminal restart metadata could not be stored: {error}");
+            print_service_log_hint();
             return ExitCode::from(1);
         }
     };
     match service_store.replace_current(&name, services) {
         Ok(plan) => {
+            logging::info(
+                SERVICE_LOG_COMPONENT,
+                format!(
+                    "save.persisted capsule={} revision={} services={}",
+                    plan.capsule_name,
+                    plan.revision,
+                    plan.services.len()
+                ),
+            );
+            for service in &plan.services {
+                logging::info(
+                    SERVICE_LOG_COMPONENT,
+                    format!(
+                        "save.service index={} source={} display={:?} execution={:?} cwd={:?}",
+                        service.service_index,
+                        service.source.as_str(),
+                        service.command,
+                        service.execution_command.as_deref().unwrap_or(service.command.as_str()),
+                        service.working_directory
+                    ),
+                );
+            }
             println!(
                 "  saved terminal restart commands: {} (capsule revision {}@{})",
                 plan.services.len(), plan.capsule_name, plan.revision
@@ -386,18 +475,33 @@ pub fn save(arguments: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("save.persist failed: {error}"));
             eprintln!("error: capsule was saved, but terminal restart metadata could not be stored: {error}");
+            print_service_log_hint();
             ExitCode::from(1)
         }
     }
 }
 
 pub fn restore(arguments: Vec<String>) -> ExitCode {
+    logging::info(SERVICE_LOG_COMPONENT, format!("restore.begin args={arguments:?}"));
     let scope = parse_restore_scope(&arguments).ok();
     let plan = scope
         .as_ref()
         .and_then(|scope| ServiceStore::open_default().ok()?.list(&scope.reference).ok())
         .map(|plan| filter_plan(plan, scope.as_ref().expect("scope exists")));
+
+    if let Some(plan) = plan.as_ref() {
+        logging::info(
+            SERVICE_LOG_COMPONENT,
+            format!(
+                "restore.plan capsule={} revision={} services={}",
+                plan.capsule_name,
+                plan.revision,
+                plan.services.len()
+            ),
+        );
+    }
 
     if let (Some(scope), Some(plan)) = (scope.as_ref(), plan.as_ref()) {
         if scope.dry_run && !plan.services.is_empty() {
@@ -421,6 +525,8 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
 
     let result = commands::restore(arguments.clone());
     if result != ExitCode::SUCCESS {
+        logging::error(SERVICE_LOG_COMPONENT, "restore.base failed; saved services not attempted");
+        print_service_log_hint();
         return result;
     }
     let Some(scope) = scope else {
@@ -433,6 +539,7 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         return result;
     };
     if plan.services.is_empty() {
+        logging::info(SERVICE_LOG_COMPONENT, "restore.no saved services in selected scope");
         return result;
     }
 
@@ -440,7 +547,9 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
     let mut service_store = match ServiceStore::open_default() {
         Ok(store) => store,
         Err(error) => {
+            logging::error(SERVICE_LOG_COMPONENT, format!("restore.policy-store failed: {error}"));
             eprintln!("  warning: saved services were not started because restart policies could not be opened: {error}");
+            print_service_log_hint();
             return result;
         }
     };
@@ -454,6 +563,13 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
                 RestartPolicy::Always => RestoreDecisionKind::StartOnce,
                 RestartPolicy::Ask => RestoreDecisionKind::Skip,
             });
+        logging::info(
+            SERVICE_LOG_COMPONENT,
+            format!(
+                "restore.decision service={} decision={decision:?} display={:?}",
+                service.service_index, service.command
+            ),
+        );
         match decision {
             RestoreDecisionKind::Skip => {}
             RestoreDecisionKind::StartOnce => selected.push(service),
@@ -463,6 +579,10 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
                     service.service_index,
                     RestartPolicy::Always,
                 ) {
+                    logging::warn(
+                        SERVICE_LOG_COMPONENT,
+                        format!("restore.policy persist Always failed service={}: {error}", service.service_index),
+                    );
                     eprintln!("  warning: could not persist Always policy for service #{}: {error}", service.service_index);
                 }
                 selected.push(service);
@@ -471,6 +591,7 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
     }
 
     if selected.is_empty() {
+        logging::info(SERVICE_LOG_COMPONENT, "restore.selected services=0");
         println!("Saved services: none started.");
         return result;
     }
@@ -491,10 +612,18 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         match start_external_service(service) {
             Ok(()) => {
                 started += 1;
+                logging::info(
+                    SERVICE_LOG_COMPONENT,
+                    format!("restore.started service={} display={:?}", service.service_index, service.command),
+                );
                 println!("  started [{}] {}", service.service_index, service.command);
             }
             Err(error) => {
                 failed += 1;
+                logging::error(
+                    SERVICE_LOG_COMPONENT,
+                    format!("restore.failed service={} display={:?}: {error}", service.service_index, service.command),
+                );
                 eprintln!("  failed [{}] {}: {error}", service.service_index, service.command);
             }
         }
@@ -503,17 +632,30 @@ pub fn restore(arguments: Vec<String>) -> ExitCode {
         match start_vscode_services(&scope.reference, &vscode_services) {
             Ok((changed, warnings)) => {
                 started += changed;
+                logging::info(
+                    SERVICE_LOG_COMPONENT,
+                    format!("restore.vscode changed={changed} requested={}", vscode_services.len()),
+                );
                 for warning in warnings {
+                    logging::warn(SERVICE_LOG_COMPONENT, format!("restore.vscode warning: {warning}"));
                     println!("  warning: VS Code service restart: {warning}");
                 }
             }
             Err(error) => {
                 failed += vscode_services.len();
+                logging::error(SERVICE_LOG_COMPONENT, format!("restore.vscode failed: {error}"));
                 eprintln!("  failed: VS Code saved service restart: {error}");
             }
         }
     }
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!("restore.complete started={started} failed={failed}"),
+    );
     println!("Saved services: {started} started, {failed} failed.");
+    if failed > 0 {
+        print_service_log_hint();
+    }
     result
 }
 
@@ -558,6 +700,13 @@ pub fn plan(arguments: Vec<String>) -> ExitCode {
 
 pub fn command(arguments: Vec<String>) -> ExitCode {
     match arguments.as_slice() {
+        [action] if action == "log" => match logging::component_log_path(SERVICE_LOG_COMPONENT) {
+            Ok(path) => {
+                println!("{}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(error) => command_error(format!("could not resolve saved-service log path: {error}")),
+        },
         [action, reference] if action == "list" => match ServiceStore::open_default()
             .and_then(|store| store.list(reference))
         {
@@ -631,6 +780,7 @@ pub fn command(arguments: Vec<String>) -> ExitCode {
         }
         _ => {
             eprintln!("error: usage:");
+            eprintln!("  capsule service log");
             eprintln!("  capsule service list <name[@revision]>");
             eprintln!("  capsule service prestart <name[@revision]> <index> -c <command>");
             eprintln!("  capsule service prestart <name[@revision]> <index> --clear");
@@ -734,6 +884,13 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
         None => None,
     };
     let initial = terminal::discover();
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!(
+            "capture.discovery sessions={} caller_pid={caller_pid:?} caller_shell_pid={caller_shell_pid:?}",
+            initial.sessions.len()
+        ),
+    );
 
     let mut vscode_running_shell_pids = initial
         .sessions
@@ -765,6 +922,31 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
             Some((session, command))
         })
         .map(|(session, command)| {
+            let execution = validate_restart_command(command)?;
+            let display = if matches!(
+                session.shell,
+                terminal::ShellKind::PowerShell | terminal::ShellKind::WindowsPowerShell
+            ) {
+                service_command_capture::recover_powershell_typed_command(&execution)
+                    .and_then(|candidate| validate_restart_command(&candidate).ok())
+                    .filter(|candidate| {
+                        service_command_capture::commands_equivalent(candidate, &execution)
+                    })
+                    .unwrap_or_else(|| execution.clone())
+            } else {
+                execution.clone()
+            };
+            let execution_command = (display != execution).then_some(execution.clone());
+            logging::info(
+                SERVICE_LOG_COMPONENT,
+                format!(
+                    "capture.candidate pid={:?} host={} shell={} cwd={:?} display={display:?} execution={execution:?}",
+                    session.pid,
+                    wire_host(&session.host),
+                    session.shell.as_str(),
+                    session.working_directory
+                ),
+            );
             Ok(CapturedService {
                 source: ServiceSource::ExternalTerminal,
                 host: wire_host(&session.host),
@@ -774,7 +956,8 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
                 terminal_name: session.title.clone(),
                 profile: session.profile.clone(),
                 working_directory: session.working_directory.clone(),
-                command: validate_restart_command(command)?,
+                command: display,
+                execution_command,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -783,6 +966,10 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
         let pid = candidate
             .captured_terminal_pid
             .ok_or_else(|| "terminal service did not have a shell PID".to_owned())?;
+        logging::info(
+            SERVICE_LOG_COMPONENT,
+            format!("capture.interrupt pid={pid} display={:?}", candidate.command),
+        );
         terminal_interrupt::send_ctrl_c(pid).map_err(|error| {
             format!(
                 "could not stop '{}' in terminal shell PID {pid}: {error}",
@@ -790,6 +977,7 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
             )
         })?;
         wait_until_shell_idle(pid)?;
+        logging::info(SERVICE_LOG_COMPONENT, format!("capture.interrupt pid={pid} idle=true"));
         captured.push(candidate);
     }
 
@@ -862,6 +1050,7 @@ fn interrupt_vscode_services(
                 profile: None,
                 working_directory: service.cwd,
                 command: validate_restart_command(&service.command)?,
+                execution_command: None,
             })
         })
         .collect()
@@ -912,10 +1101,24 @@ fn resume_interrupted_services(captured: &[CapturedService]) {
             eprintln!("  warning: could not resume '{}': terminal PID {pid} is already running '{foreground}'", service.command);
             continue;
         }
-        match terminal_interrupt::send_text(pid, &service.command) {
-            Ok(()) => resumed += 1,
+        let execution = service
+            .execution_command
+            .as_deref()
+            .unwrap_or(service.command.as_str());
+        match terminal_interrupt::send_text(pid, execution) {
+            Ok(()) => {
+                resumed += 1;
+                logging::info(
+                    SERVICE_LOG_COMPONENT,
+                    format!("recovery.sent pid={pid} display={:?} execution={execution:?}", service.command),
+                );
+            }
             Err(error) => {
                 failed += 1;
+                logging::error(
+                    SERVICE_LOG_COMPONENT,
+                    format!("recovery.failed pid={pid} display={:?}: {error}", service.command),
+                );
                 eprintln!("  warning: could not resume '{}' in terminal PID {pid}: {error}", service.command);
             }
         }
@@ -936,6 +1139,7 @@ fn resume_interrupted_services(captured: &[CapturedService]) {
             profile: service.profile.clone(),
             working_directory: service.working_directory.clone(),
             command: service.command.clone(),
+            execution_command: None,
             pre_start_command: None,
             restart_policy: RestartPolicy::Ask,
         })
@@ -968,6 +1172,10 @@ fn resume_interrupted_services(captured: &[CapturedService]) {
         }
     }
 
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!("recovery.complete resumed={resumed} failed={failed}"),
+    );
     eprintln!("  interrupted-service recovery: {resumed} resumed, {failed} failed");
 }
 
@@ -1040,6 +1248,7 @@ fn finalize_captured_services(
             profile: captured.profile,
             working_directory,
             command: captured.command,
+            execution_command: captured.execution_command,
             pre_start_command: None,
             restart_policy: RestartPolicy::Ask,
         });
@@ -1059,11 +1268,42 @@ fn finalize_captured_services(
 
 fn start_external_service(service: &SavedService) -> Result<(), String> {
     let command = combined_command(service)?;
+    let expected = service
+        .execution_command
+        .as_deref()
+        .unwrap_or(service.command.as_str());
     let current = terminal_context::enrich_for_matching(&terminal::discover());
-    let session = current
+    let candidates = current
         .sessions
         .iter()
         .filter(|session| session.host != TerminalHost::VisualStudioCode)
+        .collect::<Vec<_>>();
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!(
+            "restore.match begin service={} host={} shell={} cwd={:?} candidates={}",
+            service.service_index,
+            service.host,
+            service.shell,
+            service.working_directory,
+            candidates.len()
+        ),
+    );
+    for candidate in &candidates {
+        logging::info(
+            SERVICE_LOG_COMPONENT,
+            format!(
+                "restore.match candidate pid={:?} host={} shell={} cwd={:?} idle={}",
+                candidate.pid,
+                wire_host(&candidate.host),
+                candidate.shell.as_str(),
+                candidate.working_directory,
+                candidate.foreground_command.is_none()
+            ),
+        );
+    }
+    let session = candidates
+        .into_iter()
         .find(|session| service_matches_terminal(service, session))
         .ok_or_else(|| {
             format!(
@@ -1079,7 +1319,112 @@ fn start_external_service(service: &SavedService) -> Result<(), String> {
     let pid = session
         .pid
         .ok_or_else(|| "restored terminal has no shell PID for command replay".to_owned())?;
-    terminal_interrupt::send_text(pid, &command)
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!(
+            "restore.replay service={} pid={pid} display={:?} execution={expected:?} cwd={:?}",
+            service.service_index, service.command, session.working_directory
+        ),
+    );
+    terminal_interrupt::send_text(pid, &command).map_err(|error| {
+        logging::error(
+            SERVICE_LOG_COMPONENT,
+            format!("restore.replay send failed service={} pid={pid}: {error}", service.service_index),
+        );
+        error
+    })?;
+    logging::info(
+        SERVICE_LOG_COMPONENT,
+        format!("restore.replay input-written service={} pid={pid}", service.service_index),
+    );
+    verify_external_service_started(pid, service, expected)
+}
+
+fn verify_external_service_started(
+    pid: u32,
+    service: &SavedService,
+    expected: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + SERVICE_START_TIMEOUT;
+    let mut stable_since: Option<Instant> = None;
+    let mut observed_expected = false;
+
+    loop {
+        let current = terminal::discover();
+        let session = current.sessions.iter().find(|session| session.pid == Some(pid));
+        match session.and_then(|session| session.foreground_command.as_deref()) {
+            Some(foreground)
+                if service_command_capture::commands_equivalent(foreground, expected) =>
+            {
+                let now = Instant::now();
+                if stable_since.is_none() {
+                    stable_since = Some(now);
+                    observed_expected = true;
+                    logging::info(
+                        SERVICE_LOG_COMPONENT,
+                        format!(
+                            "restore.verify observed service={} pid={pid} expected foreground process",
+                            service.service_index
+                        ),
+                    );
+                }
+                if stable_since
+                    .is_some_and(|started| now.duration_since(started) >= SERVICE_START_STABILITY)
+                {
+                    logging::info(
+                        SERVICE_LOG_COMPONENT,
+                        format!(
+                            "restore.verify stable service={} pid={pid} stability_ms={}",
+                            service.service_index,
+                            SERVICE_START_STABILITY.as_millis()
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
+            Some(foreground) => {
+                logging::error(
+                    SERVICE_LOG_COMPONENT,
+                    format!(
+                        "restore.verify unexpected service={} pid={pid} foreground={foreground:?} expected={expected:?}",
+                        service.service_index
+                    ),
+                );
+                return Err(format!(
+                    "restart command was delivered, but terminal PID {pid} started an unexpected foreground process '{foreground}'"
+                ));
+            }
+            None if observed_expected => {
+                logging::error(
+                    SERVICE_LOG_COMPONENT,
+                    format!(
+                        "restore.verify exited service={} pid={pid} before stability window",
+                        service.service_index
+                    ),
+                );
+                return Err(format!(
+                    "service process appeared in terminal PID {pid} but exited before the {} ms startup stability window",
+                    SERVICE_START_STABILITY.as_millis()
+                ));
+            }
+            None => {}
+        }
+
+        if Instant::now() >= deadline {
+            logging::error(
+                SERVICE_LOG_COMPONENT,
+                format!(
+                    "restore.verify timeout service={} pid={pid} expected={expected:?}",
+                    service.service_index
+                ),
+            );
+            return Err(format!(
+                "restart command was delivered to terminal PID {pid}, but the expected service process was not observed within {} seconds",
+                SERVICE_START_TIMEOUT.as_secs()
+            ));
+        }
+        thread::sleep(SERVICE_START_POLL);
+    }
 }
 
 fn start_vscode_services(
@@ -1317,6 +1662,12 @@ fn command_error(error: String) -> ExitCode {
     ExitCode::from(1)
 }
 
+fn print_service_log_hint() {
+    if let Ok(path) = logging::component_log_path(SERVICE_LOG_COMPONENT) {
+        eprintln!("  service diagnostics: {}", path.display());
+    }
+}
+
 fn wire_host(host: &TerminalHost) -> String {
     serde_json::to_value(host)
         .ok()
@@ -1397,6 +1748,29 @@ mod tests {
             "--ignore-app".to_owned(),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn execution_command_column_is_added_to_legacy_service_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE capsule_terminal_services (\n\
+                    command TEXT NOT NULL,\n\
+                    pre_start_command TEXT\n\
+                 );",
+            )
+            .unwrap();
+        ensure_execution_command_column(&connection).unwrap();
+        let mut statement = connection
+            .prepare("PRAGMA table_info(capsule_terminal_services)")
+            .unwrap();
+        let columns = statement
+            .query_map(params![], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "execution_command"));
     }
 
     #[test]
