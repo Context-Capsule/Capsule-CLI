@@ -735,11 +735,6 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
     };
     let initial = terminal::discover();
 
-    // Windows process discovery can see nested/helper shells below Code.exe in
-    // addition to actual integrated-terminal shells (especially in Extension
-    // Development Hosts). Preserve the observed PIDs so the VS Code adapter can
-    // reconcile them against vscode.window.terminals[*].processId by identity
-    // instead of comparing an unreliable raw process count.
     let mut vscode_running_shell_pids = initial
         .sessions
         .iter()
@@ -1233,8 +1228,12 @@ fn parse_restore_scope(arguments: &[String]) -> Result<RestoreScope, String> {
     for value in only_values {
         for selector in value.split(',').map(str::trim) {
             match selector.to_ascii_lowercase().as_str() {
-                "terminal" | "terminals" | "all" => include_external = true,
-                "vscode" | "vs-code" | "all" => include_vscode = true,
+                "all" => {
+                    include_external = true;
+                    include_vscode = true;
+                }
+                "terminal" | "terminals" => include_external = true,
+                "vscode" | "vs-code" => include_vscode = true,
                 "apps" | "app" | "applications" | "application" | "desktop" | "firefox"
                 | "zen" | "chrome" | "browser" | "browsers" | "git" | "docker"
                 | "containers" | "explorer" => {}
@@ -1418,6 +1417,14 @@ mod tests {
         .unwrap();
         assert!(!vscode.include_external);
         assert!(vscode.include_vscode);
+
+        let all = parse_restore_scope(&[
+            "demo".to_owned(),
+            "--only=all".to_owned(),
+        ])
+        .unwrap();
+        assert!(all.include_external);
+        assert!(all.include_vscode);
     }
 
     #[test]
