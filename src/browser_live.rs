@@ -11,16 +11,18 @@ pub use base::{
 use crate::logging;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    env, fs,
     io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const NATIVE_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const NATIVE_SESSION_MAX_AGE: Duration = Duration::from_secs(15);
+const NATIVE_SESSION_SYNC_GRACE: Duration = Duration::from_secs(2);
+const NATIVE_SESSION_SYNC_POLL: Duration = Duration::from_millis(50);
 const NATIVE_SESSION_PREFIX: &str = "firefox-native-session-";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,15 +94,23 @@ impl Drop for NativeSessionLease {
 /// to report changes; rewriting the full snapshot on every native ping is both
 /// unnecessary and excessively write-heavy.
 pub fn run_native_host() -> Result<(), BrowserError> {
-    let lease = match NativeSessionLease::start() {
-        Ok(lease) => Some(lease),
-        Err(error) => {
-            logging::warn(
-                "firefox",
-                format!("native session liveness lease is unavailable: {error}"),
-            );
-            None
+    // A user can launch capsule-firefox-host with no arguments for diagnostics.
+    // Only the browser-style native-messaging invocation is allowed to prove
+    // adapter liveness; otherwise a manually started host could keep stale tabs
+    // eligible for capture even though no extension is connected.
+    let lease = if is_native_messaging_invocation() {
+        match NativeSessionLease::start() {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                logging::warn(
+                    "firefox",
+                    format!("native session liveness lease is unavailable: {error}"),
+                );
+                None
+            }
         }
+    } else {
+        None
     };
 
     let result = base::run_native_host();
@@ -125,7 +135,36 @@ pub fn load_recent_firefox_state() -> Result<Option<FirefoxSnapshot>, BrowserErr
         return Ok(None);
     }
 
-    load_validated_state_ignoring_age(&state_path)
+    // A newly connected extension publishes state immediately, but process
+    // scheduling can still put the CLI preflight a few milliseconds ahead of
+    // that first update. Wait only when a real live native session is already
+    // proven, and keep the grace window bounded so missing/broken adapters fail
+    // quickly instead of masking the completeness guard.
+    let deadline = Instant::now() + NATIVE_SESSION_SYNC_GRACE;
+    loop {
+        match load_validated_state_ignoring_age(&state_path)? {
+            Some(snapshot) => return Ok(Some(snapshot)),
+            None if Instant::now() < deadline => thread::sleep(NATIVE_SESSION_SYNC_POLL),
+            None => return Ok(None),
+        }
+    }
+}
+
+fn is_native_messaging_invocation() -> bool {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    is_native_messaging_arguments(&arguments)
+}
+
+fn is_native_messaging_arguments(arguments: &[String]) -> bool {
+    if arguments.len() != 2 || arguments[1] != FIREFOX_EXTENSION_ID {
+        return false;
+    }
+    Path::new(&arguments[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case(&format!("{NATIVE_HOST_NAME}.json"))
+        })
 }
 
 fn native_session_path(pid: u32) -> Result<PathBuf, BrowserError> {
@@ -272,6 +311,23 @@ mod tests {
             skipped_private_windows: 0,
             windows: Vec::new(),
         }
+    }
+
+    #[test]
+    fn only_browser_style_native_arguments_can_prove_liveness() {
+        assert!(is_native_messaging_arguments(&[
+            format!(r"C:\runtime\{NATIVE_HOST_NAME}.json"),
+            FIREFOX_EXTENSION_ID.to_owned(),
+        ]));
+        assert!(!is_native_messaging_arguments(&[]));
+        assert!(!is_native_messaging_arguments(&[
+            format!(r"C:\runtime\{NATIVE_HOST_NAME}.json"),
+            "wrong@extension.invalid".to_owned(),
+        ]));
+        assert!(!is_native_messaging_arguments(&[
+            r"C:\runtime\other-host.json".to_owned(),
+            FIREFOX_EXTENSION_ID.to_owned(),
+        ]));
     }
 
     #[test]
