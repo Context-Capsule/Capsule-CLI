@@ -27,7 +27,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::{
+    io::{BufRead, BufReader},
+    os::windows::process::CommandExt,
+};
 
 const SERVER_FLAG: &str = "--agent-serve";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
@@ -38,6 +41,113 @@ const START_POLL: Duration = Duration::from_millis(25);
 const EXISTING_START_ATTEMPTS: usize = 80;
 const SERVICE_RESTART_LOG_COMPONENT: &str = "service-restart";
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptInputKind {
+    InheritedStdin,
+    #[cfg(any(windows, test))]
+    WindowsConsole,
+}
+
+impl PromptInputKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InheritedStdin => "stdin",
+            #[cfg(any(windows, test))]
+            Self::WindowsConsole => "windows-console",
+        }
+    }
+}
+
+enum ServicePromptInput {
+    InheritedStdin,
+    #[cfg(windows)]
+    WindowsConsole {
+        reader: BufReader<fs::File>,
+        writer: fs::File,
+    },
+}
+
+impl ServicePromptInput {
+    fn kind(&self) -> PromptInputKind {
+        match self {
+            Self::InheritedStdin => PromptInputKind::InheritedStdin,
+            #[cfg(windows)]
+            Self::WindowsConsole { .. } => PromptInputKind::WindowsConsole,
+        }
+    }
+
+    fn read_line(&mut self, input: &mut String) -> io::Result<usize> {
+        match self {
+            Self::InheritedStdin => io::stdin().read_line(input),
+            #[cfg(windows)]
+            Self::WindowsConsole { reader, .. } => reader.read_line(input),
+        }
+    }
+
+    fn write_text(&mut self, text: &str) -> io::Result<()> {
+        match self {
+            Self::InheritedStdin => {
+                let mut stdout = io::stdout();
+                stdout.write_all(text.as_bytes())?;
+                stdout.flush()
+            }
+            #[cfg(windows)]
+            Self::WindowsConsole { writer, .. } => {
+                writer.write_all(text.as_bytes())?;
+                writer.flush()
+            }
+        }
+    }
+
+    fn write_line(&mut self, text: &str) -> io::Result<()> {
+        self.write_text(text)?;
+        self.write_text("\r\n")
+    }
+}
+
+fn open_service_prompt_input() -> Option<ServicePromptInput> {
+    if io::stdin().is_terminal() {
+        return Some(ServicePromptInput::InheritedStdin);
+    }
+
+    #[cfg(windows)]
+    {
+        // A CLI runner commonly redirects stdin/stdout so it can capture the
+        // child's streams while leaving the child attached to the same Windows
+        // console as the user. Standard-handle terminal detection is false in
+        // that arrangement. CONIN$/CONOUT$ address the attached console directly
+        // and therefore keep the prompt both readable and visible even if the
+        // runner buffers redirected output. Require both handles: if there is no
+        // visible attached console (GUI/extension/background invocation), fall
+        // back to the existing noninteractive StartOnce behavior rather than
+        // blocking on a prompt the user cannot see.
+        let reader = OpenOptions::new().read(true).open("CONIN$");
+        let writer = OpenOptions::new().write(true).open("CONOUT$");
+        if let (Ok(reader), Ok(writer)) = (reader, writer) {
+            return Some(ServicePromptInput::WindowsConsole {
+                reader: BufReader::new(reader),
+                writer,
+            });
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+fn prompt_input_kind_for_capabilities(
+    inherited_stdin_is_terminal: bool,
+    attached_windows_console_available: bool,
+) -> Option<PromptInputKind> {
+    if inherited_stdin_is_terminal {
+        Some(PromptInputKind::InheritedStdin)
+    } else if attached_windows_console_available {
+        Some(PromptInputKind::WindowsConsole)
+    } else {
+        None
+    }
+}
 
 pub fn run(args: Vec<String>) -> ExitCode {
     if args.first().is_some_and(|value| value == "agent") {
@@ -292,18 +402,24 @@ fn prepare_service_decisions(
         return Ok(None);
     }
 
-    // Only stdin needs to be interactive in order to ask the user. Requiring
-    // stdout to also be a terminal wrongly suppresses prompts under wrappers
-    // such as `cargo run` or when output is tee'd/redirected while input still
-    // comes from a real console.
-    let interactive = io::stdin().is_terminal();
+    // A runner can redirect stdin/stdout while leaving this process attached to
+    // the same Windows console as the user. Prefer inherited terminal stdin,
+    // then the attached console channel, and only use the noninteractive default
+    // when neither a visible prompt nor keyboard input is available.
+    let inherited_stdin_interactive = io::stdin().is_terminal();
+    let mut prompt_input = open_service_prompt_input();
+    let prompt_source = prompt_input
+        .as_ref()
+        .map(|input| input.kind().as_str())
+        .unwrap_or("none");
     logging::info(
         SERVICE_RESTART_LOG_COMPONENT,
         format!(
-            "service-plan capsule={} revision={} services={} stdin_interactive={interactive}",
+            "service-plan capsule={} revision={} services={} stdin_interactive={} prompt_input={prompt_source}",
             plan.capsule_name,
             plan.revision,
-            plan.services.len()
+            plan.services.len(),
+            inherited_stdin_interactive,
         ),
     );
 
@@ -320,19 +436,21 @@ fn prepare_service_decisions(
             );
             continue;
         }
-        let decision = if interactive {
+        let decision = if let Some(input) = prompt_input.as_mut() {
             if let Some(pre_start) = service.pre_start_command.as_deref() {
-                println!("  pre-start: {pre_start}");
+                input
+                    .write_line(&format!("  pre-start: {pre_start}"))
+                    .map_err(AgentError::Io)?;
             }
-            prompt_service_decision(&service.command)?
+            prompt_service_decision(&service.command, input)?
         } else {
             auto_started_noninteractive = true;
             // A saved running service is part of the captured working state.
-            // When the caller has no interactive stdin (for example an app or
-            // extension invoking `capsule restore`), skipping Ask services made
-            // restore silently incomplete. Preserve explicit Skip decisions
-            // from interactive/decision-capable callers, but otherwise start
-            // the captured service once for this restore.
+            // When the caller has no interactive input source (for example an
+            // app or extension invoking `capsule restore`), skipping Ask
+            // services makes restore silently incomplete. Preserve explicit
+            // Skip decisions from interactive callers, but otherwise start the
+            // captured service once for this restore.
             noninteractive_service_decision()
         };
         logging::info(
@@ -341,7 +459,7 @@ fn prepare_service_decisions(
                 "service decision index={} policy=ask command={:?} decision={decision:?} source={}",
                 service.service_index,
                 service.command,
-                if interactive { "interactive" } else { "noninteractive-default" }
+                if prompt_input.is_some() { prompt_source } else { "noninteractive-default" }
             ),
         );
         decisions.push(RestoreDecision {
@@ -351,11 +469,11 @@ fn prepare_service_decisions(
     }
     if auto_started_noninteractive {
         eprintln!(
-            "warning: stdin is not interactive; saved Ask services will start once for this restore"
+            "warning: no interactive console input is available; saved Ask services will start once for this restore"
         );
         logging::warn(
             SERVICE_RESTART_LOG_COMPONENT,
-            "stdin is not interactive; Ask services defaulted to StartOnce instead of being silently skipped",
+            "no interactive console input is available; Ask services defaulted to StartOnce instead of being silently skipped",
         );
     }
     if decisions.is_empty() {
@@ -409,23 +527,29 @@ fn noninteractive_service_decision() -> RestoreDecisionKind {
     RestoreDecisionKind::StartOnce
 }
 
-fn prompt_service_decision(command: &str) -> Result<RestoreDecisionKind, AgentError> {
+fn prompt_service_decision(
+    command: &str,
+    input: &mut ServicePromptInput,
+) -> Result<RestoreDecisionKind, AgentError> {
     loop {
-        print!(
-            "Start saved service? {command}  [Y] Once [A] Always for this capsule [N] Skip  "
-        );
-        io::stdout().flush().map_err(AgentError::Io)?;
-        let mut input = String::new();
-        let read = io::stdin().read_line(&mut input).map_err(AgentError::Io)?;
+        input
+            .write_text(&format!(
+                "Start saved service? {command}  [Y] Once [A] Always for this capsule [N] Skip  "
+            ))
+            .map_err(AgentError::Io)?;
+        let mut response = String::new();
+        let read = input.read_line(&mut response).map_err(AgentError::Io)?;
         if read == 0 {
-            println!("N");
+            input.write_line("N").map_err(AgentError::Io)?;
             return Ok(RestoreDecisionKind::Skip);
         }
-        match input.trim().to_ascii_lowercase().as_str() {
+        match response.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => return Ok(RestoreDecisionKind::StartOnce),
             "a" | "always" => return Ok(RestoreDecisionKind::Always),
             "n" | "no" | "" => return Ok(RestoreDecisionKind::Skip),
-            _ => println!("Please enter Y, A, or N."),
+            _ => input
+                .write_line("Please enter Y, A, or N.")
+                .map_err(AgentError::Io)?,
         }
     }
 }
@@ -671,6 +795,27 @@ mod tests {
     fn service_plan_waits_as_long_as_the_restore_it_protects() {
         assert_eq!(SERVICE_PLAN_TIMEOUT, RESPONSE_TIMEOUT);
         assert!(SERVICE_PLAN_TIMEOUT >= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn prompt_prefers_inherited_terminal_stdin() {
+        assert_eq!(
+            prompt_input_kind_for_capabilities(true, true),
+            Some(PromptInputKind::InheritedStdin)
+        );
+    }
+
+    #[test]
+    fn redirected_stdin_can_fall_back_to_attached_windows_console() {
+        assert_eq!(
+            prompt_input_kind_for_capabilities(false, true),
+            Some(PromptInputKind::WindowsConsole)
+        );
+    }
+
+    #[test]
+    fn background_call_without_console_remains_noninteractive() {
+        assert_eq!(prompt_input_kind_for_capabilities(false, false), None);
     }
 
     #[test]
