@@ -6,6 +6,7 @@
 extern crate self as context_capsule;
 
 pub mod adapters;
+#[path = "browser_live.rs"]
 pub mod browser;
 pub mod chrome;
 pub mod cleanup;
@@ -20,7 +21,9 @@ pub mod logging;
 pub mod persistence;
 pub mod restore;
 pub mod restore_bus;
+pub mod service_policy;
 pub(crate) mod terminal_context;
+pub mod terminal_interrupt;
 pub mod vscode;
 
 #[cfg(windows)]

@@ -173,6 +173,10 @@ pub(super) fn probe(snapshot: &TerminalSnapshot) -> ProbeResult {
     }
 }
 
+fn single_session_exact_result_complete(expected_sessions: usize, exact_results: usize) -> bool {
+    expected_sessions == 1 && exact_results == 1
+}
+
 #[cfg(windows)]
 fn probe_windows(snapshot: &TerminalSnapshot) -> ProbeResult {
     let live_windows_terminal = snapshot
@@ -291,6 +295,19 @@ fn probe_windows(snapshot: &TerminalSnapshot) -> ProbeResult {
             None,
             false,
         );
+
+        // With one live Windows Terminal PowerShell process, the exact CWD is
+        // the only missing fact. Tab/pane ordering cannot distinguish anything,
+        // so enumerating focus-tab/move-focus would be pure latency and can add
+        // many seconds of bounded waits. Preserve the full ordering pass for
+        // multi-session layouts, where it is still required.
+        if single_session_exact_result_complete(expected_pids.len(), result.directories.len()) {
+            logging::info(
+                TERMINAL_LOG_COMPONENT,
+                "PowerShell UI CWD probe v4: single expected session answered; skipping tab/pane order enumeration",
+            );
+            break;
+        }
 
         let mut original_tab_index = None;
         let mut first_pids_by_tab = HashSet::new();
@@ -803,6 +820,14 @@ mod tests {
         assert!(command.find("WriteAllText").unwrap() < command.find("Clear-Host").unwrap());
         assert!(!command.contains("Set-Location"));
         assert!(!command.contains("Invoke-Expression"));
+    }
+
+    #[test]
+    fn one_exact_session_does_not_need_tab_order_enumeration() {
+        assert!(single_session_exact_result_complete(1, 1));
+        assert!(!single_session_exact_result_complete(1, 0));
+        assert!(!single_session_exact_result_complete(2, 1));
+        assert!(!single_session_exact_result_complete(2, 2));
     }
 
     #[cfg(windows)]

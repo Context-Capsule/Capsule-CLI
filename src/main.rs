@@ -9,6 +9,7 @@ mod git;
 mod lifecycle;
 mod logging;
 mod persistence;
+mod service_restart;
 mod snapshot;
 mod system;
 mod toolchain;
@@ -41,6 +42,12 @@ fn main() -> ExitCode {
     let mut args = env::args().skip(1);
 
     match args.next().as_deref() {
+        Some("__capsule-console-control") => {
+            let mut helper = vec!["__capsule-console-control".to_owned()];
+            helper.extend(args);
+            context_capsule::terminal_interrupt::helper(&helper)
+        }
+        Some("__service-plan") => service_restart::plan(args.collect()),
         Some("inspect") => {
             let remaining = args.collect::<Vec<_>>();
             if remaining
@@ -60,9 +67,10 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("save") => commands::save(args.collect()),
+        Some("save") => service_restart::save(args.collect()),
         Some("update") => lifecycle::update(args.collect()),
-        Some("restore") => commands::restore(args.collect()),
+        Some("restore") => service_restart::restore(args.collect()),
+        Some("service") => service_restart::command(args.collect()),
         Some("list") => commands::list(args.collect()),
         Some("history") => lifecycle::history(args.collect()),
         Some("show") => commands::show(args.collect()),
@@ -573,9 +581,12 @@ fn print_usage() {
     println!("Context Capsule CLI\n");
     println!("Usage:");
     println!("  capsule inspect [options]");
-    println!("  capsule save <name> [-m <note>] [--force] [--ignore-app <application>]...");
+    println!("  capsule save <name> [-m <note>] [--force] [--cli-force] [--ignore-app <application>]...");
     println!("  capsule update <name>");
     println!("  capsule restore <name[@revision]> [--dry-run] [--append | --replace] [--only <targets>]");
+    println!("  capsule service list <name[@revision]>");
+    println!("  capsule service prestart <name[@revision]> <index> -c <command>");
+    println!("  capsule service policy <name[@revision]> <index> <ask|always>");
     println!("  capsule list");
     println!("  capsule history <name>");
     println!("  capsule show <name[@revision]> [--json]");
@@ -591,9 +602,10 @@ fn print_usage() {
     println!(
         "  inspect    Discover current workspace, tools, terminals, applications, windows, displays and Docker"
     );
-    println!("  save       Capture a new capsule; -m stores its continuation note and --ignore-app excludes selected applications");
+    println!("  save       Capture a new capsule; --cli-force explicitly stops restorable running terminal commands and saves restart policies");
     println!("  update     Capture the current workspace as the next revision of an existing capsule");
-    println!("  restore    Restore a full capsule or selected resources with --only; resource failures remain isolated");
+    println!("  restore    Restore a full capsule or selected resources with --only; saved services require explicit restart policy consent");
+    println!("  service    List saved terminal services, set a pre-start command, or reset/configure restart policy");
     println!("  list       List saved capsules");
     println!("  history    List immutable revisions for a capsule");
     println!("  show       Show a saved capsule or revision; --json prints the complete stored payload");
@@ -607,6 +619,7 @@ fn print_usage() {
     println!();
     println!("Save/restore options:");
     println!("  -m, --message <note>    Store a continuation note on the saved capsule revision");
+    println!("      --cli-force         Ctrl+C safely restorable running terminal commands, then capture their idle CWD and restart command");
     println!("      --ignore-app <app>  Omit a discovered application from a saved capsule; repeatable");
     println!("      --append            Preserve unrelated running applications during restore (default)");
     println!("      --replace           Close unrelated running applications before restore");
@@ -614,6 +627,12 @@ fn print_usage() {
     println!("      --only <targets>    Restore only selected resources; comma-separated and repeatable");
     println!("                          targets: apps, vscode, firefox/zen, chrome, browsers, terminals, git, docker, explorer, all");
     println!("                          cannot be combined with --replace/--close-unrelated");
+    println!();
+    println!("Service policy examples:");
+    println!("  capsule service list my-work");
+    println!("  capsule service prestart my-work 1 -c \"source .venv/bin/activate\"");
+    println!("  capsule service prestart my-work 1 --clear");
+    println!("  capsule service policy my-work 1 ask");
     println!();
     print_inspect_usage();
 }

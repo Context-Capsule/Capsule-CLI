@@ -14,6 +14,8 @@ use std::{
 };
 
 const TERMINAL_LOG_COMPONENT: &str = "terminal";
+#[cfg(windows)]
+const SERVICE_RESTART_LOG_COMPONENT: &str = "service-restart";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -28,8 +30,10 @@ const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 ///
 /// This is the preferred, non-invasive path. Windows PowerShell 5.1 can expose
 /// the host process through the named-pipe management connection while still
-/// refusing SessionStateProxy access to the interactive runspace; in that case
-/// this returns None and the caller may use the separately guarded UI fallback.
+/// refusing SessionStateProxy access to the interactive runspace. When that
+/// happens, execute a tiny read-only pipeline inside the already-idle target
+/// runspace instead. That observes the target runspace's real `$PWD` without
+/// typing into the terminal or adding a probe command to PSReadLine history.
 pub(super) fn working_directory(session: &TerminalSession) -> Option<String> {
     #[cfg(not(windows))]
     {
@@ -41,29 +45,76 @@ pub(super) fn working_directory(session: &TerminalSession) -> Option<String> {
     {
         let query = r#"
 $currentManagementRunspace = [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace
-$target = @(
-    Get-Runspace |
-        Where-Object {
-            $_ -ne $currentManagementRunspace -and
-            $_.RunspaceStateInfo.State -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened
-        } |
-        Sort-Object Id
-)[0]
-if ($null -eq $target) { return }
+$deadline = [DateTime]::UtcNow.AddMilliseconds(1200)
+$target = $null
+do {
+    $target = @(
+        Get-Runspace |
+            Where-Object {
+                $_ -ne $currentManagementRunspace -and
+                $_.RunspaceStateInfo.State -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened
+            } |
+            Sort-Object Id
+    )[0]
+    if ($null -eq $target) { return }
+    if ($target.RunspaceAvailability -eq [System.Management.Automation.Runspaces.RunspaceAvailability]::Available) {
+        break
+    }
+    Start-Sleep -Milliseconds 50
+} while ([DateTime]::UtcNow -lt $deadline)
 if ($target.RunspaceAvailability -ne [System.Management.Automation.Runspaces.RunspaceAvailability]::Available) { return }
+
+# First try the zero-pipeline SessionStateProxy path. Some hosts, notably
+# Windows PowerShell 5.1 under process remoting, expose the runspace but reject
+# this proxy even while the interactive runspace is idle.
 try {
     $location = $target.SessionStateProxy.Path.CurrentLocation
     if ($null -ne $location -and $location.Provider.Name -eq 'FileSystem') {
         [string]$location.Path
+        return
     }
 }
 catch {
-    # Some Windows PowerShell hosts do not allow SessionStateProxy access over
-    # process remoting even when the interactive runspace itself is idle.
+}
+
+# Fallback: invoke a read-only pipeline in the exact idle interactive runspace.
+# This does not use terminal input/PSReadLine and therefore does not alter the
+# user's command history. Assign the here-string before AddScript so Windows
+# PowerShell 5.1 parses the closing delimiter on its own line.
+$probe = $null
+try {
+    $probeScript = @'
+$location = $ExecutionContext.SessionState.Path.CurrentLocation
+if ($null -ne $location -and $location.Provider.Name -eq 'FileSystem') {
+    [string]$location.Path
+}
+'@
+    $probe = [System.Management.Automation.PowerShell]::Create()
+    $probe.Runspace = $target
+    [void]$probe.AddScript($probeScript)
+    $result = @($probe.Invoke())
+    if (-not $probe.HadErrors -and $result.Count -gt 0 -and $null -ne $result[0]) {
+        [string]$result[0]
+    }
+}
+catch {
+}
+finally {
+    if ($null -ne $probe) { $probe.Dispose() }
 }
 "#;
 
-        let output = run_management_query(session, query, "CWD")?;
+        let Some(output) = run_management_query(session, query, "CWD") else {
+            logging::info(
+                SERVICE_RESTART_LOG_COMPONENT,
+                format!(
+                    "PowerShell exact CWD probe pid={:?} shell={} result=unavailable stage=management-query",
+                    session.pid,
+                    session.shell.as_str(),
+                ),
+            );
+            return None;
+        };
         let directory = output.trim().to_owned();
         if directory.is_empty() {
             if let Some(pid) = session.pid {
@@ -74,6 +125,14 @@ catch {
                     ),
                 );
             }
+            logging::info(
+                SERVICE_RESTART_LOG_COMPONENT,
+                format!(
+                    "PowerShell exact CWD probe pid={:?} shell={} result=unavailable stage=target-runspace",
+                    session.pid,
+                    session.shell.as_str(),
+                ),
+            );
             return None;
         }
         if !Path::new(&directory).is_dir() {
@@ -86,6 +145,14 @@ catch {
                     ),
                 );
             }
+            logging::warn(
+                SERVICE_RESTART_LOG_COMPONENT,
+                format!(
+                    "PowerShell exact CWD probe pid={:?} shell={} result=non-directory cwd={directory:?}",
+                    session.pid,
+                    session.shell.as_str(),
+                ),
+            );
             return None;
         }
 
@@ -95,6 +162,14 @@ catch {
                 format!("PowerShell runspace CWD probe: pid={pid} exact_cwd={directory:?}"),
             );
         }
+        logging::info(
+            SERVICE_RESTART_LOG_COMPONENT,
+            format!(
+                "PowerShell exact CWD probe pid={:?} shell={} result=trusted cwd={directory:?} source=runspace",
+                session.pid,
+                session.shell.as_str(),
+            ),
+        );
         Some(directory)
     }
 }
@@ -203,7 +278,7 @@ for ($i = 0; $i -lt $queryBytes.Length; $i++) {
 $queryScript = [Text.Encoding]::UTF8.GetString($queryBytes)
 $conn = [System.Management.Automation.Runspaces.NamedPipeConnectionInfo]::new($targetPid)
 $conn.OpenTimeout = 1500
-$conn.OperationTimeout = 1500
+$conn.OperationTimeout = 2500
 $managementRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($conn)
 try {
     $managementRunspace.Open()

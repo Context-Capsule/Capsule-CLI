@@ -33,14 +33,31 @@ pub(crate) fn enrich_for_matching(snapshot: &TerminalSnapshot) -> TerminalSnapsh
     prepared
 }
 
-fn is_windows_terminal_powershell(session: &TerminalSession) -> bool {
-    session.host == TerminalHost::WindowsTerminal
-        && matches!(session.environment, TerminalEnvironment::Windows)
+fn is_windows_powershell(session: &TerminalSession) -> bool {
+    matches!(session.environment, TerminalEnvironment::Windows)
         && matches!(session.shell, ShellKind::PowerShell | ShellKind::WindowsPowerShell)
 }
 
+fn is_windows_terminal_powershell(session: &TerminalSession) -> bool {
+    session.host == TerminalHost::WindowsTerminal && is_windows_powershell(session)
+}
+
+/// VS Code and Cursor terminals are not restored through this generic terminal
+/// path. VS Code is owned by its semantic adapter when that identity exists and
+/// orphaned legacy VS Code terminal records are deliberately suppressed; Cursor
+/// terminals are preserved but not restored until a Cursor adapter exists.
+/// Probing those processes through PowerShell process remoting is therefore
+/// pure latency and can cost several seconds per terminal.
+fn should_probe_exact_powershell_location(session: &TerminalSession) -> bool {
+    is_windows_powershell(session)
+        && !matches!(
+            session.host,
+            TerminalHost::VisualStudioCode | TerminalHost::Cursor
+        )
+}
+
 fn has_trusted_exact_directory(session: &TerminalSession) -> bool {
-    is_windows_terminal_powershell(session)
+    is_windows_powershell(session)
         && session.working_directory.is_some()
         && matches!(
             session.working_directory_source,
@@ -59,14 +76,38 @@ fn enrich_exact_powershell_locations_with<F>(
 ) where
     F: Fn(&TerminalSession) -> Option<String>,
 {
+    // Terminal discovery can contain multiple reconciled records for the same
+    // live shell PID (for example persisted Windows Terminal metadata plus a
+    // process-backed record). A PowerShell management probe is process-scoped,
+    // so probing the same PID twice can only repeat the same expensive work.
+    // Cache both successes and failures and apply the one result to every record.
+    let mut probe_cache = HashMap::<u32, Option<String>>::new();
+
     for session in &mut snapshot.sessions {
-        if !is_windows_terminal_powershell(session) || has_trusted_exact_directory(session) {
+        if !should_probe_exact_powershell_location(session) || has_trusted_exact_directory(session) {
             continue;
         }
 
+        let Some(pid) = session.pid else {
+            logging::info(
+                TERMINAL_LOG_COMPONENT,
+                format!(
+                    "{stage}: exact PowerShell runspace CWD skipped for session without a PID"
+                ),
+            );
+            continue;
+        };
+
         let previous_directory = session.working_directory.clone();
         let previous_source = session.working_directory_source.clone();
-        let Some(directory) = probe(session) else {
+        let directory = if let Some(cached) = probe_cache.get(&pid) {
+            cached.clone()
+        } else {
+            let result = probe(session);
+            probe_cache.insert(pid, result.clone());
+            result
+        };
+        let Some(directory) = directory else {
             logging::info(
                 TERMINAL_LOG_COMPONENT,
                 format!(
@@ -89,7 +130,13 @@ fn enrich_exact_powershell_locations_with<F>(
 }
 
 fn ui_probe_is_safe(safety_snapshot: &TerminalSnapshot, stage: &str) -> bool {
-    ui_probe_is_safe_with(safety_snapshot, stage, powershell_runspace::is_idle)
+    // RunspaceAvailability used to be queried here as an additional diagnostic,
+    // but Available/Busy/unavailable were all explicitly advisory and all three
+    // states continued to the same UI fallback. Each query can take seconds on
+    // Windows PowerShell, so paying that cost cannot improve safety. The actual
+    // safety invariant is the process inventory below: never inject a UI probe
+    // while any Windows Terminal PowerShell pane has a foreground child command.
+    ui_probe_is_safe_with(safety_snapshot, stage, |_| None)
 }
 
 fn ui_probe_is_safe_with<F>(
@@ -100,6 +147,8 @@ fn ui_probe_is_safe_with<F>(
 where
     F: Fn(&TerminalSession) -> Option<bool>,
 {
+    let mut idle_cache = HashMap::<u32, Option<bool>>::new();
+
     for session in safety_snapshot
         .sessions
         .iter()
@@ -116,7 +165,20 @@ where
             return false;
         }
 
-        match idle_probe(session) {
+        let state = match session.pid {
+            Some(pid) => {
+                if let Some(cached) = idle_cache.get(&pid) {
+                    *cached
+                } else {
+                    let result = idle_probe(session);
+                    idle_cache.insert(pid, result);
+                    result
+                }
+            }
+            None => None,
+        };
+
+        match state {
             Some(true) => {
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
@@ -139,7 +201,7 @@ where
                 logging::info(
                     TERMINAL_LOG_COMPONENT,
                     format!(
-                        "{stage}: PowerShell UI CWD safety gate pid={:?}: idle API unavailable; continuing because process inventory has no foreground child command",
+                        "{stage}: PowerShell UI CWD safety gate pid={:?}: runspace idle advisory skipped/unavailable; process inventory has no foreground child command",
                         session.pid,
                     ),
                 );
@@ -263,6 +325,18 @@ fn reorder_windows_terminal_powershell_sessions(
     );
 }
 
+fn direct_powershell_executable(executable: &str) -> bool {
+    let name = executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe"
+    )
+}
+
 fn apply_exact_directory(
     session: &mut TerminalSession,
     directory: String,
@@ -273,6 +347,18 @@ fn apply_exact_directory(
 ) {
     session.working_directory = Some(directory.clone());
     session.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
+
+    if session.host != TerminalHost::WindowsTerminal {
+        if let Some(restart) = session.restart.as_mut() {
+            if direct_powershell_executable(&restart.executable) {
+                restart.working_directory = Some(directory.clone());
+                restart.note = Some(
+                    "Starts the captured interactive PowerShell in its exact captured $PWD without replaying shell history or foreground commands."
+                        .to_owned(),
+                );
+            }
+        }
+    }
 
     logging::info(
         TERMINAL_LOG_COMPONENT,
@@ -289,6 +375,7 @@ mod tests {
     use crate::adapters::terminal::{
         RestartPlan, TerminalHistoryPolicy, TerminalSource, TerminalStatus,
     };
+    use std::cell::Cell;
 
     fn snapshot_with(session: TerminalSession) -> TerminalSnapshot {
         snapshot_with_sessions(vec![session])
@@ -337,6 +424,13 @@ mod tests {
         }
     }
 
+    fn fake_standalone_powershell(host: TerminalHost) -> TerminalSession {
+        let mut session = fake_windows_terminal_powershell();
+        session.host = host;
+        session.profile = None;
+        session
+    }
+
     fn apply_ui_results_for_test(
         snapshot: &mut TerminalSnapshot,
         exact_by_pid: &HashMap<u32, String>,
@@ -377,6 +471,65 @@ mod tests {
             session.working_directory_source,
             WorkingDirectorySource::WindowsTerminalState
         );
+    }
+
+    #[test]
+    fn duplicate_records_for_one_pid_are_probed_once() {
+        let first = fake_windows_terminal_powershell_with_pid(42);
+        let second = first.clone();
+        let mut snapshot = snapshot_with_sessions(vec![first, second]);
+        let calls = Cell::new(0usize);
+
+        enrich_exact_powershell_locations_with(&mut snapshot, "test", |_| {
+            calls.set(calls.get() + 1);
+            Some(r"D:\actual-project".to_owned())
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert!(snapshot
+            .sessions
+            .iter()
+            .all(|session| session.working_directory.as_deref() == Some(r"D:\actual-project")));
+    }
+
+    #[test]
+    fn semantic_editor_terminals_are_not_runspace_probed() {
+        for host in [TerminalHost::VisualStudioCode, TerminalHost::Cursor] {
+            let mut session = fake_windows_terminal_powershell();
+            session.host = host;
+            let original = session.clone();
+            let mut snapshot = snapshot_with(session);
+
+            enrich_exact_powershell_locations_with(&mut snapshot, "test", |_| {
+                panic!("semantic editor terminals must not use generic PowerShell CWD probing")
+            });
+
+            assert_eq!(snapshot.sessions[0], original);
+        }
+    }
+
+    #[test]
+    fn standalone_powershell_exact_cwd_replaces_process_fallback_and_restart_directory() {
+        for host in [TerminalHost::Unknown, TerminalHost::ConsoleHost] {
+            let mut snapshot = snapshot_with(fake_standalone_powershell(host));
+            enrich_exact_powershell_locations_with(&mut snapshot, "test", |session| {
+                (session.pid == Some(42)).then(|| r"D:\actual-project".to_owned())
+            });
+
+            let session = &snapshot.sessions[0];
+            assert_eq!(session.working_directory.as_deref(), Some(r"D:\actual-project"));
+            assert_eq!(
+                session
+                    .restart
+                    .as_ref()
+                    .and_then(|plan| plan.working_directory.as_deref()),
+                Some(r"D:\actual-project")
+            );
+            assert_eq!(
+                session.working_directory_source,
+                WorkingDirectorySource::WindowsTerminalState
+            );
+        }
     }
 
     #[test]
@@ -423,6 +576,20 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_ui_safety_records_probe_idle_state_once_per_pid() {
+        let first = fake_windows_terminal_powershell_with_pid(42);
+        let second = first.clone();
+        let snapshot = snapshot_with_sessions(vec![first, second]);
+        let calls = Cell::new(0usize);
+
+        assert!(ui_probe_is_safe_with(&snapshot, "test", |_| {
+            calls.set(calls.get() + 1);
+            Some(true)
+        }));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn foreground_child_command_still_blocks_ui_fallback_even_if_runspace_looks_available() {
         let mut session = fake_windows_terminal_powershell();
         session.foreground_command = Some("node server.js".to_owned());
@@ -433,6 +600,14 @@ mod tests {
     #[test]
     fn failed_runspace_probe_preserves_existing_fallback() {
         let original = fake_windows_terminal_powershell();
+        let mut snapshot = snapshot_with(original.clone());
+        enrich_exact_powershell_locations_with(&mut snapshot, "test", |_| None);
+        assert_eq!(snapshot.sessions[0], original);
+    }
+
+    #[test]
+    fn failed_standalone_runspace_probe_preserves_existing_restart_fallback() {
+        let original = fake_standalone_powershell(TerminalHost::ConsoleHost);
         let mut snapshot = snapshot_with(original.clone());
         enrich_exact_powershell_locations_with(&mut snapshot, "test", |_| None);
         assert_eq!(snapshot.sessions[0], original);
