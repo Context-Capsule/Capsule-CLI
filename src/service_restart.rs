@@ -1,5 +1,7 @@
 #[path = "terminal_context.rs"]
 mod terminal_context;
+#[path = "psreadline_history.rs"]
+mod psreadline_history;
 
 use crate::{
     adapters::terminal::{self, TerminalEnvironment, TerminalHost, TerminalSession},
@@ -774,7 +776,7 @@ fn capture_and_interrupt_services() -> Result<Vec<CapturedService>, String> {
                 terminal_name: session.title.clone(),
                 profile: session.profile.clone(),
                 working_directory: session.working_directory.clone(),
-                command: validate_restart_command(command)?,
+                command: psreadline_history::capture_command(session, command)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
