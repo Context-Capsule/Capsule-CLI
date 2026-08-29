@@ -6,6 +6,7 @@ use crate::{
             PROTOCOL_VERSION,
         },
     },
+    logging,
     service_policy::{
         CALLER_PID_ENV, RestartPolicy, RestoreDecision, RestoreDecisionFile, RestoreDecisionKind,
         SERVICE_DECISIONS_ENV, ServicePlan,
@@ -35,6 +36,7 @@ const SERVICE_PLAN_TIMEOUT: Duration = RESPONSE_TIMEOUT;
 const START_ATTEMPTS: usize = 120;
 const START_POLL: Duration = Duration::from_millis(25);
 const EXISTING_START_ATTEMPTS: usize = 80;
+const SERVICE_RESTART_LOG_COMPONENT: &str = "service-restart";
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub fn run(args: Vec<String>) -> ExitCode {
@@ -46,13 +48,49 @@ pub fn run(args: Vec<String>) -> ExitCode {
         Ok(invocation) => invocation,
         Err(error) => return print_agent_error(error),
     };
+    let is_restore = invocation.args.first().map(String::as_str) == Some("restore");
+    if is_restore {
+        logging::info(
+            SERVICE_RESTART_LOG_COMPONENT,
+            format!(
+                "restore client begin args={:?} cwd={:?} stdin_interactive={}",
+                invocation.args,
+                invocation.current_directory,
+                io::stdin().is_terminal()
+            ),
+        );
+    }
+
     let state = match ensure_running() {
         Ok(state) => state,
-        Err(error) => return print_agent_error(error),
+        Err(error) => {
+            if is_restore {
+                logging::error(
+                    SERVICE_RESTART_LOG_COMPONENT,
+                    format!("restore client could not start/connect Local Agent: {error}"),
+                );
+            }
+            return print_agent_error(error);
+        }
     };
+    if is_restore {
+        logging::info(
+            SERVICE_RESTART_LOG_COMPONENT,
+            format!("restore client using Local Agent pid={} port={}", state.pid, state.port),
+        );
+    }
+
     let decision_file = match prepare_service_decisions(&state, &mut invocation) {
         Ok(path) => path,
-        Err(error) => return print_agent_error(error),
+        Err(error) => {
+            if is_restore {
+                logging::error(
+                    SERVICE_RESTART_LOG_COMPONENT,
+                    format!("restore decision preparation failed: {error}"),
+                );
+            }
+            return print_agent_error(error);
+        }
     };
     let response = request(
         &state,
@@ -63,8 +101,21 @@ pub fn run(args: Vec<String>) -> ExitCode {
         let _ = fs::remove_file(path);
     }
     match response {
-        Ok(response) => render_response(response),
-        Err(error) => print_agent_error(error),
+        Ok(response) => {
+            if is_restore {
+                log_restore_response(&response);
+            }
+            render_response(response)
+        }
+        Err(error) => {
+            if is_restore {
+                logging::error(
+                    SERVICE_RESTART_LOG_COMPONENT,
+                    format!("restore request failed before worker response: {error}"),
+                );
+            }
+            print_agent_error(error)
+        }
     }
 }
 
@@ -207,16 +258,37 @@ fn prepare_service_decisions(
                 (!stderr.is_empty()).then_some(stderr)
             })
             .unwrap_or("the service-plan worker did not return a successful plan");
+        logging::error(
+            SERVICE_RESTART_LOG_COMPONENT,
+            format!(
+                "service-plan failed ok={} exit={} detail={detail:?}",
+                response.ok, response.exit_code
+            ),
+        );
         return Err(AgentError::Runtime(format!(
             "could not prepare saved-service restart prompts before restore: {detail}"
         )));
     }
     let plan: ServicePlan = serde_json::from_str(response.stdout.trim()).map_err(|error| {
+        logging::error(
+            SERVICE_RESTART_LOG_COMPONENT,
+            format!(
+                "service-plan JSON parse failed: {error}; stdout={:?}",
+                response.stdout.trim()
+            ),
+        );
         AgentError::Protocol(format!(
             "saved-service restart plan was invalid and restore was stopped before silently skipping services: {error}"
         ))
     })?;
     if plan.services.is_empty() {
+        logging::info(
+            SERVICE_RESTART_LOG_COMPONENT,
+            format!(
+                "service-plan capsule={} revision={} services=0",
+                plan.capsule_name, plan.revision
+            ),
+        );
         return Ok(None);
     }
 
@@ -225,10 +297,27 @@ fn prepare_service_decisions(
     // such as `cargo run` or when output is tee'd/redirected while input still
     // comes from a real console.
     let interactive = io::stdin().is_terminal();
+    logging::info(
+        SERVICE_RESTART_LOG_COMPONENT,
+        format!(
+            "service-plan capsule={} revision={} services={} stdin_interactive={interactive}",
+            plan.capsule_name,
+            plan.revision,
+            plan.services.len()
+        ),
+    );
+
     let mut decisions = Vec::new();
-    let mut skipped_noninteractive = false;
+    let mut auto_started_noninteractive = false;
     for service in &plan.services {
         if service.restart_policy == RestartPolicy::Always {
+            logging::info(
+                SERVICE_RESTART_LOG_COMPONENT,
+                format!(
+                    "service decision index={} policy=always command={:?} source=persisted-policy",
+                    service.service_index, service.command
+                ),
+            );
             continue;
         }
         let decision = if interactive {
@@ -237,23 +326,43 @@ fn prepare_service_decisions(
             }
             prompt_service_decision(&service.command)?
         } else {
-            skipped_noninteractive = true;
-            // Make the safe fallback explicit in the decision file rather than
-            // omitting the file and relying on the worker's missing-decision
-            // fallback. This keeps public-CLI behavior deterministic.
-            RestoreDecisionKind::Skip
+            auto_started_noninteractive = true;
+            // A saved running service is part of the captured working state.
+            // When the caller has no interactive stdin (for example an app or
+            // extension invoking `capsule restore`), skipping Ask services made
+            // restore silently incomplete. Preserve explicit Skip decisions
+            // from interactive/decision-capable callers, but otherwise start
+            // the captured service once for this restore.
+            noninteractive_service_decision()
         };
+        logging::info(
+            SERVICE_RESTART_LOG_COMPONENT,
+            format!(
+                "service decision index={} policy=ask command={:?} decision={decision:?} source={}",
+                service.service_index,
+                service.command,
+                if interactive { "interactive" } else { "noninteractive-default" }
+            ),
+        );
         decisions.push(RestoreDecision {
             service_index: service.service_index,
             decision,
         });
     }
-    if skipped_noninteractive {
+    if auto_started_noninteractive {
         eprintln!(
-            "warning: saved service restart prompts were skipped because stdin is not interactive; Ask services were explicitly skipped and services configured as Always still start"
+            "warning: stdin is not interactive; saved Ask services will start once for this restore"
+        );
+        logging::warn(
+            SERVICE_RESTART_LOG_COMPONENT,
+            "stdin is not interactive; Ask services defaulted to StartOnce instead of being silently skipped",
         );
     }
     if decisions.is_empty() {
+        logging::info(
+            SERVICE_RESTART_LOG_COMPONENT,
+            "service-plan contains only Always services; no decision file required",
+        );
         return Ok(None);
     }
 
@@ -283,7 +392,21 @@ fn prepare_service_decisions(
         key: SERVICE_DECISIONS_ENV.to_owned(),
         value: path.to_string_lossy().into_owned(),
     });
+    logging::info(
+        SERVICE_RESTART_LOG_COMPONENT,
+        format!(
+            "decision file prepared path={:?} capsule={} revision={} decisions={}",
+            path,
+            decision_file.capsule_name,
+            decision_file.revision,
+            decision_file.decisions.len()
+        ),
+    );
     Ok(Some(path))
+}
+
+fn noninteractive_service_decision() -> RestoreDecisionKind {
+    RestoreDecisionKind::StartOnce
 }
 
 fn prompt_service_decision(command: &str) -> Result<RestoreDecisionKind, AgentError> {
@@ -443,6 +566,21 @@ fn request(
     Ok(response)
 }
 
+fn log_restore_response(response: &AgentResponse) {
+    logging::info(
+        SERVICE_RESTART_LOG_COMPONENT,
+        format!(
+            "restore worker response ok={} exit={} subsystem={:?} stdout={:?} stderr={:?} error={:?}",
+            response.ok,
+            response.exit_code,
+            response.subsystem,
+            response.stdout.trim(),
+            response.stderr.trim(),
+            response.error
+        ),
+    );
+}
+
 fn render_response(response: AgentResponse) -> ExitCode {
     if !response.stdout.is_empty() {
         let _ = io::stdout().write_all(response.stdout.as_bytes());
@@ -533,5 +671,13 @@ mod tests {
     fn service_plan_waits_as_long_as_the_restore_it_protects() {
         assert_eq!(SERVICE_PLAN_TIMEOUT, RESPONSE_TIMEOUT);
         assert!(SERVICE_PLAN_TIMEOUT >= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn noninteractive_restore_starts_ask_services_once() {
+        assert_eq!(
+            noninteractive_service_decision(),
+            RestoreDecisionKind::StartOnce
+        );
     }
 }

@@ -1,4 +1,7 @@
-use crate::adapters::terminal::{ShellKind, TerminalEnvironment, TerminalSession};
+use crate::{
+    adapters::terminal::{ShellKind, TerminalEnvironment, TerminalSession},
+    logging,
+};
 use context_capsule::service_policy::validate_restart_command;
 
 #[cfg(windows)]
@@ -10,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+const SERVICE_RESTART_LOG_COMPONENT: &str = "service-restart";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
@@ -28,7 +32,27 @@ pub(crate) fn capture_command(
     foreground_command: &str,
 ) -> Result<String, String> {
     let typed_command = last_typed_command(session);
-    choose_command(foreground_command, typed_command.as_deref())
+    let typed_command_is_safe = typed_command
+        .as_deref()
+        .is_some_and(|command| validate_restart_command(command).is_ok());
+    let command = choose_command(foreground_command, typed_command.as_deref())?;
+    logging::info(
+        SERVICE_RESTART_LOG_COMPONENT,
+        format!(
+            "service capture pid={:?} shell={} history_available={} history_safe={} selected_source={} selected_command={:?}",
+            session.pid,
+            session.shell.as_str(),
+            typed_command.is_some(),
+            typed_command_is_safe,
+            if typed_command_is_safe {
+                "psreadline"
+            } else {
+                "foreground-process"
+            },
+            command
+        ),
+    );
+    Ok(command)
 }
 
 fn choose_command(
