@@ -9,7 +9,7 @@ use crate::{
     system::{self, SystemInfo},
     toolchain::{self, ToolVersion, VersionHint},
 };
-use std::{env, path::PathBuf, thread, time::Instant};
+use std::{env, path::PathBuf, time::Instant};
 
 const PERFORMANCE_LOG_COMPONENT: &str = "performance";
 
@@ -67,8 +67,6 @@ pub fn discover(
         ),
     );
 
-    // Git discovery establishes the project root used for version-hint files, so
-    // keep it ahead of the independent adapter probes below.
     let phase = Instant::now();
     let git = match git::discover_current() {
         Ok(context) => GitState::Context(context),
@@ -88,92 +86,65 @@ pub fn discover(
         GitState::NotRepository | GitState::GitUnavailable => current_directory.clone(),
     };
 
-    // Toolchain, desktop, Docker, and terminal discovery are read-only snapshots
-    // with no data dependency on one another. Running them concurrently removes
-    // avoidable wall-clock serialization while preserving each adapter's existing
-    // implementation, timeout, fallback, and safety behavior.
-    let (
-        ((tools, version_hints), tools_elapsed_ms),
-        (desktop, desktop_elapsed_ms),
-        (docker, docker_elapsed_ms),
-        (terminals, terminals_elapsed_ms),
-    ) = thread::scope(|scope| {
-        let tools_handle = scope.spawn(|| {
-            let phase = Instant::now();
-            let result = if include_tools {
-                (
-                    toolchain::discover_tools(),
-                    toolchain::discover_version_hints(&project_root),
-                )
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            (result, phase.elapsed().as_millis())
-        });
-
-        let desktop_handle = scope.spawn(|| {
-            let phase = Instant::now();
-            let result = if include_desktop {
-                desktop::discover()
-            } else {
-                Err("desktop discovery was not requested".to_owned())
-            };
-            (result, phase.elapsed().as_millis())
-        });
-
-        let docker_handle = scope.spawn(|| {
-            let phase = Instant::now();
-            let result = if include_docker {
-                docker::discover()
-            } else {
-                DockerSnapshot::not_requested()
-            };
-            (result, phase.elapsed().as_millis())
-        });
-
-        let terminals_handle = scope.spawn(|| {
-            let phase = Instant::now();
-            let result = if include_terminals {
-                terminal::discover()
-            } else {
-                TerminalSnapshot::not_requested()
-            };
-            (result, phase.elapsed().as_millis())
-        });
-
+    let phase = Instant::now();
+    let (tools, version_hints) = if include_tools {
         (
-            tools_handle.join().expect("toolchain discovery thread panicked"),
-            desktop_handle.join().expect("desktop discovery thread panicked"),
-            docker_handle.join().expect("Docker discovery thread panicked"),
-            terminals_handle.join().expect("terminal discovery thread panicked"),
+            toolchain::discover_tools(),
+            toolchain::discover_version_hints(&project_root),
         )
-    });
-
+    } else {
+        (Vec::new(), Vec::new())
+    };
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
         format!(
-            "discovery.phase tools elapsed_ms={tools_elapsed_ms} enabled={include_tools} tools={} hints={}",
+            "discovery.phase tools elapsed_ms={} enabled={include_tools} tools={} hints={}",
+            phase.elapsed().as_millis(),
             tools.len(),
             version_hints.len()
         ),
     );
+
+    let phase = Instant::now();
+    let desktop = if include_desktop {
+        desktop::discover()
+    } else {
+        Err("desktop discovery was not requested".to_owned())
+    };
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
         format!(
-            "discovery.phase desktop elapsed_ms={desktop_elapsed_ms} enabled={include_desktop} ok={}",
+            "discovery.phase desktop elapsed_ms={} enabled={include_desktop} ok={}",
+            phase.elapsed().as_millis(),
             desktop.is_ok()
         ),
     );
+
+    let phase = Instant::now();
+    let docker = if include_docker {
+        docker::discover()
+    } else {
+        DockerSnapshot::not_requested()
+    };
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
         format!(
-            "discovery.phase docker elapsed_ms={docker_elapsed_ms} enabled={include_docker}"
+            "discovery.phase docker elapsed_ms={} enabled={include_docker}",
+            phase.elapsed().as_millis()
         ),
     );
+
+    let phase = Instant::now();
+    let terminals = if include_terminals {
+        terminal::discover()
+    } else {
+        TerminalSnapshot::not_requested()
+    };
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
         format!(
-            "discovery.phase terminals elapsed_ms={terminals_elapsed_ms} enabled={include_terminals} sessions={}",
+            "discovery.phase terminals elapsed_ms={} enabled={include_terminals} sessions={}",
+            phase.elapsed().as_millis(),
             terminals.sessions.len()
         ),
     );
