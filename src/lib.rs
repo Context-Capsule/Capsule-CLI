@@ -10,10 +10,14 @@ pub mod adapters;
 pub mod browser;
 pub mod chrome;
 pub mod cleanup;
+pub mod continuation_notes;
 pub mod desktop;
+pub mod desktop_api;
 pub mod diagnostics;
 pub mod diff;
+pub mod discovery;
 pub mod explorer;
+pub mod git;
 #[path = "git_context_v3.rs"]
 pub mod git_context;
 pub mod local_agent;
@@ -22,8 +26,10 @@ pub mod persistence;
 pub mod restore;
 pub mod restore_bus;
 pub mod service_policy;
+pub mod system;
 pub(crate) mod terminal_context;
 pub mod terminal_interrupt;
+pub mod toolchain;
 pub mod vscode;
 
 #[cfg(windows)]

@@ -1,0 +1,125 @@
+name: Desktop API
+
+on:
+  push:
+    branches:
+      - feature/desktop-app-api-20260830
+    paths:
+      - 'src/desktop_api.rs'
+      - 'src/capsule_main.rs'
+      - 'src/lib.rs'
+      - '.github/workflows/desktop-api.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-api-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+
+      - name: Ensure stable Rust toolchain
+        shell: pwsh
+        run: |
+          Get-Command rustup -ErrorAction Stop | Format-List Source
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+          rustc --version
+          cargo --version
+
+      # The repository's existing global rustfmt gate currently reports
+      # pre-existing formatting drift in many untouched main-branch files.
+      # This focused integration gate deliberately validates behavior/compile
+      # without reformatting unrelated mature restore/terminal code.
+      - name: Check all Rust targets
+        run: cargo check --all-targets
+
+      - name: Desktop API focused tests
+        run: cargo test desktop_api -- --nocapture
+
+      - name: Full Rust test suite
+        run: cargo test --all-targets
+
+      - name: Build complete release runtime
+        run: cargo build --release --bins
+
+      - name: Desktop API discovery and diagnostics smoke
+        shell: pwsh
+        env:
+          CONTEXT_CAPSULE_DB: ${{ runner.temp }}\desktop-api.db
+          CONTEXT_CAPSULE_LOG_DIR: ${{ runner.temp }}\desktop-api-logs
+        run: |
+          Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
+          Remove-Item $env:CONTEXT_CAPSULE_LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
+
+          $contractRaw = & .\target\release\capsule.exe desktop contract | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'desktop contract command failed' }
+          $contract = $contractRaw | ConvertFrom-Json
+          if (-not $contract.ok) { throw "desktop contract returned failure: $($contract.error)" }
+          if ($contract.api_version -ne 1) { throw "desktop envelope API version mismatch: $($contract.api_version)" }
+          if ($contract.data.api_version -ne 1) { throw "desktop contract payload API version mismatch: $($contract.data.api_version)" }
+          foreach ($feature in @('application-discovery','live-workspace','services','log-paths')) {
+            if (-not ($contract.data.features -contains $feature)) { throw "desktop contract is missing $feature feature" }
+          }
+
+          $applicationTimer = [Diagnostics.Stopwatch]::StartNew()
+          $applicationsRaw = & .\target\release\capsule.exe desktop applications | Out-String
+          $applicationTimer.Stop()
+          if ($LASTEXITCODE -ne 0) { throw 'desktop applications command failed' }
+          $applications = $applicationsRaw | ConvertFrom-Json
+          if (-not $applications.ok) { throw "desktop applications returned failure: $($applications.error)" }
+          if ($applications.api_version -ne 1) { throw 'desktop applications envelope API version mismatch' }
+          if ($null -eq $applications.data.applications) { throw 'desktop applications did not return an applications array' }
+          if ($null -eq $applications.data.browsers) { throw 'desktop applications did not return browser freshness data' }
+          Write-Host ("desktop applications returned {0} app(s) in {1} ms" -f $applications.data.applications.Count, $applicationTimer.ElapsedMilliseconds)
+
+          $liveTimer = [Diagnostics.Stopwatch]::StartNew()
+          $liveRaw = & .\target\release\capsule.exe desktop live | Out-String
+          $liveTimer.Stop()
+          if ($LASTEXITCODE -ne 0) { throw 'desktop live command failed' }
+          $live = $liveRaw | ConvertFrom-Json
+          if (-not $live.ok) { throw "desktop live returned failure: $($live.error)" }
+          if ($live.api_version -ne 1) { throw 'desktop live envelope API version mismatch' }
+          if ($null -eq $live.data.applications) { throw 'desktop live did not return an applications array' }
+          Write-Host ("desktop live returned {0} app(s) in {1} ms" -f $live.data.applications.Count, $liveTimer.ElapsedMilliseconds)
+
+          $logPath = Join-Path $env:CONTEXT_CAPSULE_LOG_DIR 'application-discovery.log'
+          if (-not (Test-Path $logPath -PathType Leaf)) { throw 'application-discovery.log was not created' }
+          $log = Get-Content $logPath -Raw
+          foreach ($marker in @('applications.begin','applications.desktop.complete','applications.complete','live.begin','live.discovery.complete','live.complete')) {
+            if ($log -notmatch [regex]::Escape($marker)) { throw "application-discovery.log is missing marker: $marker" }
+          }
+          Write-Host 'Application discovery diagnostic log:'
+          Get-Content $logPath | Select-Object -Last 20
+
+          $overviewRaw = & .\target\release\capsule.exe desktop overview | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'desktop overview command failed' }
+          $overview = $overviewRaw | ConvertFrom-Json
+          if (-not $overview.ok) { throw "desktop overview returned failure: $($overview.error)" }
+          if ($overview.api_version -ne 1) { throw 'desktop overview envelope API version mismatch' }
+          if ($null -eq $overview.data.capsules) { throw 'desktop overview did not return a capsules array' }
+
+      - name: Verify packaged CLI binaries exist
+        shell: pwsh
+        run: |
+          @(
+            '.\target\release\capsule.exe',
+            '.\target\release\capsule-agent-worker.exe',
+            '.\target\release\capsule-firefox-host.exe',
+            '.\target\release\capsule-chrome-host.exe'
+          ) | ForEach-Object {
+            if (-not (Test-Path $_ -PathType Leaf)) { throw "missing required desktop runtime binary: $_" }
+          }

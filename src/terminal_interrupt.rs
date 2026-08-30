@@ -9,14 +9,19 @@ use std::{
 };
 
 const HELPER_COMMAND: &str = "__capsule-console-control";
+const BATCH_TERMINATION_PROMPT: &str = "terminate batch job (y/n)?";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn caller_ancestry_script(caller_pid: u32) -> String {
     format!(
-        r#"$ErrorActionPreference='Stop'; $current=[uint32]{caller_pid}; $seen=@{{}}; $items=if(Get-Command Get-CimInstance -ErrorAction SilentlyContinue){{Get-CimInstance -ClassName Win32_Process}}{{Get-WmiObject -Class Win32_Process}}; $byPid=@{{}}; foreach($item in $items){{$pidKey=[uint32]$item.ProcessId; $byPid[$pidKey]=$item}}; for($i=0;$i -lt 32;$i++){{if($seen.ContainsKey($current)){{break}}; $seen[$current]=$true; $p=$byPid[$current]; if(-not $p){{break}}; $name=([string]$p.Name).ToLowerInvariant(); if($name -in @('pwsh.exe','powershell.exe','cmd.exe','bash.exe','zsh.exe','fish.exe','nu.exe','nushell.exe','sh.exe')){{[Console]::WriteLine([uint32]$p.ProcessId); break}}; $current=[uint32]$p.ParentProcessId}}"#
+        r#"$ErrorActionPreference='Stop'; $current=[uint32]{caller_pid}; $seen=@{{}}; $items=if(Get-Command Get-CimInstance -ErrorAction SilentlyContinue){{Get-CimInstance -ClassName Win32_Process}}{{Get-WmiObject -ClassName Win32_Process}}; $byPid=@{{}}; foreach($item in $items){{$pidKey=[uint32]$item.ProcessId; $byPid[$pidKey]=$item}}; for($i=0;$i -lt 32;$i++){{if($seen.ContainsKey($current)){{break}}; $seen[$current]=$true; $p=$byPid[$current]; if(-not $p){{break}}; $name=([string]$p.Name).ToLowerInvariant(); if($name -in @('pwsh.exe','powershell.exe','cmd.exe','bash.exe','zsh.exe','fish.exe','nu.exe','nushell.exe','sh.exe')){{[Console]::WriteLine([uint32]$p.ProcessId); break}}; $current=[uint32]$p.ParentProcessId}}"#
     )
+}
+
+fn contains_batch_termination_prompt(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(BATCH_TERMINATION_PROMPT)
 }
 
 pub fn caller_shell_pid(caller_pid: u32) -> Result<Option<u32>, String> {
@@ -170,6 +175,46 @@ const CONSOLE_INPUT_NAME: [u16; 7] = [
     b'$' as u16,
     0,
 ];
+#[cfg(windows)]
+const CONSOLE_OUTPUT_NAME: [u16; 8] = [
+    b'C' as u16,
+    b'O' as u16,
+    b'N' as u16,
+    b'O' as u16,
+    b'U' as u16,
+    b'T' as u16,
+    b'$' as u16,
+    0,
+];
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Coord {
+    x: i16,
+    y: i16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SmallRect {
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ConsoleScreenBufferInfo {
+    size: Coord,
+    cursor_position: Coord,
+    attributes: u16,
+    window: SmallRect,
+    maximum_window_size: Coord,
+}
 
 #[cfg(windows)]
 #[repr(C)]
@@ -216,6 +261,17 @@ unsafe extern "system" {
         handler: Option<unsafe extern "system" fn(u32) -> i32>,
         add: i32,
     ) -> i32;
+    fn GetConsoleScreenBufferInfo(
+        console_output: Handle,
+        info: *mut ConsoleScreenBufferInfo,
+    ) -> i32;
+    fn ReadConsoleOutputCharacterW(
+        console_output: Handle,
+        character: *mut u16,
+        length: u32,
+        read_coord: Coord,
+        read: *mut u32,
+    ) -> i32;
     fn CreateFileW(
         file_name: *const u16,
         desired_access: u32,
@@ -246,22 +302,109 @@ fn attach_console(pid: u32) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn open_console_output(pid: u32) -> Result<Handle, String> {
+    let handle = unsafe {
+        CreateFileW(
+            CONSOLE_OUTPUT_NAME.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return Err(format!(
+            "could not open CONOUT$ for terminal shell PID {pid}: {error}"
+        ));
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn console_tail_contains_batch_prompt(pid: u32) -> bool {
+    let output = match open_console_output(pid) {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+
+    let found = (|| {
+        let mut info = ConsoleScreenBufferInfo::default();
+        if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 || info.size.x <= 0 {
+            return false;
+        }
+
+        let width = info.size.x as u32;
+        let start_y = info.cursor_position.y.saturating_sub(2).max(0);
+        let rows = (info.cursor_position.y - start_y + 1).max(1) as u32;
+        let length = width.saturating_mul(rows).min(4096);
+        if length == 0 {
+            return false;
+        }
+
+        let mut buffer = vec![0_u16; length as usize];
+        let mut read = 0_u32;
+        if unsafe {
+            ReadConsoleOutputCharacterW(
+                output,
+                buffer.as_mut_ptr(),
+                length,
+                Coord { x: 0, y: start_y },
+                &mut read,
+            )
+        } == 0
+            || read == 0
+        {
+            return false;
+        }
+
+        contains_batch_termination_prompt(&String::from_utf16_lossy(&buffer[..read as usize]))
+    })();
+
+    unsafe {
+        let _ = CloseHandle(output);
+    }
+    found
+}
+
+#[cfg(windows)]
+fn confirm_batch_termination_if_prompted(pid: u32) -> Result<bool, String> {
+    // cmd.exe prints this prompt only after Ctrl+C reaches a running batch file.
+    // Process discovery can already look idle at that point, so inspect CONOUT$
+    // on the attached console before the save transaction is allowed to move on.
+    for _ in 0..10 {
+        if console_tail_contains_batch_prompt(pid) {
+            write_console_input_attached(pid, "Y")?;
+            thread::sleep(Duration::from_millis(120));
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
 fn ctrl_c_attached(pid: u32) -> Result<(), String> {
     attach_console(pid)?;
-    let result = unsafe {
+    let generated = unsafe {
         let _ = SetConsoleCtrlHandler(None, 1);
-        let generated = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
-        if generated != 0 {
-            thread::sleep(Duration::from_millis(150));
-        }
-        let _ = FreeConsole();
-        generated
+        GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)
     };
-    if result == 0 {
-        Err(format!("could not deliver Ctrl+C to terminal shell PID {pid}"))
-    } else {
-        Ok(())
+    if generated == 0 {
+        unsafe {
+            let _ = FreeConsole();
+        }
+        return Err(format!("could not deliver Ctrl+C to terminal shell PID {pid}"));
     }
+
+    thread::sleep(Duration::from_millis(150));
+    let confirmation = confirm_batch_termination_if_prompted(pid);
+    unsafe {
+        let _ = FreeConsole();
+    }
+    confirmation.map(|_| ())
 }
 
 #[cfg(windows)]
@@ -314,18 +457,8 @@ fn open_console_input(pid: u32) -> Result<Handle, String> {
 }
 
 #[cfg(windows)]
-fn write_console_input(pid: u32, command: &str) -> Result<(), String> {
-    attach_console(pid)?;
-    let handle = match open_console_input(pid) {
-        Ok(handle) => handle,
-        Err(error) => {
-            unsafe {
-                let _ = FreeConsole();
-            }
-            return Err(error);
-        }
-    };
-
+fn write_console_input_attached(pid: u32, command: &str) -> Result<(), String> {
+    let handle = open_console_input(pid)?;
     let records = console_input_records(command);
     let mut written = 0_u32;
     let ok = unsafe {
@@ -343,22 +476,31 @@ fn write_console_input(pid: u32, command: &str) -> Result<(), String> {
     };
     unsafe {
         let _ = CloseHandle(handle);
-        let _ = FreeConsole();
     }
 
     if let Some(error) = write_error {
         return Err(format!(
-            "could not write restart command to terminal shell PID {pid} using CONIN$: {error} ({written}/{} input events written)",
+            "could not write terminal input to shell PID {pid} using CONIN$: {error} ({written}/{} input events written)",
             records.len()
         ));
     }
     if written as usize != records.len() {
         return Err(format!(
-            "could not write complete restart command to terminal shell PID {pid} using CONIN$ ({written}/{} input events written)",
+            "could not write complete terminal input to shell PID {pid} using CONIN$ ({written}/{} input events written)",
             records.len()
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn write_console_input(pid: u32, command: &str) -> Result<(), String> {
+    attach_console(pid)?;
+    let result = write_console_input_attached(pid, command);
+    unsafe {
+        let _ = FreeConsole();
+    }
+    result.map_err(|error| error.replace("terminal input", "restart command"))
 }
 
 #[cfg(test)]
@@ -370,11 +512,23 @@ mod tests {
         let script = caller_ancestry_script(4242);
         assert!(script.contains("$current=[uint32]4242"));
         assert!(script.contains("Get-CimInstance -ClassName Win32_Process"));
-        assert!(script.contains("Get-WmiObject -Class Win32_Process"));
+        assert!(script.contains("Get-WmiObject -ClassName Win32_Process"));
         assert!(script.contains("$pidKey=[uint32]$item.ProcessId"));
         assert!(script.contains("$p=$byPid[$current]"));
         assert!(!script.contains("-Filter"));
         assert!(!script.contains("\\\""));
+    }
+
+    #[test]
+    fn batch_termination_prompt_detection_is_specific_and_case_insensitive() {
+        assert!(contains_batch_termination_prompt(
+            "^C\r\nTerminate batch job (Y/N)?"
+        ));
+        assert!(contains_batch_termination_prompt(
+            "terminate BATCH job (y/n)?"
+        ));
+        assert!(!contains_batch_termination_prompt("Overwrite file (Y/N)?"));
+        assert!(!contains_batch_termination_prompt("Terminate process?"));
     }
 
     #[test]
@@ -410,7 +564,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn console_input_name_is_null_terminated_conin() {
+    fn console_device_names_are_null_terminated() {
         assert_eq!(CONSOLE_INPUT_NAME, [67, 79, 78, 73, 78, 36, 0]);
+        assert_eq!(CONSOLE_OUTPUT_NAME, [67, 79, 78, 79, 85, 84, 36, 0]);
     }
 }

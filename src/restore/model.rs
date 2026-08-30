@@ -17,11 +17,19 @@ impl SavedDesktop {
         let Some(value) = snapshot.get("desktop") else {
             return Ok(None);
         };
-        let desktop: Self = serde_json::from_value(value.clone())
+        let mut desktop: Self = serde_json::from_value(value.clone())
             .map_err(|error| format!("invalid saved desktop metadata: {error}"))?;
         if desktop.status != "available" {
             return Ok(None);
         }
+
+        // Context Capsule is infrastructure, not workspace state. Older capsules
+        // may contain the desktop app because it was visible during capture.
+        // Never launch or reposition that saved window during restore: doing so
+        // can move the full application into the tray panel's size/position.
+        desktop
+            .applications
+            .retain(|application| !is_context_capsule_desktop_application(application));
         Ok(Some(desktop))
     }
 }
@@ -76,6 +84,33 @@ impl SavedApplication {
         }
         self.name.clone()
     }
+}
+
+fn is_context_capsule_desktop_application(application: &SavedApplication) -> bool {
+    if application.name.eq_ignore_ascii_case("Context Capsule")
+        || application
+            .name
+            .eq_ignore_ascii_case("context-capsule-desktop")
+    {
+        return true;
+    }
+
+    application
+        .executable_path
+        .as_deref()
+        .into_iter()
+        .chain(
+            application
+                .launch
+                .as_ref()
+                .map(|launch| launch.target.as_str()),
+        )
+        .filter_map(|value| value.rsplit(['\\', '/']).find(|part| !part.is_empty()))
+        .any(|name| {
+            name.eq_ignore_ascii_case("context-capsule-desktop.exe")
+                || name.eq_ignore_ascii_case("context-capsule-desktop")
+                || name.eq_ignore_ascii_case("Context Capsule.exe")
+        })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -533,6 +568,43 @@ mod tests {
             is_on_current_virtual_desktop: Some(true),
             taskbar_candidate: true,
         }
+    }
+
+    #[test]
+    fn context_capsule_desktop_is_never_a_restore_target() {
+        let snapshot = serde_json::json!({
+            "desktop": {
+                "status": "available",
+                "displays": [],
+                "applications": [
+                    {
+                        "name": "context-capsule-desktop",
+                        "executable_path": r"C:\\work\\context-capsule-desktop.exe",
+                        "app_user_model_id": null,
+                        "file_version": null,
+                        "classification": "user-application",
+                        "launch": { "strategy": "executable", "target": r"C:\\work\\context-capsule-desktop.exe" },
+                        "windows": [],
+                        "discovered_as_background": false
+                    },
+                    {
+                        "name": "Spotify",
+                        "executable_path": r"C:\\Users\\me\\Spotify.exe",
+                        "app_user_model_id": null,
+                        "file_version": null,
+                        "classification": "user-application",
+                        "launch": { "strategy": "executable", "target": r"C:\\Users\\me\\Spotify.exe" },
+                        "windows": [],
+                        "discovered_as_background": false
+                    }
+                ]
+            }
+        });
+        let desktop = SavedDesktop::from_capsule(&snapshot)
+            .expect("valid desktop")
+            .expect("available desktop");
+        assert_eq!(desktop.applications.len(), 1);
+        assert_eq!(desktop.applications[0].name, "Spotify");
     }
 
     #[test]
