@@ -10,6 +10,10 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        // Desktop reads are intentionally direct and side-effect free. Mutating
+        // save/restore/service operations continue through the Local Agent and
+        // the mature CLI transaction paths below.
+        Some("desktop") => context_capsule::desktop_api::run(arguments[1..].to_vec()),
         _ => context_capsule::local_agent::client::run(arguments),
     }
 }
