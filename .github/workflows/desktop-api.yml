@@ -56,21 +56,24 @@ jobs:
       - name: Build complete release runtime
         run: cargo build --release --bins
 
-      - name: Desktop API contract and lightweight application smoke
+      - name: Desktop API discovery and diagnostics smoke
         shell: pwsh
         env:
           CONTEXT_CAPSULE_DB: ${{ runner.temp }}\desktop-api.db
+          CONTEXT_CAPSULE_LOG_DIR: ${{ runner.temp }}\desktop-api-logs
         run: |
           Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
+          Remove-Item $env:CONTEXT_CAPSULE_LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
+
           $contractRaw = & .\target\release\capsule.exe desktop contract | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'desktop contract command failed' }
           $contract = $contractRaw | ConvertFrom-Json
           if (-not $contract.ok) { throw "desktop contract returned failure: $($contract.error)" }
           if ($contract.api_version -ne 1) { throw "desktop envelope API version mismatch: $($contract.api_version)" }
           if ($contract.data.api_version -ne 1) { throw "desktop contract payload API version mismatch: $($contract.data.api_version)" }
-          if (-not ($contract.data.features -contains 'application-discovery')) { throw 'desktop contract is missing application-discovery feature' }
-          if (-not ($contract.data.features -contains 'live-workspace')) { throw 'desktop contract is missing live-workspace feature' }
-          if (-not ($contract.data.features -contains 'services')) { throw 'desktop contract is missing services feature' }
+          foreach ($feature in @('application-discovery','live-workspace','services','log-paths')) {
+            if (-not ($contract.data.features -contains $feature)) { throw "desktop contract is missing $feature feature" }
+          }
 
           $applicationTimer = [Diagnostics.Stopwatch]::StartNew()
           $applicationsRaw = & .\target\release\capsule.exe desktop applications | Out-String
@@ -82,6 +85,25 @@ jobs:
           if ($null -eq $applications.data.applications) { throw 'desktop applications did not return an applications array' }
           if ($null -eq $applications.data.browsers) { throw 'desktop applications did not return browser freshness data' }
           Write-Host ("desktop applications returned {0} app(s) in {1} ms" -f $applications.data.applications.Count, $applicationTimer.ElapsedMilliseconds)
+
+          $liveTimer = [Diagnostics.Stopwatch]::StartNew()
+          $liveRaw = & .\target\release\capsule.exe desktop live | Out-String
+          $liveTimer.Stop()
+          if ($LASTEXITCODE -ne 0) { throw 'desktop live command failed' }
+          $live = $liveRaw | ConvertFrom-Json
+          if (-not $live.ok) { throw "desktop live returned failure: $($live.error)" }
+          if ($live.api_version -ne 1) { throw 'desktop live envelope API version mismatch' }
+          if ($null -eq $live.data.applications) { throw 'desktop live did not return an applications array' }
+          Write-Host ("desktop live returned {0} app(s) in {1} ms" -f $live.data.applications.Count, $liveTimer.ElapsedMilliseconds)
+
+          $logPath = Join-Path $env:CONTEXT_CAPSULE_LOG_DIR 'application-discovery.log'
+          if (-not (Test-Path $logPath -PathType Leaf)) { throw 'application-discovery.log was not created' }
+          $log = Get-Content $logPath -Raw
+          foreach ($marker in @('applications.begin','applications.desktop.complete','applications.complete','live.begin','live.discovery.complete','live.complete')) {
+            if ($log -notmatch [regex]::Escape($marker)) { throw "application-discovery.log is missing marker: $marker" }
+          }
+          Write-Host 'Application discovery diagnostic log:'
+          Get-Content $logPath | Select-Object -Last 20
 
           $overviewRaw = & .\target\release\capsule.exe desktop overview | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'desktop overview command failed' }
