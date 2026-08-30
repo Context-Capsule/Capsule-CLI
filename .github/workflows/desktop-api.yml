@@ -56,7 +56,7 @@ jobs:
       - name: Build complete release runtime
         run: cargo build --release --bins
 
-      - name: Desktop API contract smoke
+      - name: Desktop API contract and lightweight application smoke
         shell: pwsh
         env:
           CONTEXT_CAPSULE_DB: ${{ runner.temp }}\desktop-api.db
@@ -68,8 +68,20 @@ jobs:
           if (-not $contract.ok) { throw "desktop contract returned failure: $($contract.error)" }
           if ($contract.api_version -ne 1) { throw "desktop envelope API version mismatch: $($contract.api_version)" }
           if ($contract.data.api_version -ne 1) { throw "desktop contract payload API version mismatch: $($contract.data.api_version)" }
+          if (-not ($contract.data.features -contains 'application-discovery')) { throw 'desktop contract is missing application-discovery feature' }
           if (-not ($contract.data.features -contains 'live-workspace')) { throw 'desktop contract is missing live-workspace feature' }
           if (-not ($contract.data.features -contains 'services')) { throw 'desktop contract is missing services feature' }
+
+          $applicationTimer = [Diagnostics.Stopwatch]::StartNew()
+          $applicationsRaw = & .\target\release\capsule.exe desktop applications | Out-String
+          $applicationTimer.Stop()
+          if ($LASTEXITCODE -ne 0) { throw 'desktop applications command failed' }
+          $applications = $applicationsRaw | ConvertFrom-Json
+          if (-not $applications.ok) { throw "desktop applications returned failure: $($applications.error)" }
+          if ($applications.api_version -ne 1) { throw 'desktop applications envelope API version mismatch' }
+          if ($null -eq $applications.data.applications) { throw 'desktop applications did not return an applications array' }
+          if ($null -eq $applications.data.browsers) { throw 'desktop applications did not return browser freshness data' }
+          Write-Host ("desktop applications returned {0} app(s) in {1} ms" -f $applications.data.applications.Count, $applicationTimer.ElapsedMilliseconds)
 
           $overviewRaw = & .\target\release\capsule.exe desktop overview | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'desktop overview command failed' }
