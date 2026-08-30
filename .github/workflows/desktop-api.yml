@@ -6,6 +6,7 @@ on:
       - validation/restore-cwd-service-20260830
     paths:
       - 'scripts/apply-restore-cwd-service-fix.mjs'
+      - 'scripts/apply-restore-cwd-service-safety.mjs'
       - 'src/commands.rs'
       - 'src/service_restart.rs'
       - 'src/terminal_context.rs'
@@ -40,13 +41,17 @@ jobs:
           rustup default stable
           rustc --version
           cargo --version
-      - name: Validate and apply guarded source patch
+      - name: Validate and apply guarded source patches
         shell: pwsh
         run: |
           node --check scripts/apply-restore-cwd-service-fix.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'patch script syntax check failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'main patch script syntax check failed' }
+          node --check scripts/apply-restore-cwd-service-safety.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'safety patch script syntax check failed' }
           node scripts/apply-restore-cwd-service-fix.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'guarded patch failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'guarded main patch failed' }
+          node scripts/apply-restore-cwd-service-safety.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'guarded safety patch failed' }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw 'patched tree has whitespace errors' }
           git diff --stat
@@ -104,10 +109,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Apply guarded source patch
+      - name: Apply guarded source patches
         run: |
           node --check scripts/apply-restore-cwd-service-fix.mjs
+          node --check scripts/apply-restore-cwd-service-safety.mjs
           node scripts/apply-restore-cwd-service-fix.mjs
+          node scripts/apply-restore-cwd-service-safety.mjs
           git diff --check
       - name: Format
         run: cargo fmt --all -- --check
