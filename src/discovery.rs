@@ -51,14 +51,20 @@ pub fn discover(
         .map_err(|error| format!("failed to determine current directory: {error}"))?;
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
-        format!("discovery.phase current_directory elapsed_ms={}", phase.elapsed().as_millis()),
+        format!(
+            "discovery.phase current_directory elapsed_ms={}",
+            phase.elapsed().as_millis()
+        ),
     );
 
     let phase = Instant::now();
     let system = system::discover();
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
-        format!("discovery.phase system elapsed_ms={}", phase.elapsed().as_millis()),
+        format!(
+            "discovery.phase system elapsed_ms={}",
+            phase.elapsed().as_millis()
+        ),
     );
 
     let phase = Instant::now();
@@ -69,7 +75,10 @@ pub fn discover(
     };
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
-        format!("discovery.phase git elapsed_ms={}", phase.elapsed().as_millis()),
+        format!(
+            "discovery.phase git elapsed_ms={}",
+            phase.elapsed().as_millis()
+        ),
     );
 
     let project_root = match &git {
@@ -142,7 +151,10 @@ pub fn discover(
 
     logging::info(
         PERFORMANCE_LOG_COMPONENT,
-        format!("discovery.complete elapsed_ms={}", started.elapsed().as_millis()),
+        format!(
+            "discovery.complete elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
     );
 
     Ok(DiscoverySnapshot {
