@@ -164,8 +164,6 @@ const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 #[cfg(windows)]
 const OPEN_EXISTING: u32 = 3;
 #[cfg(windows)]
-const STD_OUTPUT_HANDLE: u32 = (-11_i32) as u32;
-#[cfg(windows)]
 const INVALID_HANDLE_VALUE: Handle = (-1_isize) as Handle;
 #[cfg(windows)]
 const CONSOLE_INPUT_NAME: [u16; 7] = [
@@ -174,6 +172,17 @@ const CONSOLE_INPUT_NAME: [u16; 7] = [
     b'N' as u16,
     b'I' as u16,
     b'N' as u16,
+    b'$' as u16,
+    0,
+];
+#[cfg(windows)]
+const CONSOLE_OUTPUT_NAME: [u16; 8] = [
+    b'C' as u16,
+    b'O' as u16,
+    b'N' as u16,
+    b'O' as u16,
+    b'U' as u16,
+    b'T' as u16,
     b'$' as u16,
     0,
 ];
@@ -252,7 +261,6 @@ unsafe extern "system" {
         handler: Option<unsafe extern "system" fn(u32) -> i32>,
         add: i32,
     ) -> i32;
-    fn GetStdHandle(std_handle: u32) -> Handle;
     fn GetConsoleScreenBufferInfo(
         console_output: Handle,
         info: *mut ConsoleScreenBufferInfo,
@@ -294,51 +302,80 @@ fn attach_console(pid: u32) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn console_tail_contains_batch_prompt() -> bool {
-    let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    if output.is_null() || output == INVALID_HANDLE_VALUE {
-        return false;
-    }
-
-    let mut info = ConsoleScreenBufferInfo::default();
-    if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 || info.size.x <= 0 {
-        return false;
-    }
-
-    let width = info.size.x as u32;
-    let start_y = info.cursor_position.y.saturating_sub(2).max(0);
-    let rows = (info.cursor_position.y - start_y + 1).max(1) as u32;
-    let length = width.saturating_mul(rows).min(4096);
-    if length == 0 {
-        return false;
-    }
-
-    let mut buffer = vec![0_u16; length as usize];
-    let mut read = 0_u32;
-    if unsafe {
-        ReadConsoleOutputCharacterW(
-            output,
-            buffer.as_mut_ptr(),
-            length,
-            Coord { x: 0, y: start_y },
-            &mut read,
+fn open_console_output(pid: u32) -> Result<Handle, String> {
+    let handle = unsafe {
+        CreateFileW(
+            CONSOLE_OUTPUT_NAME.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
         )
-    } == 0
-        || read == 0
-    {
-        return false;
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return Err(format!(
+            "could not open CONOUT$ for terminal shell PID {pid}: {error}"
+        ));
     }
+    Ok(handle)
+}
 
-    contains_batch_termination_prompt(&String::from_utf16_lossy(&buffer[..read as usize]))
+#[cfg(windows)]
+fn console_tail_contains_batch_prompt(pid: u32) -> bool {
+    let output = match open_console_output(pid) {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+
+    let found = (|| {
+        let mut info = ConsoleScreenBufferInfo::default();
+        if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 || info.size.x <= 0 {
+            return false;
+        }
+
+        let width = info.size.x as u32;
+        let start_y = info.cursor_position.y.saturating_sub(2).max(0);
+        let rows = (info.cursor_position.y - start_y + 1).max(1) as u32;
+        let length = width.saturating_mul(rows).min(4096);
+        if length == 0 {
+            return false;
+        }
+
+        let mut buffer = vec![0_u16; length as usize];
+        let mut read = 0_u32;
+        if unsafe {
+            ReadConsoleOutputCharacterW(
+                output,
+                buffer.as_mut_ptr(),
+                length,
+                Coord { x: 0, y: start_y },
+                &mut read,
+            )
+        } == 0
+            || read == 0
+        {
+            return false;
+        }
+
+        contains_batch_termination_prompt(&String::from_utf16_lossy(&buffer[..read as usize]))
+    })();
+
+    unsafe {
+        let _ = CloseHandle(output);
+    }
+    found
 }
 
 #[cfg(windows)]
 fn confirm_batch_termination_if_prompted(pid: u32) -> Result<bool, String> {
     // cmd.exe prints this prompt only after Ctrl+C reaches a running batch file.
-    // Process discovery can already look idle at that point, so inspect the
-    // attached console itself before the save transaction is allowed to move on.
+    // Process discovery can already look idle at that point, so inspect CONOUT$
+    // on the attached console before the save transaction is allowed to move on.
     for _ in 0..10 {
-        if console_tail_contains_batch_prompt() {
+        if console_tail_contains_batch_prompt(pid) {
             write_console_input_attached(pid, "Y")?;
             thread::sleep(Duration::from_millis(120));
             return Ok(true);
@@ -527,7 +564,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn console_input_name_is_null_terminated_conin() {
+    fn console_device_names_are_null_terminated() {
         assert_eq!(CONSOLE_INPUT_NAME, [67, 79, 78, 73, 78, 36, 0]);
+        assert_eq!(CONSOLE_OUTPUT_NAME, [67, 79, 78, 79, 85, 84, 36, 0]);
     }
 }
