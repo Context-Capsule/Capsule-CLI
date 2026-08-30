@@ -1,0 +1,80 @@
+name: Save Restore Performance Baseline
+
+on:
+  push:
+    branches:
+      - 'performance/**'
+    paths:
+      - 'src/**'
+      - '.github/workflows/performance-baseline.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline-windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+
+      - name: Ensure stable Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+          rustc --version
+          cargo --version
+
+      - name: Build profiling binaries
+        shell: pwsh
+        run: |
+          cargo build --bins
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build --bins failed' }
+
+      - name: Measure current save and restore paths
+        shell: pwsh
+        env:
+          CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-performance.db
+          CONTEXT_CAPSULE_LOG_DIR: ${{ runner.temp }}\context-capsule-performance-logs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
+          Remove-Item $env:CONTEXT_CAPSULE_LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $env:CONTEXT_CAPSULE_LOG_DIR | Out-Null
+          $capsule = Join-Path $PWD 'target\debug\capsule.exe'
+          $name = "perf-$env:GITHUB_RUN_ID"
+
+          function Invoke-MeasuredCapsule([string]$label, [string[]]$arguments) {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            & $capsule @arguments | Out-Host
+            $exit = $LASTEXITCODE
+            $sw.Stop()
+            Write-Host ("PERF total {0} elapsed_ms={1} exit={2}" -f $label, $sw.ElapsedMilliseconds, $exit)
+            if ($exit -ne 0) { throw "capsule $label failed with exit code $exit" }
+          }
+
+          Invoke-MeasuredCapsule 'desktop-applications' @('desktop', 'applications')
+          Invoke-MeasuredCapsule 'desktop-live' @('desktop', 'live')
+          Invoke-MeasuredCapsule 'save' @('save', $name)
+          Invoke-MeasuredCapsule 'restore-dry-run' @('restore', $name, '--dry-run')
+
+          Write-Host 'PERF log-files begin'
+          Get-ChildItem -Path $env:CONTEXT_CAPSULE_LOG_DIR -File -ErrorAction SilentlyContinue |
+            Sort-Object Name |
+            ForEach-Object {
+              Write-Host ("===== {0} =====" -f $_.Name)
+              Get-Content $_.FullName | ForEach-Object { Write-Host $_ }
+            }
+          Write-Host 'PERF log-files end'
