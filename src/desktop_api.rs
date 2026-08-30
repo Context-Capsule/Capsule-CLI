@@ -8,10 +8,11 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{path::Path, process::ExitCode, time::Duration};
+use std::{path::Path, process::ExitCode, time::{Duration, Instant}};
 
 pub const DESKTOP_API_VERSION: u32 = 1;
 const LOG_COMPONENT: &str = "desktop";
+const DISCOVERY_LOG_COMPONENT: &str = "application-discovery";
 
 #[derive(Debug, Serialize)]
 struct Envelope<T: Serialize> {
@@ -216,8 +217,34 @@ fn health() -> Result<Value, String> {
 }
 
 fn applications() -> Result<Value, String> {
-    let discovered = desktop::discover()
-        .map_err(|error| format!("application discovery failed: {error}"))?;
+    let started = Instant::now();
+    logging::info(DISCOVERY_LOG_COMPONENT, "applications.begin");
+    logging::info(DISCOVERY_LOG_COMPONENT, "applications.desktop.begin");
+    let desktop_started = Instant::now();
+    let discovered = match desktop::discover() {
+        Ok(discovered) => {
+            logging::info(
+                DISCOVERY_LOG_COMPONENT,
+                format!(
+                    "applications.desktop.complete elapsed_ms={} applications={} ignored={}",
+                    desktop_started.elapsed().as_millis(),
+                    discovered.applications.len(),
+                    discovered.ignored.len()
+                ),
+            );
+            discovered
+        }
+        Err(error) => {
+            logging::error(
+                DISCOVERY_LOG_COMPONENT,
+                format!(
+                    "applications.desktop.error elapsed_ms={} error={error}",
+                    desktop_started.elapsed().as_millis()
+                ),
+            );
+            return Err(format!("application discovery failed: {error}"));
+        }
+    };
     let applications = discovered
         .applications
         .iter()
@@ -232,10 +259,28 @@ fn applications() -> Result<Value, String> {
             "background": application.discovered_as_background,
         }))
         .collect::<Vec<_>>();
+    logging::info(DISCOVERY_LOG_COMPONENT, "applications.firefox.begin");
+    let browser_started = Instant::now();
     let firefox = browser::load_recent_firefox_state()
         .ok()
         .flatten()
         .and_then(|state| serde_json::to_value(state).ok());
+    logging::info(
+        DISCOVERY_LOG_COMPONENT,
+        format!(
+            "applications.firefox.complete elapsed_ms={} fresh={}",
+            browser_started.elapsed().as_millis(),
+            firefox.is_some()
+        ),
+    );
+    logging::info(
+        DISCOVERY_LOG_COMPONENT,
+        format!(
+            "applications.complete elapsed_ms={} applications={}",
+            started.elapsed().as_millis(),
+            applications.len()
+        ),
+    );
 
     Ok(json!({
         "applications": applications,
@@ -244,8 +289,36 @@ fn applications() -> Result<Value, String> {
 }
 
 fn live_workspace() -> Result<Value, String> {
-    let discovered = discovery::discover(true, true, true, true)
-        .map_err(|error| format!("live discovery failed: {error}"))?;
+    let started = Instant::now();
+    logging::info(DISCOVERY_LOG_COMPONENT, "live.begin");
+    logging::info(DISCOVERY_LOG_COMPONENT, "live.discovery.begin");
+    let discovery_started = Instant::now();
+    let discovered = match discovery::discover(true, true, true, true) {
+        Ok(discovered) => {
+            logging::info(
+                DISCOVERY_LOG_COMPONENT,
+                format!(
+                    "live.discovery.complete elapsed_ms={} desktop_ok={} tools={} terminals={} docker_available={}",
+                    discovery_started.elapsed().as_millis(),
+                    discovered.desktop.is_ok(),
+                    discovered.tools.len(),
+                    discovered.terminals.sessions.len(),
+                    discovered.docker.available
+                ),
+            );
+            discovered
+        }
+        Err(error) => {
+            logging::error(
+                DISCOVERY_LOG_COMPONENT,
+                format!(
+                    "live.discovery.error elapsed_ms={} error={error}",
+                    discovery_started.elapsed().as_millis()
+                ),
+            );
+            return Err(format!("live discovery failed: {error}"));
+        }
+    };
 
     let applications = match &discovered.desktop {
         Ok(desktop) => desktop
@@ -271,6 +344,8 @@ fn live_workspace() -> Result<Value, String> {
         GitState::NotRepository => json!({ "state": "not-repository" }),
         GitState::GitUnavailable => json!({ "state": "unavailable" }),
     };
+    logging::info(DISCOVERY_LOG_COMPONENT, "live.integrations.begin");
+    let integrations_started = Instant::now();
     let firefox = browser::load_recent_firefox_state()
         .ok()
         .flatten()
@@ -283,6 +358,24 @@ fn live_workspace() -> Result<Value, String> {
         .ok()
         .flatten()
         .and_then(|state| serde_json::to_value(state).ok());
+    logging::info(
+        DISCOVERY_LOG_COMPONENT,
+        format!(
+            "live.integrations.complete elapsed_ms={} firefox={} chrome={} editor={}",
+            integrations_started.elapsed().as_millis(),
+            firefox.is_some(),
+            chrome.is_some(),
+            editor.is_some()
+        ),
+    );
+    logging::info(
+        DISCOVERY_LOG_COMPONENT,
+        format!(
+            "live.complete elapsed_ms={} applications={}",
+            started.elapsed().as_millis(),
+            applications.len()
+        ),
+    );
 
     Ok(json!({
         "current_directory": discovered.current_directory.to_string_lossy(),
@@ -413,7 +506,14 @@ fn resolve_capsule_revision(
 }
 
 fn log_paths() -> Result<Value, String> {
-    let components = ["desktop", "services", "cli", "firefox", "chrome"];
+    let components = [
+        "desktop",
+        "application-discovery",
+        "services",
+        "cli",
+        "firefox",
+        "chrome",
+    ];
     let mut result = serde_json::Map::new();
     for component in components {
         if let Ok(path) = logging::component_log_path(component) {
@@ -526,5 +626,11 @@ mod tests {
         assert!(value["features"].as_array().is_some_and(|features| {
             features.iter().any(|feature| feature == "application-discovery")
         }));
+    }
+
+    #[test]
+    fn discovery_log_is_exposed_to_desktop_clients() {
+        let value = log_paths().unwrap();
+        assert!(value.get("application-discovery").is_some());
     }
 }
