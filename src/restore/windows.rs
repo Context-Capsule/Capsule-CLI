@@ -247,10 +247,9 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
     restore_desktop_with_policy(saved, dry_run, false)
 }
 
-/// Replays every saved window state even when the initial inventory already
-/// appears to match. This is used only for the final post-semantic pass so any
-/// focus/tab restoration side effects are overwritten by the saved physical
-/// desktop state instead of being accepted from a stale pre-focus observation.
+/// Replays ordinary floating window geometry in the final post-semantic pass,
+/// while native stateful layouts that are already satisfied are left untouched.
+/// Unsatisfied windows are still repaired by the normal placement path.
 pub fn restore_desktop_forced(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreReport {
     restore_desktop_with_policy(saved, dry_run, true)
 }
@@ -717,15 +716,22 @@ fn native_snap_direction(slot: SnapSlot) -> Option<SnapDirection> {
     }
 }
 
-fn force_layout_replay_supported(current: &CurrentWindow, saved: &SavedWindow) -> bool {
+fn force_layout_replay_supported(_current: &CurrentWindow, saved: &SavedWindow) -> bool {
     match saved.state_spec() {
-        WindowStateSpec::Snapped(slot) if native_snap_direction(slot).is_some() => {
-            // If IsWindowArranged is unavailable, the native snap helpers cannot
-            // verify a replay. Do not destroy a geometrically correct legacy
-            // layout just to force an unverifiable transition.
-            windows_snap::is_arranged(current.hwnd as Hwnd).is_some()
-        }
-        _ => true,
+        // The final pass takes a fresh Win32 inventory after semantic restore.
+        // For stateful layouts, a satisfied result is therefore authoritative:
+        // Maximize is verified with IsZoomed and supported native half-snaps are
+        // verified with IsWindowArranged. Replaying those states starts with
+        // SW_RESTORE/SetWindowPos and can itself destroy the native state we are
+        // trying to preserve. Unsatisfied windows still reach apply_window_state.
+        WindowStateSpec::Minimized
+        | WindowStateSpec::Maximized
+        | WindowStateSpec::Fullscreen
+        | WindowStateSpec::Snapped(_) => false,
+        WindowStateSpec::Unknown(_) if saved.state.starts_with("snapped:") => false,
+        // Preserve the historical forced convergence for ordinary floating
+        // windows, including Zen after semantic tab/window restoration.
+        WindowStateSpec::Normal | WindowStateSpec::Unknown(_) => true,
     }
 }
 
@@ -751,8 +757,11 @@ fn window_geometry_satisfied(
                     .is_some_and(|device| device.eq_ignore_ascii_case(&display.device_name))
         }
         WindowStateSpec::Fullscreen => {
+            // Older captures could label a real maximized window as fullscreen
+            // when its DWM frame happened to cover the complete monitor. If that
+            // stronger native state is still present and the geometry matches,
+            // preserve it rather than unmaximizing it into a floating rectangle.
             !current.minimized
-                && !current.maximized
                 && rect_close(current.bounds, display.bounds, GEOMETRY_TOLERANCE)
         }
         WindowStateSpec::Normal | WindowStateSpec::Snapped(_) | WindowStateSpec::Unknown(_) => {
@@ -1367,6 +1376,40 @@ mod tests {
         }
     }
 
+    fn current_window(bounds: SavedRect, maximized: bool) -> CurrentWindow {
+        CurrentWindow {
+            hwnd: 1,
+            pid: 1,
+            title: "Window".to_owned(),
+            bounds,
+            minimized: false,
+            maximized,
+            display_device: Some("DISPLAY1".to_owned()),
+            z_order: 0,
+            is_foreground: false,
+        }
+    }
+
+    fn display() -> TargetDisplay {
+        TargetDisplay {
+            device_name: "DISPLAY1".to_owned(),
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            work_area: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
+            is_primary: true,
+            relation_to_primary: "primary".to_owned(),
+        }
+    }
+
     #[test]
     fn process_identity_prefers_strong_aumid_or_path() {
         let process = CurrentProcess {
@@ -1453,24 +1496,7 @@ mod tests {
             z_order: 0,
             is_foreground: true,
         };
-        let display = TargetDisplay {
-            device_name: "DISPLAY1".to_owned(),
-            bounds: SavedRect {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1080,
-            },
-            work_area: SavedRect {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1040,
-            },
-            is_primary: true,
-            relation_to_primary: "primary".to_owned(),
-        };
-        let matches = match_windows(&application, &[&current_right, &current_left], &[display]);
+        let matches = match_windows(&application, &[&current_right, &current_left], &[display()]);
         assert_eq!(matches[0].1.hwnd, 1);
         assert_eq!(matches[1].1.hwnd, 2);
     }
@@ -1498,9 +1524,58 @@ mod tests {
     }
 
     #[test]
-    fn forced_final_pass_never_skips_an_initially_satisfied_window() {
-        let satisfied = true;
-        assert!(!(satisfied && !true));
-        assert!(satisfied && !false);
+    fn forced_final_pass_does_not_replay_satisfied_stateful_layouts() {
+        let current = current_window(display().bounds, true);
+        let mut saved = saved_window("Window", 0, false);
+
+        for state in [
+            "minimized",
+            "maximized",
+            "fullscreen",
+            "snapped:left-half",
+            "snapped:top-left-quarter",
+            "snapped:custom",
+        ] {
+            saved.state = state.to_owned();
+            assert!(
+                !force_layout_replay_supported(&current, &saved),
+                "{state} should not be destructively replayed when already satisfied"
+            );
+        }
+
+        saved.state = "normal".to_owned();
+        assert!(force_layout_replay_supported(&current, &saved));
+    }
+
+    #[test]
+    fn legacy_fullscreen_snapshot_accepts_maximized_full_display_window() {
+        let display = display();
+        let mut saved = saved_window("Window", 0, false);
+        saved.state = "fullscreen".to_owned();
+        saved.bounds = display.bounds;
+        let current = current_window(display.bounds, true);
+
+        assert!(window_geometry_satisfied(
+            &current,
+            &saved,
+            &display,
+            display.bounds
+        ));
+    }
+
+    #[test]
+    fn fullscreen_snapshot_rejects_maximized_work_area_geometry() {
+        let display = display();
+        let mut saved = saved_window("Window", 0, false);
+        saved.state = "fullscreen".to_owned();
+        saved.bounds = display.bounds;
+        let current = current_window(display.work_area, true);
+
+        assert!(!window_geometry_satisfied(
+            &current,
+            &saved,
+            &display,
+            display.bounds
+        ));
     }
 }
