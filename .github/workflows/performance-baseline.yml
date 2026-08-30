@@ -1,0 +1,106 @@
+name: Save Restore Performance Baseline
+
+on:
+  push:
+    branches:
+      - 'performance/**'
+    paths:
+      - 'src/**'
+      - '.github/workflows/performance-baseline.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  instrumentation-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --all-targets
+
+      - name: Test all targets
+        run: cargo test --all-targets
+
+  baseline-windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+
+      - name: Ensure stable Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+          rustc --version
+          cargo --version
+
+      - name: Build profiling binaries
+        shell: pwsh
+        run: |
+          cargo build --bins
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build --bins failed' }
+
+      - name: Measure read paths and isolated save/restore engine
+        shell: pwsh
+        env:
+          CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-performance.db
+          CONTEXT_CAPSULE_LOG_DIR: ${{ runner.temp }}\context-capsule-performance-logs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
+          Remove-Item $env:CONTEXT_CAPSULE_LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $env:CONTEXT_CAPSULE_LOG_DIR | Out-Null
+
+          $capsule = Join-Path $PWD 'target\debug\capsule.exe'
+          $worker = Join-Path $PWD 'target\debug\capsule-agent-worker.exe'
+          $name = "perf-$env:GITHUB_RUN_ID"
+
+          function Invoke-Measured([string]$label, [string]$executable, [string[]]$arguments) {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            & $executable @arguments | Out-Host
+            $exit = $LASTEXITCODE
+            $sw.Stop()
+            Write-Host ("PERF total {0} elapsed_ms={1} exit={2}" -f $label, $sw.ElapsedMilliseconds, $exit)
+            if ($exit -ne 0) { throw "$label failed with exit code $exit" }
+          }
+
+          # Direct desktop reads do not use the persistent Local Agent. Repeating
+          # the near-empty contract request gives a process-startup floor.
+          Invoke-Measured 'desktop-contract-1' $capsule @('desktop', 'contract')
+          Invoke-Measured 'desktop-contract-2' $capsule @('desktop', 'contract')
+          Invoke-Measured 'desktop-contract-3' $capsule @('desktop', 'contract')
+          Invoke-Measured 'desktop-applications' $capsule @('desktop', 'applications')
+          Invoke-Measured 'desktop-live' $capsule @('desktop', 'live')
+
+          # The public capsule binary routes mutations through a persistent Local
+          # Agent whose singleton deliberately ignores CONTEXT_CAPSULE_DB. Use the
+          # compatibility worker for profiling the mature engine directly so this
+          # temporary DB cannot affect the user's real agent/database.
+          Invoke-Measured 'engine-save' $worker @('save', $name)
+          Invoke-Measured 'engine-restore-dry-run' $worker @('restore', $name, '--dry-run')
+
+          Write-Host 'PERF log-files begin'
+          Get-ChildItem -Path $env:CONTEXT_CAPSULE_LOG_DIR -File -ErrorAction SilentlyContinue |
+            Sort-Object Name |
+            ForEach-Object {
+              Write-Host ("===== {0} =====" -f $_.Name)
+              Get-Content $_.FullName | ForEach-Object { Write-Host $_ }
+            }
+          Write-Host 'PERF log-files end'

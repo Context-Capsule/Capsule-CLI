@@ -1,0 +1,65 @@
+name: Toolchain Shim Diagnostic
+
+on:
+  push:
+    branches:
+      - 'performance/**'
+    paths:
+      - '.github/workflows/toolchain-shim-diagnostic.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-windows-shims:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
+
+      - name: Measure Node-family command shims
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          function Select-LaunchPath([string[]]$paths) {
+            foreach ($extension in @('.exe', '.com', '.cmd', '.bat')) {
+              $candidate = $paths | Where-Object { $_.ToLowerInvariant().EndsWith($extension) } | Select-Object -First 1
+              if ($candidate) { return $candidate }
+            }
+            return $paths | Select-Object -First 1
+          }
+
+          function Measure-Probe([string]$name, [string]$command, [string[]]$arguments) {
+            $where = [System.Diagnostics.Stopwatch]::StartNew()
+            $paths = @(& where.exe $command 2>$null)
+            $whereExit = $LASTEXITCODE
+            $where.Stop()
+            $path = Select-LaunchPath $paths
+            if ($whereExit -ne 0 -or [string]::IsNullOrWhiteSpace($path)) {
+              Write-Host ("SHIM name={0} where_ms={1} resolved=false" -f $name, $where.ElapsedMilliseconds)
+              $global:LASTEXITCODE = 0
+              return
+            }
+
+            foreach ($attempt in 1..3) {
+              $probe = [System.Diagnostics.Stopwatch]::StartNew()
+              $output = & $path @arguments 2>&1 | Out-String
+              $exit = $LASTEXITCODE
+              $probe.Stop()
+              $first = (($output -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+              if ($null -eq $first) { $first = '' }
+              $first = $first.Replace("`r", ' ').Replace("`n", ' ')
+              Write-Host ("SHIM name={0} attempt={1} where_ms={2} probe_ms={3} exit={4} path={5} first={6}" -f $name, $attempt, $where.ElapsedMilliseconds, $probe.ElapsedMilliseconds, $exit, $path, $first)
+              $global:LASTEXITCODE = 0
+            }
+          }
+
+          Measure-Probe 'npm' 'npm' @('--version')
+          Measure-Probe 'pnpm' 'pnpm' @('--version')
+          Measure-Probe 'npx' 'npx' @('--version')
+          Measure-Probe 'corepack' 'corepack' @('--version')
+          Measure-Probe 'yarn' 'yarn' @('--version')
