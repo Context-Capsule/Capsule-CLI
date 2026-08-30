@@ -727,17 +727,13 @@ fn build_window_info(
     let normalized = NormalizedRect::from_rect(geometry_bounds, display.work_area);
     let detected_snap =
         snap_from_arrangement(normalized, crate::windows_snap::is_arranged(window.hwnd));
-    let state = if window.minimized {
-        WindowState::Minimized
-    } else if rect_matches(window.bounds, display.bounds, 4) {
-        WindowState::Fullscreen
-    } else if window.maximized {
-        WindowState::Maximized
-    } else if let Some(snap) = detected_snap {
-        WindowState::Snapped(snap)
-    } else {
-        WindowState::Normal
-    };
+    let state = classify_window_state(
+        window.minimized,
+        window.maximized,
+        window.bounds,
+        display.bounds,
+        detected_snap,
+    );
     let (virtual_desktop_id, on_current_desktop) = virtual_desktops
         .map(|manager| manager.describe_window(window.hwnd))
         .unwrap_or((None, None));
@@ -756,6 +752,29 @@ fn build_window_info(
         is_on_current_virtual_desktop: on_current_desktop,
         taskbar_candidate: window.taskbar_candidate,
     })
+}
+
+fn classify_window_state(
+    minimized: bool,
+    maximized: bool,
+    bounds: Rect,
+    display_bounds: Rect,
+    detected_snap: Option<SnapPosition>,
+) -> WindowState {
+    if minimized {
+        WindowState::Minimized
+    } else if maximized {
+        // IsZoomed is a stronger signal than geometry. A maximized window can
+        // cover the full monitor (for example with an auto-hidden taskbar), and
+        // recording that as generic fullscreen loses the native maximize state.
+        WindowState::Maximized
+    } else if rect_matches(bounds, display_bounds, 4) {
+        WindowState::Fullscreen
+    } else if let Some(snap) = detected_snap {
+        WindowState::Snapped(snap)
+    } else {
+        WindowState::Normal
+    }
 }
 
 fn snap_from_arrangement(
@@ -1025,6 +1044,34 @@ mod tests {
             bottom: 1081,
         };
         assert!(rect_matches(window, display, 4));
+    }
+
+    #[test]
+    fn native_maximize_wins_over_full_display_geometry() {
+        let display = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert_eq!(
+            classify_window_state(false, true, display, display, None),
+            WindowState::Maximized
+        );
+    }
+
+    #[test]
+    fn non_zoomed_full_display_remains_fullscreen() {
+        let display = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert_eq!(
+            classify_window_state(false, false, display, display, None),
+            WindowState::Fullscreen
+        );
     }
 
     #[test]
