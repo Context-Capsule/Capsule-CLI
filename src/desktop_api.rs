@@ -1,5 +1,5 @@
 use crate::{
-    browser, chrome, continuation_notes, diagnostics, diff, discovery,
+    browser, chrome, continuation_notes, desktop, diagnostics, diff, discovery,
     discovery::GitState,
     logging,
     persistence::{self, CapsuleStore},
@@ -68,6 +68,7 @@ pub fn run(arguments: Vec<String>) -> ExitCode {
     let result = match arguments.as_slice() {
         [action] if action == "contract" => contract(),
         [action] if action == "overview" => overview(),
+        [action] if action == "applications" => applications(),
         [action] if action == "live" => live_workspace(),
         [action] if action == "health" => health(),
         [action] if action == "log-paths" => log_paths(),
@@ -76,7 +77,7 @@ pub fn run(arguments: Vec<String>) -> ExitCode {
         [action, reference] if action == "services" => services(reference),
         [action, before, after] if action == "diff" => capsule_diff(before, after),
         _ => Err(
-            "usage: capsule desktop <contract|overview|live|health|log-paths|capsule <ref>|history <name>|services <ref>|diff <before> <after>>"
+            "usage: capsule desktop <contract|overview|applications|live|health|log-paths|capsule <ref>|history <name>|services <ref>|diff <before> <after>>"
                 .to_owned(),
         ),
     };
@@ -118,6 +119,7 @@ fn contract() -> Result<Value, String> {
             "capsule-details",
             "history",
             "diff",
+            "application-discovery",
             "live-workspace",
             "health",
             "services",
@@ -211,6 +213,34 @@ fn capsule_diff(before: &str, after: &str) -> Result<Value, String> {
 
 fn health() -> Result<Value, String> {
     serde_json::to_value(diagnostics::run()).map_err(|error| error.to_string())
+}
+
+fn applications() -> Result<Value, String> {
+    let discovered = desktop::discover()
+        .map_err(|error| format!("application discovery failed: {error}"))?;
+    let applications = discovered
+        .applications
+        .iter()
+        .map(|application| json!({
+            "name": application.name,
+            "primary_pid": application.primary_pid,
+            "pids": application.pids,
+            "executable_path": application.executable_path,
+            "classification": application.classification.as_str(),
+            "confidence": application.confidence,
+            "window_count": application.windows.len(),
+            "background": application.discovered_as_background,
+        }))
+        .collect::<Vec<_>>();
+    let firefox = browser::load_recent_firefox_state()
+        .ok()
+        .flatten()
+        .and_then(|state| serde_json::to_value(state).ok());
+
+    Ok(json!({
+        "applications": applications,
+        "browsers": { "firefox": firefox },
+    }))
 }
 
 fn live_workspace() -> Result<Value, String> {
@@ -493,5 +523,8 @@ mod tests {
         let value = contract().unwrap();
         assert_eq!(value["api_version"], DESKTOP_API_VERSION);
         assert!(value["features"].as_array().is_some_and(|features| !features.is_empty()));
+        assert!(value["features"].as_array().is_some_and(|features| {
+            features.iter().any(|feature| feature == "application-discovery")
+        }));
     }
 }
