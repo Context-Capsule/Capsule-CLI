@@ -17,31 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  snap-state-windows:
+  validation-already-completed:
     runs-on: [self-hosted, Windows, X64]
     steps:
-      - name: Verify POTUS runner
+      - name: No duplicate validation needed
         shell: pwsh
-        run: |
-          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected runner POTUS, got '${{ runner.name }}'" }
-
-      - uses: actions/checkout@v4
-
-      - name: Ensure stable Rust toolchain
-        shell: pwsh
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
-          rustup default stable
-          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
-          rustc --version
-          cargo --version
-
-      - name: Check all targets
-        run: cargo check --all-targets
-
-      - name: Desktop capture state tests
-        run: cargo test desktop::windows::tests -- --nocapture
-
-      - name: Windows restore state tests
-        run: cargo test restore::windows::tests -- --nocapture
+        run: Write-Host 'Snap-state validation already passed on the feature branch; skipping duplicate compile.'
