@@ -254,6 +254,125 @@ pub fn restore_desktop_forced(saved: &SavedDesktop, dry_run: bool) -> DesktopRes
     restore_desktop_with_policy(saved, dry_run, true)
 }
 
+
+/// Restores only relative Z-order and the saved foreground window from
+/// a fresh post-placement inventory. This deliberately never moves,
+/// resizes, maximizes, minimizes, or re-snaps a window, making it safe
+/// as the last Windows restore operation after native Snap work.
+pub(super) fn restore_order_and_foreground_only(
+    saved: &SavedDesktop,
+) -> DesktopRestoreReport {
+    let mut report = DesktopRestoreReport {
+        applications_total: saved.applications.len(),
+        ..DesktopRestoreReport::default()
+    };
+
+    let inventory = match CurrentInventory::initial(saved) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            report.warnings.push(format!(
+                "final Z-order inventory failed; leaving the current stacking untouched: {error}"
+            ));
+            return report;
+        }
+    };
+
+    let mut desired = Vec::new();
+    for app in &saved.applications {
+        let current = inventory.windows_for_app(app);
+        let matches = match_windows(app, &current, &inventory.displays);
+        report.windows_total += app.windows.len();
+        report.windows_missing += app.windows.len().saturating_sub(matches.len());
+        desired.extend(matches);
+    }
+
+    if desired.is_empty() {
+        return report;
+    }
+    desired.sort_by_key(|(saved, _)| saved.z_order);
+
+    // Foreground acquisition itself can move a window in the Z stack.
+    // Do it before the authoritative live Z-order read, then make the
+    // final stack correction with SWP_NOACTIVATE so focus stays put.
+    if let Some((_, current)) = desired.iter().find(|(saved, _)| saved.is_foreground) {
+        if unsafe { GetForegroundWindow() } as usize != current.hwnd
+            && unsafe { SetForegroundWindow(current.hwnd as Hwnd) } == 0
+        {
+            report.warnings.push(
+                "Windows foreground-lock policy prevented restoring the saved foreground window"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let live_before = match enumerate_windows() {
+        Ok(live) => live,
+        Err(error) => {
+            report.warnings.push(format!(
+                "could not refresh live Z-order before final reconciliation: {error}"
+            ));
+            return report;
+        }
+    };
+
+    if relative_order_matches_live(&desired, &live_before) {
+        return report;
+    }
+
+    // Push from saved backmost to saved frontmost. HWND_TOP with
+    // NOMOVE/NOSIZE/NOACTIVATE changes only relative stacking: it does
+    // not disturb the maximized/native-Snap state validated earlier.
+    for (_, current) in desired.iter().rev() {
+        if unsafe {
+            SetWindowPos(
+                current.hwnd as Hwnd,
+                ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        } == 0
+        {
+            report
+                .warnings
+                .push("could not fully restore final relative window Z-order".to_owned());
+            return report;
+        }
+    }
+
+    match enumerate_windows() {
+        Ok(live) if !relative_order_matches_live(&desired, &live) => report.warnings.push(
+            "Windows accepted the final Z-order calls but the saved relative stacking did not converge"
+                .to_owned(),
+        ),
+        Err(error) => report.warnings.push(format!(
+            "could not verify final live Z-order: {error}"
+        )),
+        _ => {}
+    }
+
+    report
+}
+
+fn relative_order_matches_live(
+    desired: &[(&SavedWindow, &CurrentWindow)],
+    live: &[CurrentWindow],
+) -> bool {
+    desired.windows(2).all(|pair| {
+        let front = live
+            .iter()
+            .find(|window| window.hwnd == pair[0].1.hwnd)
+            .map(|window| window.z_order);
+        let back = live
+            .iter()
+            .find(|window| window.hwnd == pair[1].1.hwnd)
+            .map(|window| window.z_order);
+        matches!((front, back), (Some(front), Some(back)) if front < back)
+    })
+}
+
 fn restore_desktop_with_policy(
     saved: &SavedDesktop,
     dry_run: bool,

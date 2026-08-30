@@ -272,6 +272,15 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             final_desktop.warnings.extend(custom.warnings);
             final_desktop.failures.extend(custom.failures);
 
+// Native Snap reconstruction and foreground acquisition can alter
+// stacking after the generic Windows pass has already reconciled it.
+// Make Z-order the final authoritative operation, using a fresh live
+// inventory and no geometry/state changes.
+let final_order = windows::restore_order_and_foreground_only(desktop);
+final_desktop.warnings.extend(final_order.warnings);
+final_desktop.failures.extend(final_order.failures);
+
+
             report.desktop = final_desktop;
         }
     }
