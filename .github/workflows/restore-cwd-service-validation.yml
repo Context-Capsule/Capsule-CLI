@@ -1,0 +1,125 @@
+name: Restore CWD Service Validation
+
+on:
+  push:
+    branches:
+      - validation/restore-cwd-service-20260830
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restore-cwd-service-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-windows:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 45
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Ensure stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup install failed' }
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Validate and apply guarded source patch
+        shell: pwsh
+        run: |
+          node --check scripts/apply-restore-cwd-service-fix.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'patch script syntax check failed' }
+          node scripts/apply-restore-cwd-service-fix.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'guarded patch failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'patched tree has whitespace errors' }
+          git diff --stat
+
+      - name: Rust format
+        run: cargo fmt --all -- --check
+
+      - name: Focused terminal context tests
+        run: cargo test terminal_context::tests -- --nocapture
+
+      - name: Focused restore command tests
+        run: cargo test commands::tests -- --nocapture
+
+      - name: Focused service restart tests
+        run: cargo test service_restart::tests -- --nocapture
+
+      - name: Check all Rust targets
+        run: cargo check --all-targets
+
+      - name: Full Rust test suite
+        run: cargo test
+
+      - name: Build all binaries
+        run: cargo build --bins
+
+      - name: Verify terminal send-text path in isolated PowerShell console
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'context-capsule-send-text-smoke'
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $marker = Join-Path $dir 'marker.txt'
+          $escapedMarker = $marker.Replace("'", "''")
+          $process = Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NoExit' -WorkingDirectory $dir -PassThru
+          try {
+            Start-Sleep -Milliseconds 700
+            $command = "Set-Content -LiteralPath '$escapedMarker' -Value 'send-text-ok'"
+            & .\target\debug\capsule-agent-worker.exe __capsule-console-control send-text $process.Id $command
+            if ($LASTEXITCODE -ne 0) { throw 'terminal send-text helper failed' }
+            $deadline = (Get-Date).AddSeconds(5)
+            while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            if (-not (Test-Path $marker)) { throw 'injected PowerShell command did not execute' }
+            if ((Get-Content $marker -Raw).Trim() -ne 'send-text-ok') { throw 'unexpected send-text marker content' }
+            Write-Host 'isolated terminal send-text smoke passed'
+          } finally {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Show product-only diff
+        shell: pwsh
+        run: |
+          git diff -- src/commands.rs src/service_restart.rs src/terminal_context.rs
+
+  validate-linux:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 45
+    steps:
+      - name: Verify POTUS-linux runner
+        shell: bash
+        run: test '${{ runner.name }}' = 'POTUS-linux'
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply guarded source patch
+        run: |
+          node --check scripts/apply-restore-cwd-service-fix.mjs
+          node scripts/apply-restore-cwd-service-fix.mjs
+          git diff --check
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --all-targets
+      - name: Full tests
+        run: cargo test
