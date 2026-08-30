@@ -1,5 +1,6 @@
 name: Restore CWD Service Validation
 
+# This workflow intentionally lives only on the temporary validation branch.
 on:
   push:
     branches:
