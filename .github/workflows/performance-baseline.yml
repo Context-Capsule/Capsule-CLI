@@ -57,7 +57,7 @@ jobs:
           cargo build --bins
           if ($LASTEXITCODE -ne 0) { throw 'cargo build --bins failed' }
 
-      - name: Measure current save and restore paths
+      - name: Measure read paths and isolated save/restore engine
         shell: pwsh
         env:
           CONTEXT_CAPSULE_DB: ${{ runner.temp }}\context-capsule-performance.db
@@ -67,22 +67,34 @@ jobs:
           Remove-Item $env:CONTEXT_CAPSULE_DB -Force -ErrorAction SilentlyContinue
           Remove-Item $env:CONTEXT_CAPSULE_LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $env:CONTEXT_CAPSULE_LOG_DIR | Out-Null
+
           $capsule = Join-Path $PWD 'target\debug\capsule.exe'
+          $worker = Join-Path $PWD 'target\debug\capsule-agent-worker.exe'
           $name = "perf-$env:GITHUB_RUN_ID"
 
-          function Invoke-MeasuredCapsule([string]$label, [string[]]$arguments) {
+          function Invoke-Measured([string]$label, [string]$executable, [string[]]$arguments) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            & $capsule @arguments | Out-Host
+            & $executable @arguments | Out-Host
             $exit = $LASTEXITCODE
             $sw.Stop()
             Write-Host ("PERF total {0} elapsed_ms={1} exit={2}" -f $label, $sw.ElapsedMilliseconds, $exit)
-            if ($exit -ne 0) { throw "capsule $label failed with exit code $exit" }
+            if ($exit -ne 0) { throw "$label failed with exit code $exit" }
           }
 
-          Invoke-MeasuredCapsule 'desktop-applications' @('desktop', 'applications')
-          Invoke-MeasuredCapsule 'desktop-live' @('desktop', 'live')
-          Invoke-MeasuredCapsule 'save' @('save', $name)
-          Invoke-MeasuredCapsule 'restore-dry-run' @('restore', $name, '--dry-run')
+          # Direct desktop reads do not use the persistent Local Agent. Repeating
+          # the near-empty contract request gives a process-startup floor.
+          Invoke-Measured 'desktop-contract-1' $capsule @('desktop', 'contract')
+          Invoke-Measured 'desktop-contract-2' $capsule @('desktop', 'contract')
+          Invoke-Measured 'desktop-contract-3' $capsule @('desktop', 'contract')
+          Invoke-Measured 'desktop-applications' $capsule @('desktop', 'applications')
+          Invoke-Measured 'desktop-live' $capsule @('desktop', 'live')
+
+          # The public capsule binary routes mutations through a persistent Local
+          # Agent whose singleton deliberately ignores CONTEXT_CAPSULE_DB. Use the
+          # compatibility worker for profiling the mature engine directly so this
+          # temporary DB cannot affect the user's real agent/database.
+          Invoke-Measured 'engine-save' $worker @('save', $name)
+          Invoke-Measured 'engine-restore-dry-run' $worker @('restore', $name, '--dry-run')
 
           Write-Host 'PERF log-files begin'
           Get-ChildItem -Path $env:CONTEXT_CAPSULE_LOG_DIR -File -ErrorAction SilentlyContinue |
