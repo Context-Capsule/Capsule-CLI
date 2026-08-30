@@ -8,7 +8,11 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{path::Path, process::ExitCode, time::{Duration, Instant}};
+use std::{
+    path::Path,
+    process::ExitCode,
+    time::{Duration, Instant},
+};
 
 pub const DESKTOP_API_VERSION: u32 = 1;
 const LOG_COMPONENT: &str = "desktop";
@@ -298,12 +302,11 @@ fn live_workspace() -> Result<Value, String> {
             logging::info(
                 DISCOVERY_LOG_COMPONENT,
                 format!(
-                    "live.discovery.complete elapsed_ms={} desktop_ok={} tools={} terminals={} docker_available={}",
+                    "live.discovery.complete elapsed_ms={} desktop_ok={} tools={} terminals={}",
                     discovery_started.elapsed().as_millis(),
                     discovered.desktop.is_ok(),
                     discovered.tools.len(),
-                    discovered.terminals.sessions.len(),
-                    discovered.docker.available
+                    discovered.terminals.sessions.len()
                 ),
             );
             discovered
