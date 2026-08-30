@@ -269,7 +269,7 @@ fn doctor() -> Result<DoctorReport, String> {
         registered
     };
 
-    probe_native_host(&executable_path, &manifest_path)?;
+    probe_native_host(&executable_path)?;
 
     Ok(DoctorReport {
         manifest_path,
@@ -289,10 +289,17 @@ fn require_string(manifest: &Value, field: &str, expected: &str) -> Result<(), S
     }
 }
 
-fn probe_native_host(executable: &Path, manifest_path: &Path) -> Result<(), String> {
+fn doctor_probe_arguments() -> Vec<String> {
+    // The host intentionally supports zero-argument protocol mode for local
+    // diagnostics. Browser liveness, however, is published only for Firefox's
+    // exact manifest+extension invocation. Keeping doctor on zero arguments
+    // proves the executable/protocol without fabricating a browser connection.
+    Vec::new()
+}
+
+fn probe_native_host(executable: &Path) -> Result<(), String> {
     let mut child = Command::new(executable)
-        .arg(manifest_path)
-        .arg(browser::FIREFOX_EXTENSION_ID)
+        .args(doctor_probe_arguments())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -408,7 +415,7 @@ fn print_doctor_report(report: &DoctorReport) {
         browser::NATIVE_HOST_NAME,
         report.registry_manifest_path.display()
     );
-    println!("  browser-style protocol ping: ok");
+    println!("  diagnostic protocol ping: ok");
 }
 
 fn fail(message: String) -> ExitCode {
@@ -429,17 +436,17 @@ fn print_usage() {
         "--install copies the host to a durable per-user location, writes and registers the native manifest, and validates the result."
     );
     println!(
-        "--doctor verifies the manifest, executable, Windows registration, and the exact browser-style protocol launch."
+        "--doctor verifies the manifest, executable, Windows registration, and native protocol without publishing browser liveness."
     );
     println!();
     println!(
-        "Firefox/Zen also launches this executable internally with the native manifest path and extension ID; those arguments enter protocol mode automatically."
+        "Firefox/Zen launches this executable with the native manifest path and extension ID; only that browser-style invocation publishes a live browser session."
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_native_messaging_invocation;
+    use super::{doctor_probe_arguments, is_native_messaging_invocation};
     use context_capsule::browser;
 
     #[test]
@@ -464,6 +471,11 @@ mod tests {
             browser::FIREFOX_EXTENSION_ID.to_owned(),
         ];
         assert!(!is_native_messaging_invocation(&wrong_manifest));
+    }
+
+    #[test]
+    fn doctor_probe_never_uses_browser_liveness_arguments() {
+        assert!(doctor_probe_arguments().is_empty());
     }
 
     #[cfg(windows)]
