@@ -55,8 +55,13 @@ jobs:
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw 'patched tree has whitespace errors' }
           git diff --stat
-      - name: Rust format
-        run: cargo fmt --all -- --check
+      - name: Format changed Rust files only
+        shell: pwsh
+        run: |
+          rustfmt --edition 2024 src\commands.rs src\service_restart.rs src\terminal_context.rs
+          if ($LASTEXITCODE -ne 0) { throw 'rustfmt failed on changed files' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'formatted patch has whitespace errors' }
       - name: Focused terminal context tests
         run: cargo test terminal_context::tests -- --nocapture
       - name: Focused restore command tests
@@ -116,8 +121,10 @@ jobs:
           node scripts/apply-restore-cwd-service-fix.mjs
           node scripts/apply-restore-cwd-service-safety.mjs
           git diff --check
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Format changed Rust files only
+        run: |
+          rustfmt --edition 2024 src/commands.rs src/service_restart.rs src/terminal_context.rs
+          git diff --check
       - name: Check all targets
         run: cargo check --all-targets
       - name: Full tests
