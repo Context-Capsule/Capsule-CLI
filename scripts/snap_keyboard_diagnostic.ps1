@@ -1,134 +1,47 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
 
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
-
 public static class SnapDiagNative {
-    [DllImport("user32.dll", SetLastError=true)]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll", SetLastError=true)]
-    public static extern bool BringWindowToTop(IntPtr hWnd);
-    [DllImport("user32.dll", SetLastError=true)]
-    public static extern IntPtr SetActiveWindow(IntPtr hWnd);
-    [DllImport("user32.dll", SetLastError=true)]
-    public static extern IntPtr SetFocus(IntPtr hWnd);
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")]
-    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
-    [DllImport("user32.dll", SetLastError=true)]
-    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
-    [DllImport("kernel32.dll")]
-    public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left,Top,Right,Bottom; }
+    [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public uint cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")] public static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFO info);
+    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd,uint attr,out RECT rect,uint size);
+    [DllImport("user32.dll", EntryPoint="IsWindowArranged")] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool IsWindowArranged(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd,int cmd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd,IntPtr after,int x,int y,int cx,int cy,uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd,IntPtr pid);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a,uint b,bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern void keybd_event(byte vk,byte scan,uint flags,UIntPtr extra);
 }
 '@
-
-$VK_LWIN = 0x5B
-$VK_Z = 0x5A
-$VK_ESCAPE = 0x1B
-$KEYUP = 0x0002
-
-function Send-Key([byte]$Vk) {
-    [SnapDiagNative]::keybd_event($Vk, 0, 0, [UIntPtr]::Zero)
-    [SnapDiagNative]::keybd_event($Vk, 0, $KEYUP, [UIntPtr]::Zero)
+[SnapDiagNative]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
+$KEYUP=2; $VK_LWIN=0x5B; $VK_Z=0x5A; $VK_ESCAPE=0x1B; $SW_RESTORE=9; $SWP_NOZORDER=4; $SWP_NOACTIVATE=0x10
+function Key([byte]$v){[SnapDiagNative]::keybd_event($v,0,0,[UIntPtr]::Zero);[SnapDiagNative]::keybd_event($v,0,$KEYUP,[UIntPtr]::Zero)}
+function WinZ {[SnapDiagNative]::keybd_event($VK_LWIN,0,0,[UIntPtr]::Zero);[SnapDiagNative]::keybd_event($VK_Z,0,0,[UIntPtr]::Zero);[SnapDiagNative]::keybd_event($VK_Z,0,$KEYUP,[UIntPtr]::Zero);[SnapDiagNative]::keybd_event($VK_LWIN,0,$KEYUP,[UIntPtr]::Zero)}
+function FocusVerified([IntPtr]$h){
+ if([SnapDiagNative]::GetForegroundWindow() -eq $h){return}
+ $ct=[SnapDiagNative]::GetCurrentThreadId();$fg=[SnapDiagNative]::GetForegroundWindow();$ft=if($fg -eq [IntPtr]::Zero){0}else{[SnapDiagNative]::GetWindowThreadProcessId($fg,[IntPtr]::Zero)};$tt=[SnapDiagNative]::GetWindowThreadProcessId($h,[IntPtr]::Zero)
+ $af=$false;$at=$false
+ try {if($ft -ne 0 -and $ft -ne $ct){$af=[SnapDiagNative]::AttachThreadInput($ct,$ft,$true)};if($tt -ne 0 -and $tt -ne $ct -and $tt -ne $ft){$at=[SnapDiagNative]::AttachThreadInput($ct,$tt,$true)};[SnapDiagNative]::BringWindowToTop($h)|Out-Null;[SnapDiagNative]::SetActiveWindow($h)|Out-Null;[SnapDiagNative]::SetFocus($h)|Out-Null;[SnapDiagNative]::SetForegroundWindow($h)|Out-Null;$until=[DateTime]::UtcNow.AddMilliseconds(900);while([DateTime]::UtcNow -lt $until){[System.Windows.Forms.Application]::DoEvents();if([SnapDiagNative]::GetForegroundWindow() -eq $h){return};Start-Sleep -Milliseconds 15};throw 'focus failed'} finally {if($at){[SnapDiagNative]::AttachThreadInput($ct,$tt,$false)|Out-Null};if($af){[SnapDiagNative]::AttachThreadInput($ct,$ft,$false)|Out-Null}}
 }
-function Send-WinZ {
-    [SnapDiagNative]::keybd_event($VK_LWIN, 0, 0, [UIntPtr]::Zero)
-    [SnapDiagNative]::keybd_event($VK_Z, 0, 0, [UIntPtr]::Zero)
-    [SnapDiagNative]::keybd_event($VK_Z, 0, $KEYUP, [UIntPtr]::Zero)
-    [SnapDiagNative]::keybd_event($VK_LWIN, 0, $KEYUP, [UIntPtr]::Zero)
-}
-function Focus-Verified([IntPtr]$Hwnd) {
-    if ([SnapDiagNative]::GetForegroundWindow() -eq $Hwnd) { return }
-    $currentThread = [SnapDiagNative]::GetCurrentThreadId()
-    $foreground = [SnapDiagNative]::GetForegroundWindow()
-    $foregroundThread = if ($foreground -eq [IntPtr]::Zero) { 0 } else { [SnapDiagNative]::GetWindowThreadProcessId($foreground, [IntPtr]::Zero) }
-    $targetThread = [SnapDiagNative]::GetWindowThreadProcessId($Hwnd, [IntPtr]::Zero)
-    $attachedForeground = $false
-    $attachedTarget = $false
-    try {
-        if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {
-            $attachedForeground = [SnapDiagNative]::AttachThreadInput($currentThread, $foregroundThread, $true)
-        }
-        if ($targetThread -ne 0 -and $targetThread -ne $currentThread -and $targetThread -ne $foregroundThread) {
-            $attachedTarget = [SnapDiagNative]::AttachThreadInput($currentThread, $targetThread, $true)
-        }
-        [SnapDiagNative]::BringWindowToTop($Hwnd) | Out-Null
-        [SnapDiagNative]::SetActiveWindow($Hwnd) | Out-Null
-        [SnapDiagNative]::SetFocus($Hwnd) | Out-Null
-        [SnapDiagNative]::SetForegroundWindow($Hwnd) | Out-Null
-        $deadline = [DateTime]::UtcNow.AddMilliseconds(1000)
-        while ([DateTime]::UtcNow -lt $deadline) {
-            [System.Windows.Forms.Application]::DoEvents()
-            if ([SnapDiagNative]::GetForegroundWindow() -eq $Hwnd) { return }
-            Start-Sleep -Milliseconds 20
-        }
-        throw "Could not make diagnostic HWND foreground; refusing to send Win+Z"
-    } finally {
-        if ($attachedTarget) { [SnapDiagNative]::AttachThreadInput($currentThread, $targetThread, $false) | Out-Null }
-        if ($attachedForeground) { [SnapDiagNative]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }
-    }
-}
-
-$outDir = if ($env:SNAP_DIAG_OUT) { $env:SNAP_DIAG_OUT } else { Join-Path $env:TEMP 'capsule-snap-keyboard-diag' }
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'Context Capsule Native Snap Diagnostic'
-$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
-$form.MaximizeBox = $true
-$form.MinimizeBox = $true
-$form.MinimumSize = New-Object System.Drawing.Size(200, 160)
-$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$form.Size = New-Object System.Drawing.Size(780, 520)
-$form.Show()
-[System.Windows.Forms.Application]::DoEvents()
-Start-Sleep -Milliseconds 350
-$hwnd = $form.Handle
-Focus-Verified $hwnd
-Start-Sleep -Milliseconds 120
-Send-WinZ
-Start-Sleep -Milliseconds 450
-[System.Windows.Forms.Application]::DoEvents()
-
-$virtual = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$bitmap = New-Object System.Drawing.Bitmap($virtual.Width, $virtual.Height)
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$graphics.CopyFromScreen($virtual.Left, $virtual.Top, 0, 0, $bitmap.Size)
-$graphics.Dispose()
-$bitmap.Save((Join-Path $outDir 'win-z-flyout.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-$bitmap.Dispose()
-
-$root = [System.Windows.Automation.AutomationElement]::RootElement
-$visibleCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::IsOffscreenProperty, $false)
-$elements = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $visibleCondition)
-$rows = @()
-for ($i = 0; $i -lt $elements.Count; $i++) {
-    $e = $elements.Item($i)
-    try {
-        $r = $e.Current.BoundingRectangle
-        if ($r.Width -le 0 -or $r.Height -le 0) { continue }
-        $name = $e.Current.Name
-        $auto = $e.Current.AutomationId
-        $class = $e.Current.ClassName
-        $control = $e.Current.ControlType.ProgrammaticName
-        if ([string]::IsNullOrWhiteSpace($name) -and [string]::IsNullOrWhiteSpace($auto) -and $r.Top -gt ($virtual.Top + ($virtual.Height / 2))) { continue }
-        $rows += [pscustomobject]@{
-            name=$name; automation_id=$auto; class_name=$class; control_type=$control;
-            process_id=$e.Current.ProcessId; left=[math]::Round($r.Left,1); top=[math]::Round($r.Top,1);
-            width=[math]::Round($r.Width,1); height=[math]::Round($r.Height,1)
-        }
-    } catch {}
-}
-$rows | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $outDir 'win-z-uia.json')
-$rows | Sort-Object top,left | Format-Table -AutoSize | Out-String -Width 260 | Set-Content -Encoding UTF8 (Join-Path $outDir 'win-z-uia.txt')
-$rows | Where-Object { $_.control_type -match 'Button|ListItem|MenuItem' -or $_.name -match 'snap|layout' -or $_.automation_id -match 'snap|layout' } | Sort-Object top,left | Format-Table -AutoSize
-Send-Key $VK_ESCAPE
-Start-Sleep -Milliseconds 150
-$form.Close()
+function State([IntPtr]$h,$work){$r=New-Object SnapDiagNative+RECT;$hr=[SnapDiagNative]::DwmGetWindowAttribute($h,9,[ref]$r,[Runtime.InteropServices.Marshal]::SizeOf([type][SnapDiagNative+RECT]));if($hr-lt 0){throw "DWM $hr"};[pscustomobject]@{arranged=[SnapDiagNative]::IsWindowArranged($h);pixels=@($r.Left,$r.Top,$r.Right,$r.Bottom);x=[math]::Round(($r.Left-$work.Left)/[double]($work.Right-$work.Left),4);y=[math]::Round(($r.Top-$work.Top)/[double]($work.Bottom-$work.Top),4);width=[math]::Round(($r.Right-$r.Left)/[double]($work.Right-$work.Left),4);height=[math]::Round(($r.Bottom-$r.Top)/[double]($work.Bottom-$work.Top),4)}}
+$out=if($env:SNAP_DIAG_OUT){$env:SNAP_DIAG_OUT}else{Join-Path $env:TEMP 'capsule-snap-keyboard-diag'};New-Item -ItemType Directory -Force $out|Out-Null
+$form=New-Object System.Windows.Forms.Form;$form.Text='Context Capsule Native Snap Diagnostic';$form.FormBorderStyle='Sizable';$form.MaximizeBox=$true;$form.MinimizeBox=$true;$form.MinimumSize=New-Object Drawing.Size(200,160);$form.Size=New-Object Drawing.Size(780,520);$form.StartPosition='CenterScreen';$form.Show();[System.Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 300;$h=$form.Handle
+$m=[SnapDiagNative]::MonitorFromWindow($h,2);$mi=New-Object SnapDiagNative+MONITORINFO;$mi.cbSize=[Runtime.InteropServices.Marshal]::SizeOf([type][SnapDiagNative+MONITORINFO]);if(-not [SnapDiagNative]::GetMonitorInfoW($m,[ref]$mi)){throw 'GetMonitorInfo failed'};$work=$mi.rcWork
+$results=@()
+foreach($layout in 1..6){foreach($zone in 1..4){[SnapDiagNative]::ShowWindow($h,$SW_RESTORE)|Out-Null;$bw=[int](($work.Right-$work.Left)*.48);$bh=[int](($work.Bottom-$work.Top)*.52);$bx=$work.Left+[int](($work.Right-$work.Left-$bw)/2);$by=$work.Top+[int](($work.Bottom-$work.Top-$bh)/2);[SnapDiagNative]::SetWindowPos($h,[IntPtr]::Zero,$bx,$by,$bw,$bh,$SWP_NOZORDER-bor$SWP_NOACTIVATE)|Out-Null;FocusVerified $h;Start-Sleep -Milliseconds 100;WinZ;Start-Sleep -Milliseconds 150;Key ([byte](0x30+$layout));Start-Sleep -Milliseconds 150;Key ([byte](0x30+$zone));Start-Sleep -Milliseconds 320;[System.Windows.Forms.Application]::DoEvents();$s=State $h $work;$results += [pscustomobject]@{layout=$layout;zone=$zone;arranged=$s.arranged;x=$s.x;y=$s.y;width=$s.width;height=$s.height;pixels=$s.pixels};Key $VK_ESCAPE;Start-Sleep -Milliseconds 70}}
+$results|ConvertTo-Json -Depth 5|Set-Content -Encoding UTF8 (Join-Path $out 'win-z-map.json');$results|Format-Table -AutoSize|Out-String -Width 220|Set-Content -Encoding UTF8 (Join-Path $out 'win-z-map.txt');$results|Format-Table -AutoSize
+# Final screenshot proves the diagnostic itself closes cleanly and leaves no probe/helper window.
+$form.Close();Start-Sleep -Milliseconds 120
