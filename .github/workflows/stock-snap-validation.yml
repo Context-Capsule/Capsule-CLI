@@ -1,0 +1,100 @@
+name: Stock Native Snap Validation
+
+on:
+  push:
+    branches:
+      - 'fix/windows-snap-layout-coverage-20260831'
+    paths:
+      - 'scripts/apply_stock_snap_fix.py'
+      - '.github/workflows/stock-snap-validation.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-native-snap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+
+      - name: Ensure stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+          rustc --version
+          cargo --version
+
+      - name: Apply production patch
+        shell: pwsh
+        run: |
+          python ./scripts/apply_stock_snap_fix.py
+          if ($LASTEXITCODE -ne 0) { throw 'stock Snap source patch failed' }
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff --check failed' }
+
+      - name: Check all targets
+        shell: pwsh
+        run: cargo check --all-targets
+
+      - name: Full Rust tests
+        shell: pwsh
+        run: cargo test
+
+      - name: Desktop capture and classification tests
+        shell: pwsh
+        run: |
+          cargo test desktop::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Windows restore tests
+        shell: pwsh
+        run: |
+          cargo test restore::windows::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test restore::model::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Native Snap tests
+        shell: pwsh
+        run: |
+          cargo test windows_snap_core::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test windows_snap_legacy::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test windows_snap_coord::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test windows_snap::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Snapshot compatibility tests
+        shell: pwsh
+        run: |
+          cargo test snapshot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit production source after green deterministic tests
+        shell: pwsh
+        run: |
+          if (-not (git diff --quiet -- src/windows_snap.rs src/restore/windows.rs)) {
+            git config user.name 'GPT-Slave'
+            git config user.email 'unknown.entiti911@gmail.com'
+            git add src/windows_snap.rs src/restore/windows.rs
+            git commit -m 'fix: restore all stock Windows Snap slots natively'
+            if ($LASTEXITCODE -ne 0) { throw 'production source commit failed' }
+            git push origin HEAD:${{ github.ref_name }}
+            if ($LASTEXITCODE -ne 0) { throw 'production source push failed' }
+          }
