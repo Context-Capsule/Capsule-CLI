@@ -1,0 +1,35 @@
+name: Snap Keyboard Diagnostic
+
+on:
+  push:
+    branches:
+      - 'fix/windows-snap-layout-coverage-20260831'
+    paths:
+      - 'scripts/snap_keyboard_diagnostic.ps1'
+      - '.github/workflows/snap-keyboard-diagnostic.yml'
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+
+      - name: Run keyboard Snap diagnostic
+        shell: pwsh
+        env:
+          SNAP_DIAG_OUT: ${{ runner.temp }}\capsule-snap-keyboard-${{ github.run_id }}
+        run: |
+          ./scripts/snap_keyboard_diagnostic.ps1
+
+      - name: Upload diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap-keyboard-${{ github.run_id }}
+          path: ${{ runner.temp }}\capsule-snap-keyboard-${{ github.run_id }}
+          if-no-files-found: warn
