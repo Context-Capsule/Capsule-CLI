@@ -11,7 +11,20 @@ using System.Runtime.InteropServices;
 public static class SnapDiagNative {
     [DllImport("user32.dll", SetLastError=true)]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
-
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr SetActiveWindow(IntPtr hWnd);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 }
@@ -26,17 +39,46 @@ function Send-Key([byte]$Vk) {
     [SnapDiagNative]::keybd_event($Vk, 0, 0, [UIntPtr]::Zero)
     [SnapDiagNative]::keybd_event($Vk, 0, $KEYUP, [UIntPtr]::Zero)
 }
-
 function Send-WinZ {
     [SnapDiagNative]::keybd_event($VK_LWIN, 0, 0, [UIntPtr]::Zero)
     [SnapDiagNative]::keybd_event($VK_Z, 0, 0, [UIntPtr]::Zero)
     [SnapDiagNative]::keybd_event($VK_Z, 0, $KEYUP, [UIntPtr]::Zero)
     [SnapDiagNative]::keybd_event($VK_LWIN, 0, $KEYUP, [UIntPtr]::Zero)
 }
+function Focus-Verified([IntPtr]$Hwnd) {
+    if ([SnapDiagNative]::GetForegroundWindow() -eq $Hwnd) { return }
+    $currentThread = [SnapDiagNative]::GetCurrentThreadId()
+    $foreground = [SnapDiagNative]::GetForegroundWindow()
+    $foregroundThread = if ($foreground -eq [IntPtr]::Zero) { 0 } else { [SnapDiagNative]::GetWindowThreadProcessId($foreground, [IntPtr]::Zero) }
+    $targetThread = [SnapDiagNative]::GetWindowThreadProcessId($Hwnd, [IntPtr]::Zero)
+    $attachedForeground = $false
+    $attachedTarget = $false
+    try {
+        if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {
+            $attachedForeground = [SnapDiagNative]::AttachThreadInput($currentThread, $foregroundThread, $true)
+        }
+        if ($targetThread -ne 0 -and $targetThread -ne $currentThread -and $targetThread -ne $foregroundThread) {
+            $attachedTarget = [SnapDiagNative]::AttachThreadInput($currentThread, $targetThread, $true)
+        }
+        [SnapDiagNative]::BringWindowToTop($Hwnd) | Out-Null
+        [SnapDiagNative]::SetActiveWindow($Hwnd) | Out-Null
+        [SnapDiagNative]::SetFocus($Hwnd) | Out-Null
+        [SnapDiagNative]::SetForegroundWindow($Hwnd) | Out-Null
+        $deadline = [DateTime]::UtcNow.AddMilliseconds(1000)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            [System.Windows.Forms.Application]::DoEvents()
+            if ([SnapDiagNative]::GetForegroundWindow() -eq $Hwnd) { return }
+            Start-Sleep -Milliseconds 20
+        }
+        throw "Could not make diagnostic HWND foreground; refusing to send Win+Z"
+    } finally {
+        if ($attachedTarget) { [SnapDiagNative]::AttachThreadInput($currentThread, $targetThread, $false) | Out-Null }
+        if ($attachedForeground) { [SnapDiagNative]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }
+    }
+}
 
 $outDir = if ($env:SNAP_DIAG_OUT) { $env:SNAP_DIAG_OUT } else { Join-Path $env:TEMP 'capsule-snap-keyboard-diag' }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Context Capsule Native Snap Diagnostic'
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
@@ -49,14 +91,12 @@ $form.Show()
 [System.Windows.Forms.Application]::DoEvents()
 Start-Sleep -Milliseconds 350
 $hwnd = $form.Handle
-[SnapDiagNative]::SetForegroundWindow($hwnd) | Out-Null
-Start-Sleep -Milliseconds 250
+Focus-Verified $hwnd
+Start-Sleep -Milliseconds 120
 Send-WinZ
-Start-Sleep -Milliseconds 650
+Start-Sleep -Milliseconds 450
 [System.Windows.Forms.Application]::DoEvents()
 
-# Capture what a user actually sees. This is a desktop capture, not PrintWindow,
-# so DWM/Shell overlays such as the Snap flyout are included.
 $virtual = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $bitmap = New-Object System.Drawing.Bitmap($virtual.Width, $virtual.Height)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -78,27 +118,17 @@ for ($i = 0; $i -lt $elements.Count; $i++) {
         $auto = $e.Current.AutomationId
         $class = $e.Current.ClassName
         $control = $e.Current.ControlType.ProgrammaticName
-        # Keep actionable/named UI and anything near the top half where the
-        # Win+Z flyout is rendered. This keeps the dump useful without assuming
-        # a particular ShellExperienceHost class name.
         if ([string]::IsNullOrWhiteSpace($name) -and [string]::IsNullOrWhiteSpace($auto) -and $r.Top -gt ($virtual.Top + ($virtual.Height / 2))) { continue }
         $rows += [pscustomobject]@{
-            name = $name
-            automation_id = $auto
-            class_name = $class
-            control_type = $control
-            process_id = $e.Current.ProcessId
-            left = [math]::Round($r.Left, 1)
-            top = [math]::Round($r.Top, 1)
-            width = [math]::Round($r.Width, 1)
-            height = [math]::Round($r.Height, 1)
+            name=$name; automation_id=$auto; class_name=$class; control_type=$control;
+            process_id=$e.Current.ProcessId; left=[math]::Round($r.Left,1); top=[math]::Round($r.Top,1);
+            width=[math]::Round($r.Width,1); height=[math]::Round($r.Height,1)
         }
     } catch {}
 }
 $rows | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $outDir 'win-z-uia.json')
 $rows | Sort-Object top,left | Format-Table -AutoSize | Out-String -Width 260 | Set-Content -Encoding UTF8 (Join-Path $outDir 'win-z-uia.txt')
-$rows | Where-Object { $_.control_type -match 'Button|ListItem|MenuItem' -or $_.name -match 'snap|layout' } | Sort-Object top,left | Format-Table -AutoSize
-
+$rows | Where-Object { $_.control_type -match 'Button|ListItem|MenuItem' -or $_.name -match 'snap|layout' -or $_.automation_id -match 'snap|layout' } | Sort-Object top,left | Format-Table -AutoSize
 Send-Key $VK_ESCAPE
 Start-Sleep -Milliseconds 150
 $form.Close()
