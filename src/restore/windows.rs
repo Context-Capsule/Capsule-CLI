@@ -28,6 +28,8 @@ const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 const MONITORINFOF_PRIMARY: u32 = 1;
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+const GWL_EXSTYLE: i32 = -20;
+const WS_EX_TOPMOST: isize = 0x0000_0008;
 
 const SW_MINIMIZE: i32 = 6;
 const SW_MAXIMIZE: i32 = 3;
@@ -38,6 +40,7 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_SHOWWINDOW: u32 = 0x0040;
+const SWP_NOOWNERZORDER: u32 = 0x0200;
 
 const LAUNCH_GATE_TIMEOUT: Duration = Duration::from_millis(1_500);
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(120);
@@ -48,6 +51,8 @@ const GEOMETRY_TOLERANCE: i32 = 14;
 const PLACEMENT_RETRIES: usize = 5;
 const PLACEMENT_SETTLE_BASE_MS: u64 = 120;
 const NATIVE_SNAP_RETRIES: usize = 2;
+const FINAL_Z_ORDER_RETRIES: usize = 3;
+const FINAL_Z_ORDER_SETTLE: Duration = Duration::from_millis(120);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -99,6 +104,7 @@ unsafe extern "system" {
     fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
     fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max_count: i32) -> i32;
     fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
+    fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
     fn GetWindowRect(hwnd: Hwnd, rect: *mut NativeRect) -> Bool;
     fn IsIconic(hwnd: Hwnd) -> Bool;
     fn IsZoomed(hwnd: Hwnd) -> Bool;
@@ -247,12 +253,209 @@ pub fn restore_desktop(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreRep
     restore_desktop_with_policy(saved, dry_run, false)
 }
 
-/// Replays every saved window state even when the initial inventory already
-/// appears to match. This is used only for the final post-semantic pass so any
-/// focus/tab restoration side effects are overwritten by the saved physical
-/// desktop state instead of being accepted from a stale pre-focus observation.
+/// Replays ordinary floating window geometry in the final post-semantic pass,
+/// while native stateful layouts that are already satisfied are left untouched.
+/// Unsatisfied windows are still repaired by the normal placement path.
 pub fn restore_desktop_forced(saved: &SavedDesktop, dry_run: bool) -> DesktopRestoreReport {
     restore_desktop_with_policy(saved, dry_run, true)
+}
+
+/// Restores only relative Z-order and the saved foreground window from
+/// a fresh post-placement inventory. This deliberately never moves,
+/// resizes, maximizes, minimizes, or re-snaps a window, making it safe
+/// as the last Windows restore operation after native Snap work.
+pub(super) fn restore_order_and_foreground_only(
+    saved: &SavedDesktop,
+) -> DesktopRestoreReport {
+    let mut report = DesktopRestoreReport {
+        applications_total: saved.applications.len(),
+        ..DesktopRestoreReport::default()
+    };
+
+    let inventory = match CurrentInventory::initial(saved) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            report.warnings.push(format!(
+                "final Z-order inventory failed; leaving the current stacking untouched: {error}"
+            ));
+            return report;
+        }
+    };
+
+    let mut desired = Vec::new();
+    for app in &saved.applications {
+        let current = inventory.windows_for_app(app);
+        let matches = match_windows(app, &current, &inventory.displays);
+        report.windows_total += app.windows.len();
+        report.windows_missing += app.windows.len().saturating_sub(matches.len());
+        desired.extend(matches);
+    }
+
+    if desired.is_empty() {
+        return report;
+    }
+    desired.sort_by_key(|(saved, _)| saved.z_order);
+
+    // Foreground acquisition itself can move a window in the Z stack. Do it
+    // before the authoritative stack correction, then use SWP_NOACTIVATE for
+    // every relative insertion so this pass cannot steal focus afterward.
+    if let Some((_, current)) = desired.iter().find(|(saved, _)| saved.is_foreground) {
+        if unsafe { GetForegroundWindow() } as usize != current.hwnd
+            && unsafe { SetForegroundWindow(current.hwnd as Hwnd) } == 0
+        {
+            report.warnings.push(
+                "Windows foreground-lock policy prevented restoring the saved foreground window"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let stateful_layout = desired
+        .iter()
+        .any(|(saved, _)| !matches!(saved.state_spec(), WindowStateSpec::Normal));
+    let mut live = match enumerate_windows() {
+        Ok(live) => live,
+        Err(error) => {
+            report.warnings.push(format!(
+                "could not refresh live Z-order before final reconciliation: {error}"
+            ));
+            return report;
+        }
+    };
+
+    // Native maximize/Snap operations may finish their shell-side restacking a
+    // little after geometry already looks settled. Require a second sample for
+    // stateful layouts before taking the fast path; ordinary floating windows
+    // retain the zero-delay already-correct path.
+    if relative_order_matches_live(&desired, &live) {
+        if !stateful_layout {
+            return report;
+        }
+        thread::sleep(FINAL_Z_ORDER_SETTLE);
+        live = match enumerate_windows() {
+            Ok(live) => live,
+            Err(error) => {
+                report
+                    .warnings
+                    .push(format!("could not verify settled live Z-order: {error}"));
+                return report;
+            }
+        };
+        if relative_order_matches_live(&desired, &live) {
+            return report;
+        }
+    }
+
+    for attempt in 1..=FINAL_Z_ORDER_RETRIES {
+        if let Err(error) = reorder_relative_z_order(&desired) {
+            report.warnings.push(format!(
+                "could not fully restore final relative window Z-order: {error}"
+            ));
+            return report;
+        }
+
+        // Two consecutive post-settle observations avoid treating a transient
+        // SetWindowPos result as success if Explorer/Snap immediately restacks.
+        thread::sleep(FINAL_Z_ORDER_SETTLE);
+        let first = match enumerate_windows() {
+            Ok(live) => live,
+            Err(error) => {
+                report.warnings.push(format!(
+                    "could not verify final live Z-order after attempt {attempt}: {error}"
+                ));
+                return report;
+            }
+        };
+        if !relative_order_matches_live(&desired, &first) {
+            continue;
+        }
+
+        thread::sleep(FINAL_Z_ORDER_SETTLE);
+        let second = match enumerate_windows() {
+            Ok(live) => live,
+            Err(error) => {
+                report.warnings.push(format!(
+                    "could not verify settled final live Z-order after attempt {attempt}: {error}"
+                ));
+                return report;
+            }
+        };
+        if relative_order_matches_live(&desired, &second) {
+            return report;
+        }
+    }
+
+    report.warnings.push(format!(
+        "Windows did not keep the saved relative window Z-order after {FINAL_Z_ORDER_RETRIES} guarded reconciliation attempts"
+    ));
+    report
+}
+
+/// Restore captured windows relative to one another instead of repeatedly
+/// promoting every one of them to HWND_TOP. The first saved window in each
+/// current topmost/non-topmost band is left as an anchor; every following window
+/// is inserted directly behind the previous captured HWND. This avoids top
+/// promotion policy, preserves unrelated foreground state, and never changes a
+/// window's WS_EX_TOPMOST band.
+fn reorder_relative_z_order(desired: &[(&SavedWindow, &CurrentWindow)]) -> Result<(), String> {
+    let mut topmost = Vec::new();
+    let mut ordinary = Vec::new();
+    for (_, current) in desired {
+        if window_is_topmost(current.hwnd) {
+            topmost.push(current.hwnd);
+        } else {
+            ordinary.push(current.hwnd);
+        }
+    }
+
+    reorder_z_order_band(&topmost)?;
+    reorder_z_order_band(&ordinary)
+}
+
+fn reorder_z_order_band(handles: &[usize]) -> Result<(), String> {
+    for pair in handles.windows(2) {
+        let insert_after = pair[0] as Hwnd;
+        let hwnd = pair[1] as Hwnd;
+        if unsafe {
+            SetWindowPos(
+                hwnd,
+                insert_after,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "SetWindowPos failed while placing HWND {:#x} behind {:#x}",
+                pair[1], pair[0]
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn window_is_topmost(hwnd: usize) -> bool {
+    (unsafe { GetWindowLongPtrW(hwnd as Hwnd, GWL_EXSTYLE) } & WS_EX_TOPMOST) != 0
+}
+
+fn relative_order_matches_live(
+    desired: &[(&SavedWindow, &CurrentWindow)],
+    live: &[CurrentWindow],
+) -> bool {
+    desired.windows(2).all(|pair| {
+        let front = live
+            .iter()
+            .find(|window| window.hwnd == pair[0].1.hwnd)
+            .map(|window| window.z_order);
+        let back = live
+            .iter()
+            .find(|window| window.hwnd == pair[1].1.hwnd)
+            .map(|window| window.z_order);
+        matches!((front, back), (Some(front), Some(back)) if front < back)
+    })
 }
 
 fn restore_desktop_with_policy(
@@ -717,15 +920,14 @@ fn native_snap_direction(slot: SnapSlot) -> Option<SnapDirection> {
     }
 }
 
-fn force_layout_replay_supported(current: &CurrentWindow, saved: &SavedWindow) -> bool {
+fn force_layout_replay_supported(_current: &CurrentWindow, saved: &SavedWindow) -> bool {
     match saved.state_spec() {
-        WindowStateSpec::Snapped(slot) if native_snap_direction(slot).is_some() => {
-            // If IsWindowArranged is unavailable, the native snap helpers cannot
-            // verify a replay. Do not destroy a geometrically correct legacy
-            // layout just to force an unverifiable transition.
-            windows_snap::is_arranged(current.hwnd as Hwnd).is_some()
-        }
-        _ => true,
+        WindowStateSpec::Minimized
+        | WindowStateSpec::Maximized
+        | WindowStateSpec::Fullscreen
+        | WindowStateSpec::Snapped(_) => false,
+        WindowStateSpec::Unknown(_) if saved.state.starts_with("snapped:") => false,
+        WindowStateSpec::Normal | WindowStateSpec::Unknown(_) => true,
     }
 }
 
@@ -752,7 +954,6 @@ fn window_geometry_satisfied(
         }
         WindowStateSpec::Fullscreen => {
             !current.minimized
-                && !current.maximized
                 && rect_close(current.bounds, display.bounds, GEOMETRY_TOLERANCE)
         }
         WindowStateSpec::Normal | WindowStateSpec::Snapped(_) | WindowStateSpec::Unknown(_) => {
@@ -780,9 +981,6 @@ fn window_satisfied(
         return true;
     }
 
-    // If the modern arranged-state API exists, require the real Windows snap
-    // state as well as the saved rectangle. On older Windows builds where the
-    // API is missing, exact geometry remains the backward-compatible contract.
     windows_snap::is_arranged(current.hwnd as Hwnd).unwrap_or(true)
 }
 
@@ -915,10 +1113,6 @@ fn apply_window_state(
         }
     }
 
-    // On modern Windows, a saved native Snap slot is not restored unless the
-    // arranged-state API confirms it. Keep the exact rectangle as a containment
-    // fallback, but return an error instead of silently reporting a floating
-    // half-screen window as successfully restored.
     if geometry_converged && native_direction.is_some() && native_failure.is_some() {
         stage_window_rect(hwnd, target)?;
         thread::sleep(Duration::from_millis(PLACEMENT_SETTLE_BASE_MS));
@@ -1050,11 +1244,6 @@ fn reconcile_order_and_foreground(
         }
     }
 
-    // Foreground/Z-order restoration happens after the main placement loop and
-    // may trigger application-specific window behavior. Re-observe every saved
-    // window now and repair anything that stopped satisfying its saved state.
-    // This is deliberately based on live Win32 state, not the inventory captured
-    // before focus changed.
     for (saved, current) in &desired {
         let Some(display) = choose_display(saved, displays) else {
             continue;
@@ -1367,6 +1556,40 @@ mod tests {
         }
     }
 
+    fn current_window(bounds: SavedRect, maximized: bool) -> CurrentWindow {
+        CurrentWindow {
+            hwnd: 1,
+            pid: 1,
+            title: "Window".to_owned(),
+            bounds,
+            minimized: false,
+            maximized,
+            display_device: Some("DISPLAY1".to_owned()),
+            z_order: 0,
+            is_foreground: false,
+        }
+    }
+
+    fn display() -> TargetDisplay {
+        TargetDisplay {
+            device_name: "DISPLAY1".to_owned(),
+            bounds: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            work_area: SavedRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
+            is_primary: true,
+            relation_to_primary: "primary".to_owned(),
+        }
+    }
+
     #[test]
     fn process_identity_prefers_strong_aumid_or_path() {
         let process = CurrentProcess {
@@ -1453,24 +1676,7 @@ mod tests {
             z_order: 0,
             is_foreground: true,
         };
-        let display = TargetDisplay {
-            device_name: "DISPLAY1".to_owned(),
-            bounds: SavedRect {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1080,
-            },
-            work_area: SavedRect {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1040,
-            },
-            is_primary: true,
-            relation_to_primary: "primary".to_owned(),
-        };
-        let matches = match_windows(&application, &[&current_right, &current_left], &[display]);
+        let matches = match_windows(&application, &[&current_right, &current_left], &[display()]);
         assert_eq!(matches[0].1.hwnd, 1);
         assert_eq!(matches[1].1.hwnd, 2);
     }
@@ -1498,9 +1704,58 @@ mod tests {
     }
 
     #[test]
-    fn forced_final_pass_never_skips_an_initially_satisfied_window() {
-        let satisfied = true;
-        assert!(!(satisfied && !true));
-        assert!(satisfied && !false);
+    fn forced_final_pass_does_not_replay_satisfied_stateful_layouts() {
+        let current = current_window(display().bounds, true);
+        let mut saved = saved_window("Window", 0, false);
+
+        for state in [
+            "minimized",
+            "maximized",
+            "fullscreen",
+            "snapped:left-half",
+            "snapped:top-left-quarter",
+            "snapped:custom",
+        ] {
+            saved.state = state.to_owned();
+            assert!(
+                !force_layout_replay_supported(&current, &saved),
+                "{state} should not be destructively replayed when already satisfied"
+            );
+        }
+
+        saved.state = "normal".to_owned();
+        assert!(force_layout_replay_supported(&current, &saved));
+    }
+
+    #[test]
+    fn legacy_fullscreen_snapshot_accepts_maximized_full_display_window() {
+        let display = display();
+        let mut saved = saved_window("Window", 0, false);
+        saved.state = "fullscreen".to_owned();
+        saved.bounds = display.bounds;
+        let current = current_window(display.bounds, true);
+
+        assert!(window_geometry_satisfied(
+            &current,
+            &saved,
+            &display,
+            display.bounds
+        ));
+    }
+
+    #[test]
+    fn fullscreen_snapshot_rejects_maximized_work_area_geometry() {
+        let display = display();
+        let mut saved = saved_window("Window", 0, false);
+        saved.state = "fullscreen".to_owned();
+        saved.bounds = display.bounds;
+        let current = current_window(display.work_area, true);
+
+        assert!(!window_geometry_satisfied(
+            &current,
+            &saved,
+            &display,
+            display.bounds
+        ));
     }
 }
