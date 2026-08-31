@@ -438,7 +438,7 @@ fn reorder_z_order_band(handles: &[usize]) -> Result<(), String> {
 }
 
 fn window_is_topmost(hwnd: usize) -> bool {
-    unsafe { GetWindowLongPtrW(hwnd as Hwnd, GWL_EXSTYLE) } & WS_EX_TOPMOST != 0
+    (unsafe { GetWindowLongPtrW(hwnd as Hwnd, GWL_EXSTYLE) } & WS_EX_TOPMOST) != 0
 }
 
 fn relative_order_matches_live(
