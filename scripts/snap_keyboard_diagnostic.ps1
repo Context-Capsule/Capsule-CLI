@@ -1,34 +1,162 @@
-$ErrorActionPreference='Stop'
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
 Add-Type @'
-using System; using System.Runtime.InteropServices;
-public static class N {
- [StructLayout(LayoutKind.Sequential)] public struct R{public int L,T,Ri,B;}
- [StructLayout(LayoutKind.Explicit,Size=40)] public struct I{[FieldOffset(0)]public uint type;[FieldOffset(8)]public K k;}
- [StructLayout(LayoutKind.Sequential)] public struct K{public ushort vk,scan;public uint flags,time;public UIntPtr extra;}
- [DllImport("user32.dll")]public static extern uint SendInput(uint n,I[] a,int s);
- [DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();
- [DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);
- [DllImport("user32.dll")]public static extern bool BringWindowToTop(IntPtr h);
- [DllImport("user32.dll")]public static extern IntPtr SetActiveWindow(IntPtr h);
- [DllImport("user32.dll")]public static extern IntPtr SetFocus(IntPtr h);
- [DllImport("user32.dll")]public static extern uint GetWindowThreadProcessId(IntPtr h,IntPtr p);
- [DllImport("user32.dll")]public static extern bool AttachThreadInput(uint a,uint b,bool on);
- [DllImport("kernel32.dll")]public static extern uint GetCurrentThreadId();
- [DllImport("user32.dll",EntryPoint="IsWindowArranged")][return:MarshalAs(UnmanagedType.Bool)]public static extern bool IsWindowArranged(IntPtr h);
- [DllImport("dwmapi.dll")]public static extern int DwmGetWindowAttribute(IntPtr h,uint a,out R r,uint s);
+using System;
+using System.Runtime.InteropServices;
+
+public static class SnapDigitNative {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Explicit, Size = 40)]
+    public struct INPUT {
+        [FieldOffset(0)] public uint type;
+        [FieldOffset(8)] public KEYBDINPUT keyboard;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort vk;
+        public ushort scan;
+        public uint flags;
+        public uint time;
+        public UIntPtr extra;
+    }
+
+    [DllImport("user32.dll")] public static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint threadId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern short VkKeyScanExW(char ch, IntPtr layout);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr processId);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", EntryPoint = "IsWindowArranged")]
+    [return: MarshalAs(UnmanagedType.Bool)] public static extern bool IsWindowArranged(IntPtr hwnd);
+    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, uint attr, out RECT rect, uint size);
 }
 '@
-$KU=2;$WIN=0x5B;$Z=0x5A;$ESC=0x1B
-function In([ushort]$v,[uint]$f=0){$i=New-Object N+I;$i.type=1;$k=New-Object N+K;$k.vk=$v;$k.flags=$f;$i.k=$k;$i}
-function Keys([ushort[]]$ks){$a=New-Object 'N+I[]'($ks.Count*2);$n=0;foreach($k in$ks){$a[$n]=In $k;$n++};for($j=$ks.Count-1;$j-ge 0;$j--){$a[$n]=In $ks[$j] $KU;$n++};if([N]::SendInput($a.Length,$a,[Runtime.InteropServices.Marshal]::SizeOf([type][N+I]))-ne$a.Length){throw 'input blocked'}}
-function Focus([IntPtr]$h){if([N]::GetForegroundWindow()-eq$h){return};$ct=[N]::GetCurrentThreadId();$fg=[N]::GetForegroundWindow();$ft=if($fg-eq[IntPtr]::Zero){0}else{[N]::GetWindowThreadProcessId($fg,[IntPtr]::Zero)};$tt=[N]::GetWindowThreadProcessId($h,[IntPtr]::Zero);$af=$false;$at=$false;try{if($ft-ne 0-and$ft-ne$ct){$af=[N]::AttachThreadInput($ct,$ft,$true)};if($tt-ne 0-and$tt-ne$ct-and$tt-ne$ft){$at=[N]::AttachThreadInput($ct,$tt,$true)};[N]::BringWindowToTop($h)|Out-Null;[N]::SetActiveWindow($h)|Out-Null;[N]::SetFocus($h)|Out-Null;[N]::SetForegroundWindow($h)|Out-Null;$u=[DateTime]::UtcNow.AddMilliseconds(1000);while([DateTime]::UtcNow-lt$u){[Windows.Forms.Application]::DoEvents();if([N]::GetForegroundWindow()-eq$h){return};Start-Sleep -Milliseconds 15};throw 'focus'}finally{if($at){[N]::AttachThreadInput($ct,$tt,$false)|Out-Null};if($af){[N]::AttachThreadInput($ct,$ft,$false)|Out-Null}}}
-function Shot($n){$v=[Windows.Forms.SystemInformation]::VirtualScreen;$b=New-Object Drawing.Bitmap($v.Width,$v.Height);$g=[Drawing.Graphics]::FromImage($b);$g.CopyFromScreen($v.Left,$v.Top,0,0,$b.Size);$g.Dispose();$b.Save((Join-Path $out $n),[Drawing.Imaging.ImageFormat]::Png);$b.Dispose()}
-$out=if($env:SNAP_DIAG_OUT){$env:SNAP_DIAG_OUT}else{Join-Path $env:TEMP 'capsule-snap-keyboard-diag'};New-Item -Type Directory -Force $out|Out-Null
-$f=New-Object Windows.Forms.Form;$f.Text='Context Capsule Native Snap Diagnostic';$f.FormBorderStyle='Sizable';$f.MaximizeBox=$true;$f.MinimumSize=New-Object Drawing.Size(200,160);$f.Size=New-Object Drawing.Size(780,520);$f.StartPosition='CenterScreen';$f.Show();[Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 300;$h=$f.Handle;Focus $h
-Keys @($WIN,$Z);Start-Sleep -Milliseconds 300;Shot '01-open.png'
-Keys @([ushort]0x30);Start-Sleep -Milliseconds 300;Shot '02-after-zero.png'
-Keys @([ushort]0x33);Start-Sleep -Milliseconds 300;Shot '03-layout3.png'
-Keys @([ushort]0x32);Start-Sleep -Milliseconds 520;Shot '04-zone2.png'
-$r=New-Object N+R;[N]::DwmGetWindowAttribute($h,9,[ref]$r,[Runtime.InteropServices.Marshal]::SizeOf([type][N+R]))|Out-Null;[pscustomobject]@{arranged=[N]::IsWindowArranged($h);pixels=@($r.L,$r.T,$r.Ri,$r.B)}|ConvertTo-Json|Set-Content -Encoding UTF8(Join-Path $out 'result.json');Keys @([ushort]$ESC);$f.Close()
+
+$KEY_UP = 0x0002
+$VK_SHIFT = 0x10
+$VK_CONTROL = 0x11
+$VK_MENU = 0x12
+$VK_LWIN = 0x5B
+$VK_Z = 0x5A
+$VK_ESCAPE = 0x1B
+
+function New-KeyInput([ushort]$VirtualKey, [uint32]$Flags = 0) {
+    $input = New-Object SnapDigitNative+INPUT
+    $input.type = 1
+    $keyboard = New-Object SnapDigitNative+KEYBDINPUT
+    $keyboard.vk = $VirtualKey
+    $keyboard.flags = $Flags
+    $input.keyboard = $keyboard
+    return $input
+}
+
+function Send-KeySequence([ushort[]]$VirtualKeys) {
+    $list = New-Object System.Collections.Generic.List[SnapDigitNative+INPUT]
+    foreach ($virtualKey in $VirtualKeys) { $list.Add((New-KeyInput $virtualKey)) }
+    for ($i = $VirtualKeys.Count - 1; $i -ge 0; $i--) { $list.Add((New-KeyInput $VirtualKeys[$i] $KEY_UP)) }
+    $inputs = $list.ToArray()
+    $sent = [SnapDigitNative]::SendInput($inputs.Length, $inputs, [Runtime.InteropServices.Marshal]::SizeOf([type][SnapDigitNative+INPUT]))
+    if ($sent -ne $inputs.Length) { throw "SendInput accepted $sent/$($inputs.Length) events" }
+}
+
+function Send-Character([char]$Character) {
+    $layout = [SnapDigitNative]::GetKeyboardLayout(0)
+    $mapping = [int][SnapDigitNative]::VkKeyScanExW($Character, $layout)
+    if ($mapping -eq -1) { throw "Active keyboard layout cannot produce '$Character'" }
+    $virtualKey = [ushort]($mapping -band 0xFF)
+    $shiftState = ($mapping -shr 8) -band 0xFF
+    $keys = New-Object System.Collections.Generic.List[ushort]
+    if (($shiftState -band 1) -ne 0) { $keys.Add([ushort]$VK_SHIFT) }
+    if (($shiftState -band 2) -ne 0) { $keys.Add([ushort]$VK_CONTROL) }
+    if (($shiftState -band 4) -ne 0) { $keys.Add([ushort]$VK_MENU) }
+    $keys.Add($virtualKey)
+    Send-KeySequence $keys.ToArray()
+}
+
+function Focus-Verified([IntPtr]$Hwnd) {
+    if ([SnapDigitNative]::GetForegroundWindow() -eq $Hwnd) { return }
+    $current = [SnapDigitNative]::GetCurrentThreadId()
+    $foreground = [SnapDigitNative]::GetForegroundWindow()
+    $foregroundThread = if ($foreground -eq [IntPtr]::Zero) { 0 } else { [SnapDigitNative]::GetWindowThreadProcessId($foreground, [IntPtr]::Zero) }
+    $targetThread = [SnapDigitNative]::GetWindowThreadProcessId($Hwnd, [IntPtr]::Zero)
+    $attachedForeground = $false
+    $attachedTarget = $false
+    try {
+        if ($foregroundThread -ne 0 -and $foregroundThread -ne $current) { $attachedForeground = [SnapDigitNative]::AttachThreadInput($current, $foregroundThread, $true) }
+        if ($targetThread -ne 0 -and $targetThread -ne $current -and $targetThread -ne $foregroundThread) { $attachedTarget = [SnapDigitNative]::AttachThreadInput($current, $targetThread, $true) }
+        [SnapDigitNative]::BringWindowToTop($Hwnd) | Out-Null
+        [SnapDigitNative]::SetActiveWindow($Hwnd) | Out-Null
+        [SnapDigitNative]::SetFocus($Hwnd) | Out-Null
+        [SnapDigitNative]::SetForegroundWindow($Hwnd) | Out-Null
+        $deadline = [DateTime]::UtcNow.AddMilliseconds(1000)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            [System.Windows.Forms.Application]::DoEvents()
+            if ([SnapDigitNative]::GetForegroundWindow() -eq $Hwnd) { return }
+            Start-Sleep -Milliseconds 15
+        }
+        throw 'Could not focus diagnostic target; refusing Win+Z input'
+    } finally {
+        if ($attachedTarget) { [SnapDigitNative]::AttachThreadInput($current, $targetThread, $false) | Out-Null }
+        if ($attachedForeground) { [SnapDigitNative]::AttachThreadInput($current, $foregroundThread, $false) | Out-Null }
+    }
+}
+
+function Save-Screenshot([string]$Name) {
+    $virtual = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $bitmap = New-Object System.Drawing.Bitmap($virtual.Width, $virtual.Height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $graphics.CopyFromScreen($virtual.Left, $virtual.Top, 0, 0, $bitmap.Size)
+    $graphics.Dispose()
+    $bitmap.Save((Join-Path $outDir $Name), [System.Drawing.Imaging.ImageFormat]::Png)
+    $bitmap.Dispose()
+}
+
+$outDir = if ($env:SNAP_DIAG_OUT) { $env:SNAP_DIAG_OUT } else { Join-Path $env:TEMP 'capsule-snap-keyboard-diag' }
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Context Capsule Native Snap Diagnostic'
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+$form.MaximizeBox = $true
+$form.MinimumSize = New-Object System.Drawing.Size(200, 160)
+$form.Size = New-Object System.Drawing.Size(780, 520)
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$form.Show()
+[System.Windows.Forms.Application]::DoEvents()
+Start-Sleep -Milliseconds 300
+$hwnd = $form.Handle
+Focus-Verified $hwnd
+
+Send-KeySequence @([ushort]$VK_LWIN, [ushort]$VK_Z)
+Start-Sleep -Milliseconds 300
+Save-Screenshot '01-open.png'
+Send-Character '3'
+Start-Sleep -Milliseconds 300
+Save-Screenshot '02-first-3.png'
+Send-Character '3'
+Start-Sleep -Milliseconds 300
+Save-Screenshot '03-second-3.png'
+Send-Character '2'
+Start-Sleep -Milliseconds 550
+Save-Screenshot '04-zone-2.png'
+
+$rect = New-Object SnapDigitNative+RECT
+[SnapDigitNative]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [Runtime.InteropServices.Marshal]::SizeOf([type][SnapDigitNative+RECT])) | Out-Null
+[pscustomobject]@{
+    arranged = [SnapDigitNative]::IsWindowArranged($hwnd)
+    pixels = @($rect.Left, $rect.Top, $rect.Right, $rect.Bottom)
+    keyboard_layout = ('0x{0:X}' -f ([SnapDigitNative]::GetKeyboardLayout(0).ToInt64()))
+} | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $outDir 'result.json')
+
+Send-KeySequence @([ushort]$VK_ESCAPE)
+Start-Sleep -Milliseconds 100
+$form.Close()
