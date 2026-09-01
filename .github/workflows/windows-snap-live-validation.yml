@@ -7,7 +7,7 @@ on:
     paths:
       - 'tests/windows_snap_live.rs'
       - 'scripts/patch_windows_snap_live_test.py'
-      - 'scripts/patch_quarter_snap_sequence.py'
+      - 'scripts/patch_explicit_snap_layouts.py'
       - '.github/workflows/windows-snap-live-validation.yml'
 
 jobs:
@@ -34,8 +34,8 @@ jobs:
         run: |
           python ./scripts/patch_windows_snap_live_test.py
           if ($LASTEXITCODE -ne 0) { throw 'live test patch failed' }
-          python ./scripts/patch_quarter_snap_sequence.py
-          if ($LASTEXITCODE -ne 0) { throw 'quarter Snap patch failed' }
+          python ./scripts/patch_explicit_snap_layouts.py
+          if ($LASTEXITCODE -ne 0) { throw 'explicit Snap Layout patch failed' }
           cargo fmt --all
           if ($LASTEXITCODE -ne 0) { throw 'formatting failed' }
           git diff --check
