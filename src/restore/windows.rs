@@ -47,7 +47,12 @@ const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(120);
 const SETTLE_MAXIMUM: Duration = Duration::from_secs(8);
 const SETTLE_STABLE_FOR: Duration = Duration::from_millis(900);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(180);
-const GEOMETRY_TOLERANCE: i32 = 14;
+const NORMAL_GEOMETRY_TOLERANCE: i32 = 14;
+// A snapped window must match the saved/canonical slot very closely. The old
+// 14-pixel tolerance allowed a nearby floating rectangle to be accepted before
+// native Snap was attempted. DWM rounding can vary by a pixel or two, so keep a
+// tiny allowance rather than requiring impossible bit-for-bit equality.
+const SNAP_GEOMETRY_TOLERANCE: i32 = 3;
 const PLACEMENT_RETRIES: usize = 5;
 const PLACEMENT_SETTLE_BASE_MS: u64 = 120;
 const NATIVE_SNAP_RETRIES: usize = 2;
@@ -264,9 +269,7 @@ pub fn restore_desktop_forced(saved: &SavedDesktop, dry_run: bool) -> DesktopRes
 /// a fresh post-placement inventory. This deliberately never moves,
 /// resizes, maximizes, minimizes, or re-snaps a window, making it safe
 /// as the last Windows restore operation after native Snap work.
-pub(super) fn restore_order_and_foreground_only(
-    saved: &SavedDesktop,
-) -> DesktopRestoreReport {
+pub(super) fn restore_order_and_foreground_only(saved: &SavedDesktop) -> DesktopRestoreReport {
     let mut report = DesktopRestoreReport {
         applications_total: saved.applications.len(),
         ..DesktopRestoreReport::default()
@@ -903,21 +906,41 @@ fn window_match_score(
 }
 
 fn native_snap_direction(slot: SnapSlot) -> Option<SnapDirection> {
-    match slot {
-        SnapSlot::LeftHalf => Some(SnapDirection::LeftHalf),
-        SnapSlot::RightHalf => Some(SnapDirection::RightHalf),
-        SnapSlot::TopHalf => Some(SnapDirection::TopHalf),
-        SnapSlot::BottomHalf => Some(SnapDirection::BottomHalf),
-        SnapSlot::TopLeftQuarter
-        | SnapSlot::TopRightQuarter
-        | SnapSlot::BottomLeftQuarter
-        | SnapSlot::BottomRightQuarter
-        | SnapSlot::LeftThird
-        | SnapSlot::CenterThird
-        | SnapSlot::RightThird
-        | SnapSlot::LeftTwoThirds
-        | SnapSlot::RightTwoThirds => None,
+    Some(match slot {
+        SnapSlot::LeftHalf => SnapDirection::LeftHalf,
+        SnapSlot::RightHalf => SnapDirection::RightHalf,
+        SnapSlot::TopHalf => SnapDirection::TopHalf,
+        SnapSlot::BottomHalf => SnapDirection::BottomHalf,
+        SnapSlot::TopLeftQuarter => SnapDirection::TopLeftQuarter,
+        SnapSlot::TopRightQuarter => SnapDirection::TopRightQuarter,
+        SnapSlot::BottomLeftQuarter => SnapDirection::BottomLeftQuarter,
+        SnapSlot::BottomRightQuarter => SnapDirection::BottomRightQuarter,
+        SnapSlot::LeftThird => SnapDirection::LeftThird,
+        SnapSlot::CenterThird => SnapDirection::CenterThird,
+        SnapSlot::RightThird => SnapDirection::RightThird,
+        SnapSlot::LeftTwoThirds => SnapDirection::LeftTwoThirds,
+        SnapSlot::RightTwoThirds => SnapDirection::RightTwoThirds,
+    })
+}
+
+fn native_snap_direction_for_saved(
+    saved: &SavedWindow,
+    display: &TargetDisplay,
+    target: SavedRect,
+) -> Option<SnapDirection> {
+    let WindowStateSpec::Snapped(slot) = saved.state_spec() else {
+        return None;
+    };
+
+    // Old capsules can contain a false "snapped:*" label even though their
+    // normalized rectangle is plainly a normal floating window. target_rect()
+    // intentionally preserves that historical geometry. Do not turn those old
+    // false positives into a real snap now; only native-replay canonical slots.
+    let canonical = snap_rect(display.work_area, slot);
+    if !rect_close(target, canonical, SNAP_GEOMETRY_TOLERANCE) {
+        return None;
     }
+    native_snap_direction(slot)
 }
 
 fn force_layout_replay_supported(_current: &CurrentWindow, saved: &SavedWindow) -> bool {
@@ -954,12 +977,22 @@ fn window_geometry_satisfied(
         }
         WindowStateSpec::Fullscreen => {
             !current.minimized
-                && rect_close(current.bounds, display.bounds, GEOMETRY_TOLERANCE)
+                && rect_close(current.bounds, display.bounds, NORMAL_GEOMETRY_TOLERANCE)
         }
-        WindowStateSpec::Normal | WindowStateSpec::Snapped(_) | WindowStateSpec::Unknown(_) => {
+        WindowStateSpec::Snapped(_) => {
             !current.minimized
                 && !current.maximized
-                && rect_close(current.bounds, target, GEOMETRY_TOLERANCE)
+                && rect_close(current.bounds, target, SNAP_GEOMETRY_TOLERANCE)
+        }
+        WindowStateSpec::Unknown(_) if saved.state.starts_with("snapped:") => {
+            !current.minimized
+                && !current.maximized
+                && rect_close(current.bounds, target, SNAP_GEOMETRY_TOLERANCE)
+        }
+        WindowStateSpec::Normal | WindowStateSpec::Unknown(_) => {
+            !current.minimized
+                && !current.maximized
+                && rect_close(current.bounds, target, NORMAL_GEOMETRY_TOLERANCE)
         }
     }
 }
@@ -974,14 +1007,13 @@ fn window_satisfied(
         return false;
     }
 
-    let WindowStateSpec::Snapped(slot) = saved.state_spec() else {
-        return true;
-    };
-    if native_snap_direction(slot).is_none() {
-        return true;
+    // Geometry alone is never enough for a canonical stock Snap slot. This is
+    // the key invariant that prevents a nearby floating window from being
+    // skipped. If Windows cannot prove IsWindowArranged=true, restore must run.
+    if native_snap_direction_for_saved(saved, display, target).is_some() {
+        return windows_snap::is_arranged(current.hwnd as Hwnd) == Some(true);
     }
-
-    windows_snap::is_arranged(current.hwnd as Hwnd).unwrap_or(true)
+    true
 }
 
 fn stage_window_rect(hwnd: Hwnd, target: SavedRect) -> Result<(), String> {
@@ -1027,10 +1059,7 @@ fn apply_window_state(
         return Err("window handle is unavailable".to_owned());
     }
 
-    let native_direction = match saved.state_spec() {
-        WindowStateSpec::Snapped(slot) => native_snap_direction(slot),
-        _ => None,
-    };
+    let native_direction = native_snap_direction_for_saved(saved, display, target);
     let mut native_attempts = 0usize;
     let mut native_failure: Option<String> = None;
     let mut geometry_converged = false;
@@ -1071,9 +1100,10 @@ fn apply_window_state(
                 geometry_converged = true;
 
                 if let Some(direction) = native_direction {
-                    if windows_snap::is_arranged(hwnd) == Some(false)
-                        && native_attempts < NATIVE_SNAP_RETRIES
-                    {
+                    // Re-snap whenever the saved native state is not satisfied.
+                    // An HWND may already be arranged in the wrong slot; the
+                    // baseline Snap wrapper safely restores it to floating first.
+                    if native_attempts < NATIVE_SNAP_RETRIES {
                         native_attempts += 1;
                         match windows_snap::snap(hwnd, direction) {
                             Ok(true) => {
@@ -1121,7 +1151,9 @@ fn apply_window_state(
                 return Err(format!(
                     "native Windows snap could not be restored for '{}'; exact saved geometry was retained but the window is not in the required arranged state: {}",
                     saved.title,
-                    native_failure.as_deref().unwrap_or("unknown native snap failure")
+                    native_failure
+                        .as_deref()
+                        .unwrap_or("unknown native snap failure")
                 ));
             }
             last_observed = Some(observed);
@@ -1682,25 +1714,80 @@ mod tests {
     }
 
     #[test]
-    fn native_snap_shortcuts_are_limited_to_unambiguous_half_slots() {
-        assert_eq!(
-            native_snap_direction(SnapSlot::LeftHalf),
-            Some(SnapDirection::LeftHalf)
+    fn native_snap_shortcuts_cover_every_stock_slot() {
+        let cases = [
+            (SnapSlot::LeftHalf, SnapDirection::LeftHalf),
+            (SnapSlot::RightHalf, SnapDirection::RightHalf),
+            (SnapSlot::TopHalf, SnapDirection::TopHalf),
+            (SnapSlot::BottomHalf, SnapDirection::BottomHalf),
+            (SnapSlot::TopLeftQuarter, SnapDirection::TopLeftQuarter),
+            (SnapSlot::TopRightQuarter, SnapDirection::TopRightQuarter),
+            (
+                SnapSlot::BottomLeftQuarter,
+                SnapDirection::BottomLeftQuarter,
+            ),
+            (
+                SnapSlot::BottomRightQuarter,
+                SnapDirection::BottomRightQuarter,
+            ),
+            (SnapSlot::LeftThird, SnapDirection::LeftThird),
+            (SnapSlot::CenterThird, SnapDirection::CenterThird),
+            (SnapSlot::RightThird, SnapDirection::RightThird),
+            (SnapSlot::LeftTwoThirds, SnapDirection::LeftTwoThirds),
+            (SnapSlot::RightTwoThirds, SnapDirection::RightTwoThirds),
+        ];
+        for (slot, direction) in cases {
+            assert_eq!(native_snap_direction(slot), Some(direction));
+        }
+    }
+
+    #[test]
+    fn snapped_geometry_does_not_accept_old_fourteen_pixel_slack() {
+        let display = display();
+        let mut saved = saved_window("Window", 0, false);
+        saved.state = "snapped:left-half".to_owned();
+        saved.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        });
+        let target = snap_rect(display.work_area, SnapSlot::LeftHalf);
+        let current = current_window(
+            SavedRect {
+                left: target.left + 4,
+                top: target.top,
+                right: target.right + 4,
+                bottom: target.bottom,
+            },
+            false,
         );
-        assert_eq!(
-            native_snap_direction(SnapSlot::RightHalf),
-            Some(SnapDirection::RightHalf)
-        );
-        assert_eq!(
-            native_snap_direction(SnapSlot::TopHalf),
-            Some(SnapDirection::TopHalf)
-        );
-        assert_eq!(
-            native_snap_direction(SnapSlot::BottomHalf),
-            Some(SnapDirection::BottomHalf)
-        );
-        assert_eq!(native_snap_direction(SnapSlot::LeftThird), None);
-        assert_eq!(native_snap_direction(SnapSlot::TopLeftQuarter), None);
+        assert!(!window_geometry_satisfied(
+            &current, &saved, &display, target
+        ));
+
+        saved.state = "normal".to_owned();
+        assert!(window_geometry_satisfied(
+            &current,
+            &saved,
+            &display,
+            current.bounds
+        ));
+    }
+
+    #[test]
+    fn legacy_false_snap_is_not_promoted_to_native_snap() {
+        let display = display();
+        let mut saved = saved_window("Window", 0, false);
+        saved.state = "snapped:left-half".to_owned();
+        saved.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.12,
+            y: 0.11,
+            width: 0.55,
+            height: 0.70,
+        });
+        let target = target_rect(&saved, &display);
+        assert!(native_snap_direction_for_saved(&saved, &display, target).is_none());
     }
 
     #[test]
