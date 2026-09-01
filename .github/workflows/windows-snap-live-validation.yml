@@ -6,6 +6,7 @@ on:
       - 'fix/windows-snap-layout-coverage-20260831'
     paths:
       - 'tests/windows_snap_live.rs'
+      - 'scripts/patch_windows_snap_live_test.py'
       - '.github/workflows/windows-snap-live-validation.yml'
 
 jobs:
@@ -26,6 +27,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
           rustup default stable
           if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+
+      - name: Normalize temporary live harness
+        shell: pwsh
+        run: |
+          python ./scripts/patch_windows_snap_live_test.py
+          if ($LASTEXITCODE -ne 0) { throw 'live test patch failed' }
+          cargo fmt --all -- tests/windows_snap_live.rs
+          if ($LASTEXITCODE -ne 0) { throw 'live test formatting failed' }
 
       - name: Compile live validation
         shell: pwsh
