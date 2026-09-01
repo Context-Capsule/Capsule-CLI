@@ -7,6 +7,7 @@ on:
     paths:
       - 'tests/windows_snap_live.rs'
       - 'scripts/patch_windows_snap_live_test.py'
+      - 'scripts/patch_quarter_snap_sequence.py'
       - '.github/workflows/windows-snap-live-validation.yml'
 
 jobs:
@@ -28,13 +29,17 @@ jobs:
           rustup default stable
           if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
 
-      - name: Normalize temporary live harness
+      - name: Apply live validation patches
         shell: pwsh
         run: |
           python ./scripts/patch_windows_snap_live_test.py
           if ($LASTEXITCODE -ne 0) { throw 'live test patch failed' }
-          cargo fmt --all -- tests/windows_snap_live.rs
-          if ($LASTEXITCODE -ne 0) { throw 'live test formatting failed' }
+          python ./scripts/patch_quarter_snap_sequence.py
+          if ($LASTEXITCODE -ne 0) { throw 'quarter Snap patch failed' }
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'formatting failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
 
       - name: Compile live validation
         shell: pwsh
