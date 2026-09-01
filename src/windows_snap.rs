@@ -18,12 +18,16 @@ const INPUT_KEYBOARD: u32 = 1;
 const KEYEVENTF_KEYUP: u32 = 0x0002;
 const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
 const MOUSEEVENTF_LEFTUP: u32 = 0x0004;
+const VK_SHIFT: u16 = 0x10;
+const VK_CONTROL: u16 = 0x11;
+const VK_MENU: u16 = 0x12;
+const VK_ESCAPE: u16 = 0x1B;
 const VK_LEFT: u16 = 0x25;
 const VK_UP: u16 = 0x26;
 const VK_RIGHT: u16 = 0x27;
 const VK_DOWN: u16 = 0x28;
-const VK_MENU: u16 = 0x12;
 const VK_LWIN: u16 = 0x5B;
+const VK_Z: u16 = 0x5A;
 const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
 
 const WM_NCHITTEST: u32 = 0x0084;
@@ -37,6 +41,11 @@ const FOREGROUND_SETTLE: Duration = Duration::from_millis(45);
 const FOREGROUND_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(1_400);
 const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SNAP_SETTLE: Duration = Duration::from_millis(220);
+const SNAP_PATH_STEP_SETTLE: Duration = Duration::from_millis(180);
+const SNAP_LAYOUT_OPEN_SETTLE: Duration = Duration::from_millis(300);
+const SNAP_LAYOUT_SELECT_SETTLE: Duration = Duration::from_millis(240);
+const SNAP_LAYOUT_RESULT_TIMEOUT: Duration = Duration::from_millis(1_500);
+const SNAP_LAYOUT_DISMISS_SETTLE: Duration = Duration::from_millis(100);
 const DIVIDER_HOVER_SETTLE: Duration = Duration::from_millis(90);
 const DIVIDER_STEP_SETTLE: Duration = Duration::from_millis(12);
 const DIVIDER_RESULT_SETTLE: Duration = Duration::from_millis(280);
@@ -59,6 +68,15 @@ pub(crate) enum SnapDirection {
     RightHalf,
     TopHalf,
     BottomHalf,
+    TopLeftQuarter,
+    TopRightQuarter,
+    BottomLeftQuarter,
+    BottomRightQuarter,
+    LeftThird,
+    CenterThird,
+    RightThird,
+    LeftTwoThirds,
+    RightTwoThirds,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +178,8 @@ unsafe extern "system" {
     fn GetForegroundWindow() -> Hwnd;
     fn SetForegroundWindow(hwnd: Hwnd) -> Bool;
     fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
+    fn GetKeyboardLayout(thread_id: u32) -> Handle;
+    fn VkKeyScanExW(character: u16, keyboard_layout: Handle) -> i16;
     fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: Bool) -> Bool;
     fn SendInput(count: u32, inputs: *const NativeInput, size: i32) -> u32;
     fn SetCursorPos(x: i32, y: i32) -> Bool;
@@ -228,15 +248,133 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
         );
     }
 
-    let (modifiers, arrow): (&[u16], u16) = match direction {
-        SnapDirection::LeftHalf => (&[VK_LWIN], VK_LEFT),
-        SnapDirection::RightHalf => (&[VK_LWIN], VK_RIGHT),
-        SnapDirection::TopHalf => (&[VK_LWIN, VK_MENU], VK_UP),
-        SnapDirection::BottomHalf => (&[VK_LWIN, VK_MENU], VK_DOWN),
-    };
-    send_chord(modifiers, arrow)?;
+    match direction {
+        SnapDirection::LeftHalf => send_chord(&[VK_LWIN], VK_LEFT)?,
+        SnapDirection::RightHalf => send_chord(&[VK_LWIN], VK_RIGHT)?,
+        SnapDirection::TopHalf => send_chord(&[VK_LWIN, VK_MENU], VK_UP)?,
+        SnapDirection::BottomHalf => send_chord(&[VK_LWIN, VK_MENU], VK_DOWN)?,
+        SnapDirection::TopLeftQuarter => send_win_arrow_path(&[VK_LEFT, VK_UP])?,
+        SnapDirection::TopRightQuarter => send_win_arrow_path(&[VK_RIGHT, VK_UP])?,
+        SnapDirection::BottomLeftQuarter => send_win_arrow_path(&[VK_LEFT, VK_DOWN])?,
+        SnapDirection::BottomRightQuarter => send_win_arrow_path(&[VK_RIGHT, VK_DOWN])?,
+        direction => {
+            let (layout, zone) = snap_layout_choice(direction).ok_or_else(|| {
+                format!("no native Snap Layout mapping is available for {direction:?}")
+            })?;
+            return snap_layout_zone(hwnd, layout, zone);
+        }
+    }
+
     thread::sleep(SNAP_SETTLE);
     Ok(is_arranged(hwnd).unwrap_or(false))
+}
+
+fn snap_layout_choice(direction: SnapDirection) -> Option<(u8, u8)> {
+    Some(match direction {
+        // Windows 11 numbers the standard landscape templates in the Win+Z
+        // flyout as: 1=halves, 2=2/3+1/3, 3=1/3+2/3, 4=three thirds,
+        // 5=half+two quarters, 6=four quarters. A one-third slot is chosen from
+        // an asymmetric two-zone template when possible so a paired 2/3 window
+        // can share the same native template; center-third necessarily uses 4.
+        SnapDirection::LeftThird => (3, 1),
+        SnapDirection::CenterThird => (4, 2),
+        SnapDirection::RightThird => (2, 2),
+        SnapDirection::LeftTwoThirds => (2, 1),
+        SnapDirection::RightTwoThirds => (3, 2),
+        _ => return None,
+    })
+}
+
+fn snap_layout_zone(hwnd: Hwnd, layout: u8, zone: u8) -> Result<bool, String> {
+    if !(1..=9).contains(&layout) || !(1..=9).contains(&zone) {
+        return Err(format!("invalid Snap Layout access key {layout}:{zone}"));
+    }
+    if unsafe { GetForegroundWindow() } != hwnd {
+        return Err(
+            "the native Snap Layout target lost foreground focus before Win+Z; no layout keys were sent"
+                .to_owned(),
+        );
+    }
+
+    // No helper/probe HWND is created. Win+Z is opened only for the real target
+    // window, and every access-key stage re-checks that the intended HWND still
+    // owns foreground focus before continuing.
+    send_chord(&[VK_LWIN], VK_Z)?;
+    thread::sleep(SNAP_LAYOUT_OPEN_SETTLE);
+
+    let result = (|| {
+        if unsafe { GetForegroundWindow() } != hwnd {
+            return Err(
+                "the Snap Layout flyout did not remain associated with the intended target window"
+                    .to_owned(),
+            );
+        }
+        send_access_digit(hwnd, layout)?;
+        thread::sleep(SNAP_LAYOUT_SELECT_SETTLE);
+        if unsafe { GetForegroundWindow() } != hwnd {
+            return Err(
+                "the intended target lost foreground focus while selecting a Snap Layout"
+                    .to_owned(),
+            );
+        }
+        send_access_digit(hwnd, zone)?;
+
+        let deadline = Instant::now() + SNAP_LAYOUT_RESULT_TIMEOUT;
+        while Instant::now() < deadline {
+            if is_arranged(hwnd) == Some(true) {
+                return Ok(true);
+            }
+            thread::sleep(FOREGROUND_POLL_INTERVAL);
+        }
+        Ok(false)
+    })();
+
+    // Native zone selection normally opens Snap Assist. Escape dismisses that
+    // transient shell picker without undoing the arranged target window. It also
+    // guarantees a failed restore does not leave a Win+Z overlay behind.
+    let _ = send_chord(&[], VK_ESCAPE);
+    thread::sleep(SNAP_LAYOUT_DISMISS_SETTLE);
+    result.map(|arranged| arranged && is_arranged(hwnd) == Some(true))
+}
+
+fn send_access_digit(hwnd: Hwnd, digit: u8) -> Result<(), String> {
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+    if thread_id == 0 {
+        return Err(
+            "could not resolve the target keyboard layout for Snap Layout access keys".to_owned(),
+        );
+    }
+    let keyboard_layout = unsafe { GetKeyboardLayout(thread_id) };
+    let mapping = unsafe { VkKeyScanExW(u16::from(b'0' + digit), keyboard_layout) };
+    if mapping == -1 {
+        return Err(format!(
+            "the target keyboard layout cannot generate Snap Layout digit '{digit}'"
+        ));
+    }
+
+    let virtual_key = (mapping as u16) & 0x00ff;
+    let shift_state = ((mapping as u16) >> 8) & 0x00ff;
+    let mut modifiers = Vec::with_capacity(3);
+    if shift_state & 0x01 != 0 {
+        modifiers.push(VK_SHIFT);
+    }
+    if shift_state & 0x02 != 0 {
+        modifiers.push(VK_CONTROL);
+    }
+    if shift_state & 0x04 != 0 {
+        modifiers.push(VK_MENU);
+    }
+    send_chord(&modifiers, virtual_key)
+}
+
+fn send_win_arrow_path(arrows: &[u16]) -> Result<(), String> {
+    for (index, arrow) in arrows.iter().enumerate() {
+        send_chord(&[VK_LWIN], *arrow)?;
+        if index + 1 < arrows.len() {
+            thread::sleep(SNAP_PATH_STEP_SETTLE);
+        }
+    }
+    Ok(())
 }
 
 fn focus_window_without_geometry_change(hwnd: Hwnd) -> bool {
@@ -269,9 +407,8 @@ fn focus_window_without_geometry_change(hwnd: Hwnd) -> bool {
     let target_thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
 
     let attach_foreground = foreground_thread != 0 && foreground_thread != current_thread;
-    let attach_target = target_thread != 0
-        && target_thread != current_thread
-        && target_thread != foreground_thread;
+    let attach_target =
+        target_thread != 0 && target_thread != current_thread && target_thread != foreground_thread;
 
     if attach_foreground {
         unsafe {
@@ -823,6 +960,22 @@ mod tests {
         assert_eq!(input.kind, INPUT_MOUSE);
         let mouse = unsafe { input.payload.mouse };
         assert_eq!(mouse.flags, MOUSEEVENTF_LEFTDOWN);
+    }
+
+    #[test]
+    fn stock_snap_layout_choices_cover_thirds_and_asymmetric_slots() {
+        assert_eq!(snap_layout_choice(SnapDirection::LeftThird), Some((3, 1)));
+        assert_eq!(snap_layout_choice(SnapDirection::CenterThird), Some((4, 2)));
+        assert_eq!(snap_layout_choice(SnapDirection::RightThird), Some((2, 2)));
+        assert_eq!(
+            snap_layout_choice(SnapDirection::LeftTwoThirds),
+            Some((2, 1))
+        );
+        assert_eq!(
+            snap_layout_choice(SnapDirection::RightTwoThirds),
+            Some((3, 2))
+        );
+        assert_eq!(snap_layout_choice(SnapDirection::TopLeftQuarter), None);
     }
 
     #[test]

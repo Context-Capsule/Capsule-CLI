@@ -1,0 +1,60 @@
+name: Windows Snap Live Validation
+
+on:
+  push:
+    branches:
+      - 'fix/windows-snap-layout-coverage-20260831'
+    paths:
+      - 'tests/windows_snap_live.rs'
+      - 'scripts/patch_windows_snap_live_test.py'
+      - 'scripts/patch_explicit_snap_layouts.py'
+      - '.github/workflows/windows-snap-live-validation.yml'
+
+jobs:
+  live:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+
+      - name: Ensure stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+
+      - name: Apply live validation patches
+        shell: pwsh
+        run: |
+          python ./scripts/patch_windows_snap_live_test.py
+          if ($LASTEXITCODE -ne 0) { throw 'live test patch failed' }
+          python ./scripts/patch_explicit_snap_layouts.py
+          if ($LASTEXITCODE -ne 0) { throw 'explicit Snap Layout patch failed' }
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'formatting failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+
+      - name: Compile live validation
+        shell: pwsh
+        run: cargo test --test windows_snap_live --no-run
+
+      - name: Run actual restore against near-floating windows
+        shell: pwsh
+        env:
+          SNAP_LIVE_OUT: ${{ runner.temp }}\context-capsule-snap-live-${{ github.run_id }}
+        run: cargo test --test windows_snap_live -- --ignored --nocapture --test-threads=1
+
+      - name: Upload screenshots and runtime report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-snap-live-${{ github.run_id }}
+          path: ${{ runner.temp }}\context-capsule-snap-live-${{ github.run_id }}
+          if-no-files-found: warn
