@@ -2,7 +2,7 @@ name: VS Code State Integration
 
 on:
   push:
-    branches: [main, 'agent/**', 'feature/**']
+    branches: [main, 'agent/**', 'feature/**', 'fix/**']
   pull_request:
   workflow_dispatch:
 
@@ -114,9 +114,6 @@ jobs:
 
   vscode-state-to-capsule-linux:
     runs-on: [self-hosted, Linux, X64]
-    env:
-      CONTEXT_CAPSULE_VSCODE_STATE_PATH: ${{ runner.temp }}/context-capsule-vscode-state.json
-      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-vscode.db
     steps:
       - name: Verify POTUS-linux runner
         shell: bash
@@ -125,6 +122,11 @@ jobs:
           test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Configure isolated runtime paths
+        shell: bash
+        run: |
+          echo "CONTEXT_CAPSULE_VSCODE_STATE_PATH=$RUNNER_TEMP/context-capsule-vscode-state.json" >> "$GITHUB_ENV"
+          echo "CONTEXT_CAPSULE_DB=$RUNNER_TEMP/context-capsule-vscode.db" >> "$GITHUB_ENV"
       - name: Build and test VS Code state parser
         run: |
           cargo build
