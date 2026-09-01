@@ -66,11 +66,8 @@ core = core[:start] + core[end + 1 :]
 
 core = replace_required(
     core,
-    """        assert_eq!(snap_layout_choice(SnapDirection::RightTwoThirds), Some((3, 2)));
-        assert_eq!(snap_layout_choice(SnapDirection::TopLeftQuarter), None);
-""",
-    """        assert_eq!(snap_layout_choice(SnapDirection::RightTwoThirds), Some((3, 2)));
-        assert_eq!(snap_layout_choice(SnapDirection::TopLeftQuarter), Some((6, 1)));
+    "        assert_eq!(snap_layout_choice(SnapDirection::TopLeftQuarter), None);\n",
+    """        assert_eq!(snap_layout_choice(SnapDirection::TopLeftQuarter), Some((6, 1)));
         assert_eq!(snap_layout_choice(SnapDirection::TopRightQuarter), Some((6, 2)));
         assert_eq!(snap_layout_choice(SnapDirection::BottomLeftQuarter), Some((6, 3)));
         assert_eq!(snap_layout_choice(SnapDirection::BottomRightQuarter), Some((6, 4)));
