@@ -2,7 +2,7 @@ name: Firefox Native Host
 
 on:
   push:
-    branches: [main, 'agent/**', 'feature/**']
+    branches: [main, 'agent/**', 'feature/**', 'fix/**']
   pull_request:
   workflow_dispatch:
 
@@ -66,10 +66,6 @@ jobs:
 
   protocol-integration-linux:
     runs-on: [self-hosted, Linux, X64]
-    env:
-      HOME: ${{ runner.temp }}/context-capsule-firefox-home
-      CONTEXT_CAPSULE_DB: ${{ runner.temp }}/context-capsule-firefox.db
-      CONTEXT_CAPSULE_FIREFOX_STATE_PATH: ${{ runner.temp }}/context-capsule-firefox-state.json
     steps:
       - name: Verify POTUS-linux runner
         shell: bash
@@ -78,6 +74,12 @@ jobs:
           test '${{ runner.name }}' = 'POTUS-linux' || { echo "Expected runner POTUS-linux, got '${{ runner.name }}'" >&2; exit 1; }
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Configure isolated runtime paths
+        shell: bash
+        run: |
+          echo "HOME=$RUNNER_TEMP/context-capsule-firefox-home" >> "$GITHUB_ENV"
+          echo "CONTEXT_CAPSULE_DB=$RUNNER_TEMP/context-capsule-firefox.db" >> "$GITHUB_ENV"
+          echo "CONTEXT_CAPSULE_FIREFOX_STATE_PATH=$RUNNER_TEMP/context-capsule-firefox-state.json" >> "$GITHUB_ENV"
       - run: cargo build --bins
       - name: Install and diagnose native host manifest
         shell: bash
