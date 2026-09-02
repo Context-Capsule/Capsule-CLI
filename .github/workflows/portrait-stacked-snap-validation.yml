@@ -1,0 +1,56 @@
+name: Portrait Stacked Snap Validation
+
+on:
+  push:
+    branches:
+      - fix/portrait-stacked-snap-20260902
+
+permissions:
+  contents: read
+
+jobs:
+  windows-regression:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/portrait-stacked-snap-20260902
+      - name: Run Windows regression suite
+        shell: pwsh
+        run: cargo test --all-targets -- --skip git_context::tests::live_terminal_value_contributes_repo_omitted_from_durable_terminal_snapshot
+
+  portrait-live:
+    needs: windows-regression
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify interactive POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/portrait-stacked-snap-20260902
+      - name: Ensure stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+      - name: Run portrait top-bottom native pair regression
+        shell: pwsh
+        env:
+          SNAP_LIVE_OUT: ${{ runner.temp }}\context-capsule-portrait-${{ github.run_id }}
+        run: cargo test --test windows_snap_live live_restore_portrait_top_bottom_as_one_native_pair -- --ignored --nocapture --test-threads=1
+      - name: Re-run fullscreen post-restore regression
+        shell: pwsh
+        env:
+          SNAP_LIVE_OUT: ${{ runner.temp }}\context-capsule-portrait-${{ github.run_id }}
+        run: cargo test --test windows_snap_live live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation -- --ignored --nocapture --test-threads=1
+      - name: Upload validation screenshots and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portrait-stacked-snap-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}\context-capsule-portrait-${{ github.run_id }}
+          if-no-files-found: warn
