@@ -6,18 +6,27 @@ permissions:
   contents: write
 jobs:
   stage:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: fix/portrait-stacked-snap-20260902
           fetch-depth: 0
-      - run: python .github/scripts/apply_portrait_stacked_snap_fix.py
-      - run: cargo fmt --all && git diff --check
-      - run: |
-          if git diff --quiet; then exit 0; fi
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/windows_snap.rs src/restore/custom_snap.rs src/restore/mod.rs
-          git commit -m "fix: restore portrait stacked snap as one pair"
+      - name: Apply focused live regression test
+        shell: pwsh
+        run: python .github/scripts/add_portrait_live_test.py
+      - name: Format focused test only
+        shell: pwsh
+        run: rustfmt --edition 2024 tests/windows_snap_live.rs
+      - name: Compile focused test target
+        shell: pwsh
+        run: cargo test --test windows_snap_live --no-run
+      - name: Commit test
+        shell: pwsh
+        run: |
+          git add tests/windows_snap_live.rs
+          if (git diff --cached --quiet) { exit 0 }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test: cover portrait stacked snap restore'
           git push origin HEAD:fix/portrait-stacked-snap-20260902
