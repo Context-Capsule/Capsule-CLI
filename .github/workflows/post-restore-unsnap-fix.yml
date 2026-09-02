@@ -1,0 +1,186 @@
+name: Post Restore Unsnap Fix Validation
+
+on:
+  push:
+    branches:
+      - 'fix/post-restore-unsnap-20260902'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-and-commit:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Verify POTUS runner
+        shell: pwsh
+        run: |
+          if ('${{ runner.name }}' -ne 'POTUS') { throw "Expected POTUS, got '${{ runner.name }}'" }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/post-restore-unsnap-20260902
+
+      - name: Ensure stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'rustup stable install failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
+
+      - name: Apply narrow post-restore fix and regression coverage
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          windows = Path('src/restore/windows.rs')
+          text = windows.read_text(encoding='utf-8')
+
+          old_call = '''        reconcile_order_and_foreground(
+              &matched_for_order,
+              &inventory.displays,
+              &mut report.warnings,
+              &mut report.failures,
+          );'''
+          new_call = '''        reconcile_order_and_foreground(
+              &matched_for_order,
+              &inventory.displays,
+              &mut report.warnings,
+              &mut report.failures,
+              !force_layout,
+          );'''
+          if old_call in text:
+              text = text.replace(old_call, new_call, 1)
+          elif new_call not in text:
+              raise SystemExit('reconcile call patch point not found')
+
+          old_sig = '''fn reconcile_order_and_foreground(
+              matches: &[(&SavedWindow, &CurrentWindow)],
+              displays: &[TargetDisplay],
+              warnings: &mut Vec<String>,
+              failures: &mut Vec<String>,
+          ) {'''
+          new_sig = '''fn reconcile_order_and_foreground(
+              matches: &[(&SavedWindow, &CurrentWindow)],
+              displays: &[TargetDisplay],
+              warnings: &mut Vec<String>,
+              failures: &mut Vec<String>,
+              repair_layout_after_order: bool,
+          ) {'''
+          if old_sig in text:
+              text = text.replace(old_sig, new_sig, 1)
+          elif new_sig not in text:
+              raise SystemExit('reconcile signature patch point not found')
+
+          marker = '''    if let Some((_, current)) = desired.iter().find(|(saved, _)| saved.is_foreground) {
+              if unsafe { GetForegroundWindow() } as usize != current.hwnd
+                  && unsafe { SetForegroundWindow(current.hwnd as Hwnd) } == 0
+              {
+                  warnings.push(
+                      "Windows foreground-lock policy prevented restoring the saved foreground window"
+                          .to_owned(),
+                  );
+              }
+          }
+
+          for (saved, current) in &desired {'''
+          replacement = '''    if let Some((_, current)) = desired.iter().find(|(saved, _)| saved.is_foreground) {
+              if unsafe { GetForegroundWindow() } as usize != current.hwnd
+                  && unsafe { SetForegroundWindow(current.hwnd as Hwnd) } == 0
+              {
+                  warnings.push(
+                      "Windows foreground-lock policy prevented restoring the saved foreground window"
+                          .to_owned(),
+                  );
+              }
+          }
+
+          // The forced final placement pass has already proved native Snap/maximize state.
+          // Re-running placement here can destroy a valid Snap group while shell Z-order
+          // state is still settling. The top-level restore performs a later fresh,
+          // geometry-free order/foreground pass, so do not touch layout again here.
+          if !repair_layout_after_order {
+              return;
+          }
+
+          for (saved, current) in &desired {'''
+          if marker in text:
+              text = text.replace(marker, replacement, 1)
+          elif 'if !repair_layout_after_order {' not in text:
+              raise SystemExit('post-foreground repair guard patch point not found')
+
+          windows.write_text(text, encoding='utf-8')
+
+          live = Path('tests/windows_snap_live.rs')
+          test = live.read_text(encoding='utf-8')
+          anchor = '''    run_stock_scenario(
+              &host,
+              &display,
+              &executable,
+              &out_dir,
+              "02-four-quarters",'''
+          addition = '''    run_stock_scenario(
+              &host,
+              &display,
+              &executable,
+              &out_dir,
+              "07-top-half-foreground-stability",
+              vec![stock_spec(
+                  "Live Top Half Foreground",
+                  "snapped:top-half",
+                  SnapSlot::TopHalf,
+                  display.work,
+              )],
+              &mut log,
+          );
+
+          '''
+          if '07-top-half-foreground-stability' not in test:
+              if anchor not in test:
+                  raise SystemExit('live regression insertion point not found')
+              test = test.replace(anchor, addition + anchor, 1)
+          live.write_text(test, encoding='utf-8')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'source patch failed' }
+
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+          git diff -- src/restore/windows.rs tests/windows_snap_live.rs
+
+      - name: Run Rust test suite
+        shell: pwsh
+        run: cargo test --all-targets
+
+      - name: Run live Windows Snap regression
+        shell: pwsh
+        env:
+          SNAP_LIVE_OUT: ${{ runner.temp }}\context-capsule-post-unsnap-${{ github.run_id }}
+        run: cargo test --test windows_snap_live -- --ignored --nocapture --test-threads=1
+
+      - name: Upload live validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-restore-unsnap-${{ github.run_id }}
+          path: ${{ runner.temp }}\context-capsule-post-unsnap-${{ github.run_id }}
+          if-no-files-found: warn
+
+      - name: Commit validated fix to branch
+        if: success()
+        shell: pwsh
+        run: |
+          if (git diff --quiet -- src/restore/windows.rs tests/windows_snap_live.rs) {
+            Write-Host 'Validated fix is already committed.'
+            exit 0
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/restore/windows.rs tests/windows_snap_live.rs
+          git commit -m 'fix: preserve snap state after final placement'
+          if ($LASTEXITCODE -ne 0) { throw 'git commit failed' }
+          git push origin HEAD:fix/post-restore-unsnap-20260902
+          if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
