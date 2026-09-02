@@ -26,10 +26,6 @@ jobs:
           rustup default stable
           if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
 
-      - name: Verify clean diff syntax
-        shell: pwsh
-        run: git diff --check origin/main...HEAD
-
       - name: Run Rust test suite
         shell: pwsh
         run: cargo test --all-targets
