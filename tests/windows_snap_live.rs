@@ -396,7 +396,7 @@ fn live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation() {
 
 #[test]
 #[ignore = "interactive Windows shell validation; run only on a desktop self-hosted runner"]
-fn live_restore_portrait_top_bottom_prefers_native_or_falls_back_exactly() {
+fn live_restore_portrait_top_bottom_as_one_native_pair() {
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
