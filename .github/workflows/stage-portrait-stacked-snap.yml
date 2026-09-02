@@ -12,21 +12,25 @@ jobs:
         with:
           ref: fix/portrait-stacked-snap-20260902
           fetch-depth: 0
+      - name: Apply safe one-shot pair wiring
+        shell: pwsh
+        run: python .github/scripts/wire_equal_pair_safe.py
       - name: Apply focused live regression test
         shell: pwsh
         run: python .github/scripts/add_portrait_live_test.py
-      - name: Format focused test only
+      - name: Format only touched Rust files
         shell: pwsh
-        run: rustfmt --edition 2024 tests/windows_snap_live.rs
+        run: |
+          rustfmt --edition 2024 src/windows_snap_coord.rs src/windows_snap_safe.rs tests/windows_snap_live.rs
       - name: Compile focused test target
         shell: pwsh
         run: cargo test --test windows_snap_live --no-run
-      - name: Commit test
+      - name: Commit implementation and test
         shell: pwsh
         run: |
-          git add tests/windows_snap_live.rs
+          git add src/windows_snap_coord.rs src/windows_snap_safe.rs tests/windows_snap_live.rs
           if (git diff --cached --quiet) { exit 0 }
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'test: cover portrait stacked snap restore'
+          git commit -m 'fix: route portrait pair through safe snap coordinator'
           git push origin HEAD:fix/portrait-stacked-snap-20260902
