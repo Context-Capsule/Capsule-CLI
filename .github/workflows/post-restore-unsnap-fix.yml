@@ -6,7 +6,19 @@ on:
       - 'fix/post-restore-unsnap-20260902'
 
 jobs:
-  validate:
+  compile-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/post-restore-unsnap-20260902
+
+      - name: Run Rust test suite
+        shell: pwsh
+        run: cargo test --all-targets
+
+  live-snap:
+    needs: compile-test
     runs-on: [self-hosted, Windows, X64]
     steps:
       - name: Verify POTUS runner
@@ -26,20 +38,8 @@ jobs:
           rustup default stable
           if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
 
-      - name: Run Rust test suite
-        shell: pwsh
-        run: cargo test --all-targets
-
       - name: Run focused post-restore Snap regression
         shell: pwsh
         env:
           SNAP_LIVE_OUT: ${{ runner.temp }}\context-capsule-post-unsnap-${{ github.run_id }}
         run: cargo test --test windows_snap_live live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation -- --ignored --nocapture --test-threads=1
-
-      - name: Upload live validation evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: post-restore-unsnap-${{ github.run_id }}
-          path: ${{ runner.temp }}\context-capsule-post-unsnap-${{ github.run_id }}
-          if-no-files-found: warn
