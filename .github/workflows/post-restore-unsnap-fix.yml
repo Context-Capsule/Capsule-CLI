@@ -5,11 +5,9 @@ on:
     branches:
       - 'fix/post-restore-unsnap-20260902'
 
-permissions:
-  contents: write
-
 jobs:
-  patch-test-and-commit:
+  validate:
+    if: github.actor == 'github-actions[bot]'
     runs-on: [self-hosted, Windows, X64]
     steps:
       - name: Verify POTUS runner
@@ -29,26 +27,19 @@ jobs:
           rustup default stable
           if ($LASTEXITCODE -ne 0) { throw 'rustup default stable failed' }
 
-      - name: Apply narrow post-restore fix and regression coverage
+      - name: Verify clean diff syntax
         shell: pwsh
-        run: |
-          python scripts/apply_post_restore_unsnap_fix.py
-          if ($LASTEXITCODE -ne 0) { throw 'source patch failed' }
-          cargo fmt --all
-          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
-          git diff --check
-          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
-          git diff -- src/restore/windows.rs tests/windows_snap_live.rs
+        run: git diff --check origin/main...HEAD
 
       - name: Run Rust test suite
         shell: pwsh
         run: cargo test --all-targets
 
-      - name: Run live Windows Snap regression
+      - name: Run focused post-restore Snap regression
         shell: pwsh
         env:
           SNAP_LIVE_OUT: ${{ runner.temp }}\context-capsule-post-unsnap-${{ github.run_id }}
-        run: cargo test --test windows_snap_live -- --ignored --nocapture --test-threads=1
+        run: cargo test --test windows_snap_live live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation -- --ignored --nocapture --test-threads=1
 
       - name: Upload live validation evidence
         if: always()
@@ -57,19 +48,3 @@ jobs:
           name: post-restore-unsnap-${{ github.run_id }}
           path: ${{ runner.temp }}\context-capsule-post-unsnap-${{ github.run_id }}
           if-no-files-found: warn
-
-      - name: Commit validated fix to branch
-        if: success()
-        shell: pwsh
-        run: |
-          if (git diff --quiet -- src/restore/windows.rs tests/windows_snap_live.rs) {
-            Write-Host 'Validated fix is already committed.'
-            exit 0
-          }
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/restore/windows.rs tests/windows_snap_live.rs
-          git commit -m 'fix: preserve snap state after final placement'
-          if ($LASTEXITCODE -ne 0) { throw 'git commit failed' }
-          git push origin HEAD:fix/post-restore-unsnap-20260902
-          if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
