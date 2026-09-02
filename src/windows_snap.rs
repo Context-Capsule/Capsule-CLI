@@ -450,6 +450,96 @@ fn wait_until_foreground(hwnd: Hwnd, timeout: Duration) -> bool {
     false
 }
 
+pub(crate) fn restore_equal_pair(
+    first_hwnd: usize,
+    second_hwnd: usize,
+    orientation: SplitOrientation,
+    work_area: [i32; 4],
+) -> Result<(), String> {
+    let first = first_hwnd as Hwnd;
+    let second = second_hwnd as Hwnd;
+    if first.is_null() || second.is_null() || first == second {
+        return Err("stock snap pair has invalid window handles".to_owned());
+    }
+
+    let width = work_area[2].saturating_sub(work_area[0]);
+    let height = work_area[3].saturating_sub(work_area[1]);
+    if width <= 0 || height <= 0 {
+        return Err("stock snap pair has an invalid monitor work area".to_owned());
+    }
+
+    let _foreground_restore = ForegroundRestoreGuard {
+        hwnd: unsafe { GetForegroundWindow() },
+    };
+
+    // A canonical 50/50 pair needs no divider drag. Each member gets exactly
+    // one native Snap attempt, followed by verification. If Windows makes no
+    // progress, return immediately rather than replaying identical input.
+    establish_pair(first, second, orientation)?;
+    thread::sleep(SNAP_SETTLE);
+
+    if equal_pair_matches_work_area(first, second, orientation, work_area, 3) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows created the stock snap pair, but it did not settle into the expected 50/50 work-area halves: {}",
+            pair_mismatch_description(
+                first,
+                second,
+                orientation,
+                match orientation {
+                    SplitOrientation::SideBySide => work_area[0] + width / 2,
+                    SplitOrientation::Stacked => work_area[1] + height / 2,
+                },
+            )
+        ))
+    }
+}
+
+fn equal_pair_matches_work_area(
+    first: Hwnd,
+    second: Hwnd,
+    orientation: SplitOrientation,
+    work_area: [i32; 4],
+    tolerance: i32,
+) -> bool {
+    if is_arranged(first) != Some(true) || is_arranged(second) != Some(true) {
+        return false;
+    }
+    let Some(first_rect) = frame_bounds(first) else {
+        return false;
+    };
+    let Some(second_rect) = frame_bounds(second) else {
+        return false;
+    };
+
+    let close = |left: i32, right: i32| (left - right).abs() <= tolerance;
+    match orientation {
+        SplitOrientation::SideBySide => {
+            let divider = work_area[0] + (work_area[2] - work_area[0]) / 2;
+            close(first_rect.left, work_area[0])
+                && close(first_rect.top, work_area[1])
+                && close(first_rect.right, divider)
+                && close(first_rect.bottom, work_area[3])
+                && close(second_rect.left, divider)
+                && close(second_rect.top, work_area[1])
+                && close(second_rect.right, work_area[2])
+                && close(second_rect.bottom, work_area[3])
+        }
+        SplitOrientation::Stacked => {
+            let divider = work_area[1] + (work_area[3] - work_area[1]) / 2;
+            close(first_rect.left, work_area[0])
+                && close(first_rect.top, work_area[1])
+                && close(first_rect.right, work_area[2])
+                && close(first_rect.bottom, divider)
+                && close(second_rect.left, work_area[0])
+                && close(second_rect.top, divider)
+                && close(second_rect.right, work_area[2])
+                && close(second_rect.bottom, work_area[3])
+        }
+    }
+}
+
 pub(crate) fn restore_resized_pair(
     first_hwnd: usize,
     second_hwnd: usize,

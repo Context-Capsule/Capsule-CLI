@@ -1,0 +1,40 @@
+name: Apply Post Restore Unsnap Fix
+
+on:
+  push:
+    branches:
+      - 'fix/post-restore-unsnap-20260902'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/post-restore-unsnap-20260902
+          fetch-depth: 0
+
+      - name: Apply narrow fix and keep regression diff minimal
+        shell: bash
+        run: |
+          git checkout origin/main -- tests/windows_snap_live.rs
+          python scripts/apply_post_restore_unsnap_fix.py
+          git diff --check
+          git diff -- src/restore/windows.rs tests/windows_snap_live.rs
+
+      - name: Commit patch to validation branch
+        shell: bash
+        run: |
+          if git diff --quiet -- src/restore/windows.rs tests/windows_snap_live.rs; then
+            echo 'Patch already present.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/restore/windows.rs tests/windows_snap_live.rs
+          git commit -m 'test: cover post-restore snap stability without format noise'
+          git push origin HEAD:fix/post-restore-unsnap-20260902

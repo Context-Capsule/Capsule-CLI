@@ -100,8 +100,13 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // Terminal, Zen and the VS Code Dev Host out of the prerequisite
             // desktop pass so generic launching cannot race their richer restore
             // logic or create an extra default terminal tab.
+            // Determine portrait pair membership before filtering semantic-owned
+            // hosts. Otherwise a VS Code top-half + deferred Windows Terminal
+            // bottom-half pair is temporarily broken and VS Code gets snapped by
+            // itself in this prerequisite pass, only to be processed again later.
+            let portrait_geometry = custom_snap::geometry_only_portrait_stacked_pairs(&desktop);
             let prerequisite = desktop_without_semantic_owned_hosts(
-                &desktop,
+                &portrait_geometry,
                 defer_windows_terminal,
                 saved_devhost,
                 zen_semantic_owner,
@@ -127,7 +132,9 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             #[cfg(windows)]
             {
                 let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
-                report.desktop = windows::restore_desktop(&prerequisite, options.dry_run);
+                let prerequisite_placement =
+                    custom_snap::geometry_only_portrait_stacked_pairs(&prerequisite);
+                report.desktop = windows::restore_desktop(&prerequisite_placement, options.dry_run);
                 report.desktop.applications_total = full_application_count;
                 if zen_bootstrap.already_running {
                     report.desktop.applications_already_running += 1;
@@ -248,7 +255,8 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // captured before foreground/focus work already looked correct. The
             // saved geometry and window state are deliberately replayed after all
             // semantic tab/terminal work has finished.
-            let mut final_desktop = windows::restore_desktop_forced(desktop, false);
+            let final_placement = custom_snap::geometry_only_portrait_stacked_pairs(desktop);
+            let mut final_desktop = windows::restore_desktop_forced(&final_placement, false);
             final_desktop.applications_total = full_application_count;
             final_desktop.applications_launched += initial_launched;
             final_desktop.applications_already_running = initial_already_running;
@@ -268,18 +276,21 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // blank so both this pass and custom-Snap attribution use the geometry
             // established by the semantic adapter rather than volatile active-tab
             // titles.
+            let portrait_stock = custom_snap::restore_portrait_stacked_pairs(desktop);
+            final_desktop.warnings.extend(portrait_stock.warnings);
+            final_desktop.failures.extend(portrait_stock.failures);
+
             let custom = custom_snap::restore(desktop);
             final_desktop.warnings.extend(custom.warnings);
             final_desktop.failures.extend(custom.failures);
 
-// Native Snap reconstruction and foreground acquisition can alter
-// stacking after the generic Windows pass has already reconciled it.
-// Make Z-order the final authoritative operation, using a fresh live
-// inventory and no geometry/state changes.
-let final_order = windows::restore_order_and_foreground_only(desktop);
-final_desktop.warnings.extend(final_order.warnings);
-final_desktop.failures.extend(final_order.failures);
-
+            // Native Snap reconstruction and foreground acquisition can alter
+            // stacking after the generic Windows pass has already reconciled it.
+            // Make Z-order the final authoritative operation, using a fresh live
+            // inventory and no geometry/state changes.
+            let final_order = windows::restore_order_and_foreground_only(desktop);
+            final_desktop.warnings.extend(final_order.warnings);
+            final_desktop.failures.extend(final_order.failures);
 
             report.desktop = final_desktop;
         }
@@ -650,6 +661,92 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn portrait_pair_geometry_is_decided_before_terminal_is_deferred() {
+        let mut code = application(
+            "Visual Studio Code",
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+        );
+        let mut terminal = application(
+            "Windows Terminal",
+            Some(r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"),
+        );
+
+        let mut top = physical_test_window("workspace - Visual Studio Code");
+        top.state = "snapped:top-half".to_owned();
+        top.display_device = "DISPLAY1".to_owned();
+        top.display_relation = "primary".to_owned();
+        top.bounds = SavedRect {
+            left: 0,
+            top: 0,
+            right: 1080,
+            bottom: 960,
+        };
+        top.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 0.5,
+        });
+
+        let mut bottom = physical_test_window("Terminal");
+        bottom.state = "snapped:bottom-half".to_owned();
+        bottom.display_device = "DISPLAY1".to_owned();
+        bottom.display_relation = "primary".to_owned();
+        bottom.bounds = SavedRect {
+            left: 0,
+            top: 960,
+            right: 1080,
+            bottom: 1920,
+        };
+        bottom.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.0,
+            y: 0.5,
+            width: 1.0,
+            height: 0.5,
+        });
+        code.windows = vec![top];
+        terminal.windows = vec![bottom];
+
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: vec![SavedDisplay {
+                device_name: "DISPLAY1".to_owned(),
+                bounds: SavedRect {
+                    left: 0,
+                    top: 0,
+                    right: 1080,
+                    bottom: 1920,
+                },
+                work_area: SavedRect {
+                    left: 0,
+                    top: 0,
+                    right: 1080,
+                    bottom: 1920,
+                },
+                is_primary: true,
+                scale_percent: 100,
+                orientation: "portrait".to_owned(),
+                relation_to_primary: "primary".to_owned(),
+            }],
+            applications: vec![code, terminal],
+        };
+
+        let portrait_geometry = custom_snap::geometry_only_portrait_stacked_pairs(&desktop);
+        let prerequisite =
+            desktop_without_semantic_owned_hosts(&portrait_geometry, true, false, false);
+
+        assert_eq!(prerequisite.applications.len(), 1);
+        assert_eq!(prerequisite.applications[0].name, "Visual Studio Code");
+        assert_eq!(prerequisite.applications[0].windows[0].state, "normal");
+        assert_eq!(desktop.applications[0].windows[0].state, "snapped:top-half");
+        assert_eq!(
+            desktop.applications[1].windows[0].state,
+            "snapped:bottom-half"
+        );
+    }
+
     #[test]
     fn windows_terminal_is_deferred_only_when_a_safe_terminal_plan_exists() {
         assert!(should_defer_windows_terminal(&json!({
@@ -668,19 +765,41 @@ mod tests {
             applications: vec![
                 application(
                     "Windows Terminal",
-                    Some(r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"),
+                    Some(
+                        r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe",
+                    ),
                 ),
                 application("Notepad", Some(r"C:\Windows\System32\notepad.exe")),
             ],
         };
 
         let prerequisite = desktop_without_semantic_owned_hosts(&desktop, true, false, false);
-        assert!(!prerequisite.applications.iter().any(is_windows_terminal_application));
-        assert!(prerequisite.applications.iter().any(|app| app.name == "Notepad"));
+        assert!(
+            !prerequisite
+                .applications
+                .iter()
+                .any(is_windows_terminal_application)
+        );
+        assert!(
+            prerequisite
+                .applications
+                .iter()
+                .any(|app| app.name == "Notepad")
+        );
 
         let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
-        assert!(final_placement.applications.iter().any(is_windows_terminal_application));
-        assert!(final_placement.applications.iter().any(|app| app.name == "Notepad"));
+        assert!(
+            final_placement
+                .applications
+                .iter()
+                .any(is_windows_terminal_application)
+        );
+        assert!(
+            final_placement
+                .applications
+                .iter()
+                .any(|app| app.name == "Notepad")
+        );
     }
 
     #[test]
