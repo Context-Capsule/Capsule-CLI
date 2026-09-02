@@ -41,6 +41,12 @@ jobs:
         shell: pwsh
         run: cargo test --all-targets -- --skip git_context::tests::live_terminal_value_contributes_repo_omitted_from_durable_terminal_snapshot
 
+      - name: Run focused Snap stability check on hosted Windows
+        shell: pwsh
+        env:
+          SNAP_LIVE_OUT: ${{ runner.temp }}\context-capsule-hosted-post-unsnap-${{ github.run_id }}
+        run: cargo test --test windows_snap_live live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation -- --ignored --nocapture --test-threads=1
+
   live-snap:
     needs: [cancel-stale-validation, compile-test]
     runs-on: [self-hosted, Windows, X64]
