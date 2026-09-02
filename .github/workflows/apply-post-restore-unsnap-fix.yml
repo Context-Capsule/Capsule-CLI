@@ -17,11 +17,10 @@ jobs:
         with:
           ref: fix/post-restore-unsnap-20260902
 
-      - name: Apply narrow fix and regression scenario
+      - name: Apply narrow fix and focused regression
         shell: bash
         run: |
           python scripts/apply_post_restore_unsnap_fix.py
-          cargo fmt --all
           git diff --check
           git diff -- src/restore/windows.rs tests/windows_snap_live.rs
 
@@ -35,5 +34,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/restore/windows.rs tests/windows_snap_live.rs
-          git commit -m 'fix: preserve snap state after final placement'
+          git commit -m 'fix: stop final placement from disturbing snap state'
           git push origin HEAD:fix/post-restore-unsnap-20260902
