@@ -186,7 +186,7 @@ unsafe extern "system" fn collect_monitor(
 }
 
 fn portrait_display() -> Option<DisplayInfo> {
-    let mut displays = Vec::new();
+    let mut displays: Vec<DisplayInfo> = Vec::new();
     let ok = unsafe {
         EnumDisplayMonitors(
             ptr::null_mut(),
