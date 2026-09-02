@@ -400,6 +400,110 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
     windows_snap_legacy::snap(hwnd, direction)
 }
 
+fn snap_once(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String> {
+    let _attachment = InputQueueAttachment::for_windows(&[hwnd as usize])?;
+    activate_target(hwnd)?;
+    windows_snap_legacy::snap_once(hwnd, direction)
+}
+
+fn equal_pair_member_matches_work_area(
+    hwnd: Hwnd,
+    orientation: SplitOrientation,
+    first: bool,
+    work_area: [i32; 4],
+    tolerance: i32,
+) -> bool {
+    if is_arranged(hwnd) != Some(true) {
+        return false;
+    }
+    let Some(rect) = frame_bounds(hwnd) else {
+        return false;
+    };
+    let close = |actual: i32, expected: i32| (actual - expected).abs() <= tolerance;
+    match (orientation, first) {
+        (SplitOrientation::SideBySide, true) => {
+            let divider = work_area[0] + (work_area[2] - work_area[0]) / 2;
+            close(rect.left, work_area[0])
+                && close(rect.top, work_area[1])
+                && close(rect.right, divider)
+                && close(rect.bottom, work_area[3])
+        }
+        (SplitOrientation::SideBySide, false) => {
+            let divider = work_area[0] + (work_area[2] - work_area[0]) / 2;
+            close(rect.left, divider)
+                && close(rect.top, work_area[1])
+                && close(rect.right, work_area[2])
+                && close(rect.bottom, work_area[3])
+        }
+        (SplitOrientation::Stacked, true) => {
+            let divider = work_area[1] + (work_area[3] - work_area[1]) / 2;
+            close(rect.left, work_area[0])
+                && close(rect.top, work_area[1])
+                && close(rect.right, work_area[2])
+                && close(rect.bottom, divider)
+        }
+        (SplitOrientation::Stacked, false) => {
+            let divider = work_area[1] + (work_area[3] - work_area[1]) / 2;
+            close(rect.left, work_area[0])
+                && close(rect.top, divider)
+                && close(rect.right, work_area[2])
+                && close(rect.bottom, work_area[3])
+        }
+    }
+}
+
+fn establish_pair_once(
+    first: Hwnd,
+    second: Hwnd,
+    orientation: SplitOrientation,
+    work_area: [i32; 4],
+) -> Result<(), String> {
+    let (first_direction, second_direction) = match orientation {
+        SplitOrientation::SideBySide => (SnapDirection::LeftHalf, SnapDirection::RightHalf),
+        SplitOrientation::Stacked => (SnapDirection::TopHalf, SnapDirection::BottomHalf),
+    };
+
+    if !snap_once(first, first_direction)? {
+        return Err(
+            "Windows did not arrange the first window while creating the one-shot stock snap pair"
+                .to_owned(),
+        );
+    }
+
+    // IsWindowArranged alone is insufficient: on a tall portrait display the
+    // shell may choose a top third. If that happened, stop immediately. Sending
+    // the second shortcut cannot turn the first window into the saved half and
+    // only creates more visible churn.
+    if !equal_pair_member_matches_work_area(first, orientation, true, work_area, 3) {
+        let observed = frame_bounds(first)
+            .map(|rect| {
+                format!(
+                    "[{}, {}, {}, {}]",
+                    rect.left, rect.top, rect.right, rect.bottom
+                )
+            })
+            .unwrap_or_else(|| "unavailable".to_owned());
+        return Err(format!(
+            "the first native Snap shortcut entered an arranged zone {observed}, but not the saved 50/50 half; the second shortcut was intentionally not attempted"
+        ));
+    }
+
+    if !snap_once(second, second_direction)? {
+        return Err(
+            "Windows did not arrange the second window while creating the one-shot stock snap pair"
+                .to_owned(),
+        );
+    }
+    thread::sleep(SNAP_SETTLE);
+
+    if !equal_pair_member_matches_work_area(second, orientation, false, work_area, 3) {
+        return Err(
+            "the second native Snap shortcut did not land in the saved 50/50 half".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn establish_pair(first: Hwnd, second: Hwnd, orientation: SplitOrientation) -> Result<(), String> {
     let (first_direction, second_direction) = match orientation {
         SplitOrientation::SideBySide => (SnapDirection::LeftHalf, SnapDirection::RightHalf),
@@ -449,7 +553,7 @@ pub(crate) fn restore_equal_pair(
     // Exactly one TopHalf + one BottomHalf (or LeftHalf + RightHalf) attempt.
     // There is deliberately no divider drag and no retry loop here: if the two
     // verified native shortcuts do not settle, return the failure immediately.
-    establish_pair(first, second, orientation)?;
+    establish_pair_once(first, second, orientation, work_area)?;
 
     if equal_pair_matches_work_area(first, second, orientation, work_area, 3) {
         Ok(())

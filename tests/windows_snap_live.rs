@@ -396,7 +396,7 @@ fn live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation() {
 
 #[test]
 #[ignore = "interactive Windows shell validation; run only on a desktop self-hosted runner"]
-fn live_restore_portrait_top_bottom_as_one_native_pair() {
+fn live_restore_portrait_top_bottom_prefers_native_or_falls_back_exactly() {
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -463,15 +463,11 @@ fn live_restore_portrait_top_bottom_as_one_native_pair() {
     thread::sleep(Duration::from_millis(1200));
     let top = frame_bounds(host.windows[0].hwnd()).expect("final top DWM bounds");
     let bottom = frame_bounds(host.windows[1].hwnd()).expect("final bottom DWM bounds");
-    assert_ne!(
-        unsafe { IsWindowArranged(host.windows[0].hwnd()) },
-        0,
-        "portrait top window is only floating at the target rectangle"
-    );
-    assert_ne!(
-        unsafe { IsWindowArranged(host.windows[1].hwnd()) },
-        0,
-        "portrait bottom window is only floating at the target rectangle"
+    let top_arranged = unsafe { IsWindowArranged(host.windows[0].hwnd()) } != 0;
+    let bottom_arranged = unsafe { IsWindowArranged(host.windows[1].hwnd()) } != 0;
+    assert_eq!(
+        top_arranged, bottom_arranged,
+        "portrait pair ended in a mixed native/floating state instead of one coherent layout"
     );
     assert!(
         rect_close_px(top.into(), top_target, 3),
@@ -490,6 +486,19 @@ fn live_restore_portrait_top_bottom_as_one_native_pair() {
         "portrait windows overlap instead of halving the monitor: top={top:?}, bottom={bottom:?}"
     );
 
+    fs::write(
+        out_dir.join("portrait-stacked-state.txt"),
+        format!(
+            "top_arranged={top_arranged}\nbottom_arranged={bottom_arranged}\ntop={top:?}\nbottom={bottom:?}\ntop_target={top_target:?}\nbottom_target={bottom_target:?}\nfallback_warning={}\n",
+            report
+                .desktop
+                .warnings
+                .iter()
+                .chain(report.warnings.iter())
+                .any(|warning| warning.contains("exact floating geometry instead"))
+        ),
+    )
+    .expect("write portrait settled state");
     screenshot(&out_dir, "portrait-stacked-after-1200ms.png");
 }
 

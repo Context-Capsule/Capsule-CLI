@@ -99,9 +99,22 @@ pub(crate) fn with_target_work_area<T>(work_area: [i32; 4], action: impl FnOnce(
 /// floating on the intended monitor rather than allowing a bad transition to
 /// cascade into the remaining Snap reconstruction.
 pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String> {
+    snap_with_attempts(hwnd, direction, SNAP_ATTEMPTS)
+}
+
+pub(crate) fn snap_once(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String> {
+    snap_with_attempts(hwnd, direction, 1)
+}
+
+fn snap_with_attempts(
+    hwnd: Hwnd,
+    direction: SnapDirection,
+    attempts: usize,
+) -> Result<bool, String> {
+    debug_assert!(attempts > 0);
     let mut failures = Vec::new();
 
-    for attempt in 1..=SNAP_ATTEMPTS {
+    for attempt in 1..=attempts {
         let expected_work = prepare_floating_baseline(hwnd)?;
         let arranged = windows_snap_core::snap(hwnd, direction)?;
         let actual_work = monitor_work_area(hwnd);
@@ -124,13 +137,16 @@ pub(crate) fn snap(hwnd: Hwnd, direction: SnapDirection) -> Result<bool, String>
             "attempt {attempt}: arranged={arranged}, {monitor_detail}"
         ));
 
-        // Contain the failure immediately. This returns the HWND to a verified
-        // unarranged position on the intended monitor before any retry or error.
-        prepare_floating_baseline(hwnd)?;
+        // Only establish another baseline if another attempt will actually run.
+        // The portrait-pair caller uses one attempt, so an unchanged failure is
+        // never visibly replayed.
+        if attempt < attempts {
+            prepare_floating_baseline(hwnd)?;
+        }
     }
 
     Err(format!(
-        "native snap could not produce the requested arranged state on the intended monitor after {SNAP_ATTEMPTS} verified attempt(s): {}",
+        "native snap could not produce the requested arranged state on the intended monitor after {attempts} verified attempt(s): {}",
         failures.join(" | ")
     ))
 }

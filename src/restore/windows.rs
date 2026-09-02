@@ -1047,6 +1047,35 @@ fn stage_window_rect(hwnd: Hwnd, target: SavedRect) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn force_floating_geometry(
+    hwnd_value: usize,
+    target: SavedRect,
+) -> Result<SavedRect, String> {
+    let hwnd = hwnd_value as Hwnd;
+    if hwnd.is_null() {
+        return Err("window handle is unavailable for floating fallback".to_owned());
+    }
+
+    // A wrong native Snap zone must be explicitly cleared before SetWindowPos;
+    // otherwise Windows can retain arranged membership even when the rectangle
+    // looks close to the requested fallback geometry.
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+    thread::sleep(Duration::from_millis(40));
+    stage_window_rect(hwnd, target)?;
+    thread::sleep(Duration::from_millis(PLACEMENT_SETTLE_BASE_MS));
+
+    let observed = observe_window(hwnd)
+        .ok_or_else(|| "window became unavailable while verifying floating fallback".to_owned())?;
+    if windows_snap::is_arranged(hwnd) == Some(true) {
+        return Err(
+            "Windows kept the window in arranged state after SW_RESTORE fallback".to_owned(),
+        );
+    }
+    Ok(observed.bounds)
+}
+
 fn apply_window_state(
     current: &CurrentWindow,
     saved: &SavedWindow,

@@ -100,8 +100,13 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // Terminal, Zen and the VS Code Dev Host out of the prerequisite
             // desktop pass so generic launching cannot race their richer restore
             // logic or create an extra default terminal tab.
+            // Determine portrait pair membership before filtering semantic-owned
+            // hosts. Otherwise a VS Code top-half + deferred Windows Terminal
+            // bottom-half pair is temporarily broken and VS Code gets snapped by
+            // itself in this prerequisite pass, only to be processed again later.
+            let portrait_geometry = custom_snap::geometry_only_portrait_stacked_pairs(&desktop);
             let prerequisite = desktop_without_semantic_owned_hosts(
-                &desktop,
+                &portrait_geometry,
                 defer_windows_terminal,
                 saved_devhost,
                 zen_semantic_owner,
@@ -653,6 +658,92 @@ mod tests {
                 .map(|window| window.title.clone())
                 .collect::<Vec<_>>(),
             original_zen_titles
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portrait_pair_geometry_is_decided_before_terminal_is_deferred() {
+        let mut code = application(
+            "Visual Studio Code",
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+        );
+        let mut terminal = application(
+            "Windows Terminal",
+            Some(r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"),
+        );
+
+        let mut top = physical_test_window("workspace - Visual Studio Code");
+        top.state = "snapped:top-half".to_owned();
+        top.display_device = "DISPLAY1".to_owned();
+        top.display_relation = "primary".to_owned();
+        top.bounds = SavedRect {
+            left: 0,
+            top: 0,
+            right: 1080,
+            bottom: 960,
+        };
+        top.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 0.5,
+        });
+
+        let mut bottom = physical_test_window("Terminal");
+        bottom.state = "snapped:bottom-half".to_owned();
+        bottom.display_device = "DISPLAY1".to_owned();
+        bottom.display_relation = "primary".to_owned();
+        bottom.bounds = SavedRect {
+            left: 0,
+            top: 960,
+            right: 1080,
+            bottom: 1920,
+        };
+        bottom.normalized_bounds = Some(SavedNormalizedRect {
+            x: 0.0,
+            y: 0.5,
+            width: 1.0,
+            height: 0.5,
+        });
+        code.windows = vec![top];
+        terminal.windows = vec![bottom];
+
+        let desktop = SavedDesktop {
+            status: "available".to_owned(),
+            displays: vec![SavedDisplay {
+                device_name: "DISPLAY1".to_owned(),
+                bounds: SavedRect {
+                    left: 0,
+                    top: 0,
+                    right: 1080,
+                    bottom: 1920,
+                },
+                work_area: SavedRect {
+                    left: 0,
+                    top: 0,
+                    right: 1080,
+                    bottom: 1920,
+                },
+                is_primary: true,
+                scale_percent: 100,
+                orientation: "portrait".to_owned(),
+                relation_to_primary: "primary".to_owned(),
+            }],
+            applications: vec![code, terminal],
+        };
+
+        let portrait_geometry = custom_snap::geometry_only_portrait_stacked_pairs(&desktop);
+        let prerequisite =
+            desktop_without_semantic_owned_hosts(&portrait_geometry, true, false, false);
+
+        assert_eq!(prerequisite.applications.len(), 1);
+        assert_eq!(prerequisite.applications[0].name, "Visual Studio Code");
+        assert_eq!(prerequisite.applications[0].windows[0].state, "normal");
+        assert_eq!(desktop.applications[0].windows[0].state, "snapped:top-half");
+        assert_eq!(
+            desktop.applications[1].windows[0].state,
+            "snapped:bottom-half"
         );
     }
 

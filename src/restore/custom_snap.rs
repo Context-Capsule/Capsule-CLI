@@ -22,6 +22,7 @@ const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
 const LAYOUT_TOLERANCE: f64 = 0.035;
+const PORTRAIT_PAIR_TOLERANCE: i64 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -321,31 +322,109 @@ pub(super) fn restore_portrait_stacked_pairs(desktop: &SavedDesktop) -> CustomSn
             continue;
         }
 
-        let top_target = normalized_target(work, top_saved.normalized);
-        let bottom_target = normalized_target(work, bottom_saved.normalized);
-        let already_correct = top_target
-            .is_some_and(|target| rect_distance(target, top.bounds) <= 12)
-            && bottom_target.is_some_and(|target| rect_distance(target, bottom.bounds) <= 12)
-            && windows_snap::is_arranged(top.hwnd as Hwnd) == Some(true)
-            && windows_snap::is_arranged(bottom.hwnd as Hwnd) == Some(true);
-        if already_correct {
+        let Some(top_target) = normalized_target(work, top_saved.normalized) else {
+            report.failures.push(format!(
+                "portrait stock snap restore could not calculate the saved top-half target for '{}'",
+                top_window.title
+            ));
+            continue;
+        };
+        let Some(bottom_target) = normalized_target(work, bottom_saved.normalized) else {
+            report.failures.push(format!(
+                "portrait stock snap restore could not calculate the saved bottom-half target for '{}'",
+                bottom_window.title
+            ));
+            continue;
+        };
+
+        if portrait_pair_is_exact_native(top.hwnd, bottom.hwnd, top_target, bottom_target) {
             continue;
         }
 
-        if let Err(error) = windows_snap::restore_equal_pair(
+        let native_result = windows_snap::restore_equal_pair(
             top.hwnd,
             bottom.hwnd,
             SplitOrientation::Stacked,
             [work.left, work.top, work.right, work.bottom],
+        );
+        if portrait_pair_is_exact_native(top.hwnd, bottom.hwnd, top_target, bottom_target) {
+            continue;
+        }
+
+        let native_detail = native_result
+            .err()
+            .unwrap_or_else(|| "Windows reported native Snap success, but the settled pair did not match the saved 50/50 halves".to_owned());
+
+        match fallback_portrait_pair_to_geometry(
+            top.hwnd,
+            bottom.hwnd,
+            top_target,
+            bottom_target,
         ) {
-            report.failures.push(format!(
-                "portrait stock snap restore failed for '{}' + '{}': {error}",
+            Ok(()) => report.warnings.push(format!(
+                "portrait native Snap was not exact for '{}' + '{}' ({native_detail}); retained the saved top/bottom halves as exact floating geometry instead",
                 top_window.title, bottom_window.title
-            ));
+            )),
+            Err(fallback_error) => report.failures.push(format!(
+                "portrait restore failed for '{}' + '{}': native attempt: {native_detail}; floating fallback: {fallback_error}",
+                top_window.title, bottom_window.title
+            )),
         }
     }
 
     report
+}
+
+fn portrait_pair_is_exact_native(
+    top_hwnd: usize,
+    bottom_hwnd: usize,
+    top_target: SavedRect,
+    bottom_target: SavedRect,
+) -> bool {
+    windows_snap::is_arranged(top_hwnd as Hwnd) == Some(true)
+        && windows_snap::is_arranged(bottom_hwnd as Hwnd) == Some(true)
+        && window_bounds(top_hwnd as Hwnd)
+            .is_some_and(|bounds| rect_distance(bounds, top_target) <= PORTRAIT_PAIR_TOLERANCE)
+        && window_bounds(bottom_hwnd as Hwnd)
+            .is_some_and(|bounds| rect_distance(bounds, bottom_target) <= PORTRAIT_PAIR_TOLERANCE)
+}
+
+fn fallback_portrait_pair_to_geometry(
+    top_hwnd: usize,
+    bottom_hwnd: usize,
+    top_target: SavedRect,
+    bottom_target: SavedRect,
+) -> Result<(), String> {
+    let top_observed = super::windows::force_floating_geometry(top_hwnd, top_target)?;
+    let bottom_observed = super::windows::force_floating_geometry(bottom_hwnd, bottom_target)?;
+
+    if rect_distance(top_observed, top_target) > PORTRAIT_PAIR_TOLERANCE {
+        return Err(format!(
+            "top floating fallback missed the saved half: observed left={} top={} right={} bottom={}, target left={} top={} right={} bottom={}",
+            top_observed.left,
+            top_observed.top,
+            top_observed.right,
+            top_observed.bottom,
+            top_target.left,
+            top_target.top,
+            top_target.right,
+            top_target.bottom,
+        ));
+    }
+    if rect_distance(bottom_observed, bottom_target) > PORTRAIT_PAIR_TOLERANCE {
+        return Err(format!(
+            "bottom floating fallback missed the saved half: observed left={} top={} right={} bottom={}, target left={} top={} right={} bottom={}",
+            bottom_observed.left,
+            bottom_observed.top,
+            bottom_observed.right,
+            bottom_observed.bottom,
+            bottom_target.left,
+            bottom_target.top,
+            bottom_target.right,
+            bottom_target.bottom,
+        ));
+    }
+    Ok(())
 }
 
 fn portrait_stacked_pair_indices(desktop: &SavedDesktop) -> Vec<SavedStockPairIndex> {
