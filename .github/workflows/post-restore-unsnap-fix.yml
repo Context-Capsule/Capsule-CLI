@@ -7,7 +7,6 @@ on:
 
 jobs:
   validate:
-    if: github.actor == 'github-actions[bot]'
     runs-on: [self-hosted, Windows, X64]
     steps:
       - name: Verify POTUS runner
