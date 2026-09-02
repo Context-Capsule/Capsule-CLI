@@ -1,0 +1,23 @@
+name: Stage Portrait Stacked Snap
+on:
+  push:
+    branches: [fix/portrait-stacked-snap-20260902]
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/portrait-stacked-snap-20260902
+          fetch-depth: 0
+      - run: python .github/scripts/apply_portrait_stacked_snap_fix.py
+      - run: cargo fmt --all && git diff --check
+      - run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/windows_snap.rs src/restore/custom_snap.rs src/restore/mod.rs
+          git commit -m "fix: restore portrait stacked snap as one pair"
+          git push origin HEAD:fix/portrait-stacked-snap-20260902
