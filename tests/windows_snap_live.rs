@@ -327,7 +327,7 @@ fn live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation() {
         right: (display.work.left + 880).min(display.work.right - 80),
         bottom: (display.work.top + 680).min(display.work.bottom - 80),
     };
-    let top_half = snap_rect(SnapSlot::TopHalf, display.work);
+    let top_half = snap_rect(display.work, SnapSlot::TopHalf);
     let specs = vec![
         SlotSpec {
             title: "Foreground Floating Window".to_owned(),
