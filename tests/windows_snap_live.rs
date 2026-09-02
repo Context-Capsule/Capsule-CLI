@@ -312,6 +312,79 @@ struct DisplayInfo {
 
 #[test]
 #[ignore = "interactive Windows shell validation; run only on a desktop self-hosted runner"]
+fn live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation() {
+    unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let out_dir = std::env::var_os("SNAP_LIVE_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("context-capsule-post-restore-unsnap"));
+    fs::create_dir_all(&out_dir).expect("create focused live output directory");
+
+    let host = WindowHost::start(2);
+    let display = display_for(host.windows[0].hwnd()).expect("monitor info");
+    let executable = std::env::current_exe().expect("current test executable");
+    let normal = SavedRect {
+        left: display.work.left + 80,
+        top: display.work.top + 80,
+        right: (display.work.left + 880).min(display.work.right - 80),
+        bottom: (display.work.top + 680).min(display.work.bottom - 80),
+    };
+    let top_half = snap_rect(SnapSlot::TopHalf, display.work);
+    let specs = vec![
+        SlotSpec {
+            title: "Foreground Floating Window".to_owned(),
+            state: "normal".to_owned(),
+            target: normal,
+            normalized: [
+                (normal.left - display.work.left) as f64 / display.work.width() as f64,
+                (normal.top - display.work.top) as f64 / display.work.height() as f64,
+                normal.width() as f64 / display.work.width() as f64,
+                normal.height() as f64 / display.work.height() as f64,
+            ],
+        },
+        stock_spec(
+            "Background Top Half",
+            "snapped:top-half",
+            SnapSlot::TopHalf,
+            display.work,
+        ),
+    ];
+    let titles = specs.iter().map(|spec| spec.title.clone()).collect::<Vec<_>>();
+    host.prepare(&titles);
+    stage_frame(host.windows[0].hwnd(), near_target(normal, display.work))
+        .expect("stage foreground floating window");
+    stage_frame(host.windows[1].hwnd(), near_target(top_half, display.work))
+        .expect("stage top-half window near target");
+    assert_eq!(unsafe { IsWindowArranged(host.windows[1].hwnd()) }, 0);
+
+    screenshot(&out_dir, "post-restore-unsnap-before.png");
+    let snapshot = snapshot_for(&display, &executable, &specs);
+    let report = restore_snapshot(&snapshot, RestoreOptions { dry_run: false });
+    fs::write(
+        out_dir.join("post-restore-unsnap-report.txt"),
+        format!("{report:#?}"),
+    )
+    .expect("write focused restore report");
+    assert!(report.success(), "focused restore failed: {report:#?}");
+
+    // The reported bug happened after the window initially looked correct.
+    thread::sleep(Duration::from_millis(1200));
+    let observed = frame_bounds(host.windows[1].hwnd()).expect("final top-half DWM bounds");
+    assert_ne!(
+        unsafe { IsWindowArranged(host.windows[1].hwnd()) },
+        0,
+        "top-half window was unsnapped after final foreground/Z-order handling"
+    );
+    assert!(
+        rect_close_px(observed.into(), top_half, 3),
+        "top-half geometry drifted after final foreground/Z-order handling: observed={observed:?}, target={top_half:?}"
+    );
+    screenshot(&out_dir, "post-restore-unsnap-after-1200ms.png");
+}
+
+#[test]
+#[ignore = "interactive Windows shell validation; run only on a desktop self-hosted runner"]
 fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -343,21 +416,6 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
             "Live Left Half",
             "snapped:left-half",
             SnapSlot::LeftHalf,
-            display.work,
-        )],
-        &mut log,
-    );
-
-    run_stock_scenario(
-        &host,
-        &display,
-        &executable,
-        &out_dir,
-        "07-top-half-foreground-stability",
-        vec![stock_spec(
-            "Live Top Half Foreground",
-            "snapped:top-half",
-            SnapSlot::TopHalf,
             display.work,
         )],
         &mut log,

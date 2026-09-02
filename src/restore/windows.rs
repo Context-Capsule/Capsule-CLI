@@ -563,13 +563,12 @@ fn restore_desktop_with_policy(
         }
     }
 
-    if !dry_run && !matched_for_order.is_empty() {
+    if !dry_run && !force_layout && !matched_for_order.is_empty() {
         reconcile_order_and_foreground(
             &matched_for_order,
             &inventory.displays,
             &mut report.warnings,
             &mut report.failures,
-            !force_layout,
         );
     }
 
@@ -1239,7 +1238,6 @@ fn reconcile_order_and_foreground(
     displays: &[TargetDisplay],
     warnings: &mut Vec<String>,
     failures: &mut Vec<String>,
-    repair_layout_after_order: bool,
 ) {
     let mut desired = matches.to_vec();
     desired.sort_by_key(|(saved, _)| saved.z_order);
@@ -1276,14 +1274,6 @@ fn reconcile_order_and_foreground(
                     .to_owned(),
             );
         }
-    }
-
-    // The forced final placement pass has already proved native Snap/maximize state.
-    // Re-running placement here can destroy a valid Snap group while shell Z-order
-    // state is still settling. The top-level restore performs a later fresh,
-    // geometry-free order/foreground pass, so do not touch layout again here.
-    if !repair_layout_after_order {
-        return;
     }
 
     for (saved, current) in &desired {
