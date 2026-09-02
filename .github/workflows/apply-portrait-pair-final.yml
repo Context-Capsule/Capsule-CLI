@@ -1,0 +1,48 @@
+name: Apply Portrait Pair Final Fix
+
+on:
+  push:
+    branches:
+      - fix/portrait-stacked-snap-20260902
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-portrait-pair-final-fix
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/portrait-stacked-snap-20260902
+          fetch-depth: 0
+      - name: Apply final portrait restore design
+        shell: pwsh
+        run: python .github/scripts/finalize_portrait_pair_restore.py
+      - name: Format only touched Rust files
+        shell: pwsh
+        run: |
+          rustfmt --edition 2024 src/windows_snap_baseline.rs src/windows_snap_coord.rs src/restore/windows.rs src/restore/custom_snap.rs src/restore/mod.rs tests/windows_snap_live.rs
+      - name: Compile focused live test
+        shell: pwsh
+        run: cargo test --test windows_snap_live --no-run
+      - name: Run Windows regression suite before committing
+        shell: pwsh
+        run: cargo test --all-targets -- --skip git_context::tests::live_terminal_value_contributes_repo_omitted_from_durable_terminal_snapshot
+      - name: Commit validated implementation
+        shell: pwsh
+        run: |
+          git add src/windows_snap_baseline.rs src/windows_snap_coord.rs src/restore/windows.rs src/restore/custom_snap.rs src/restore/mod.rs tests/windows_snap_live.rs
+          if (git diff --cached --quiet) {
+            Write-Host 'Source already contains the final patch.'
+            exit 0
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: make portrait pair restore one-shot with exact fallback'
+          git push origin HEAD:fix/portrait-stacked-snap-20260902
