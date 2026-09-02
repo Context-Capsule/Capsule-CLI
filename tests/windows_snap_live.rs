@@ -1,8 +1,6 @@
 #![cfg(windows)]
 
-use context_capsule::restore::{
-    RestoreOptions, SavedRect, SnapSlot, restore_snapshot, snap_rect,
-};
+use context_capsule::restore::{RestoreOptions, SavedRect, SnapSlot, restore_snapshot, snap_rect};
 use serde_json::{Value, json};
 use std::{
     ffi::c_void,
@@ -22,6 +20,8 @@ type Hmonitor = *mut c_void;
 type Bool = i32;
 type Hresult = i32;
 type WndProc = Option<unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize>;
+type MonitorEnumProc =
+    Option<unsafe extern "system" fn(Hmonitor, Handle, *mut Rect, isize) -> Bool>;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 const WS_VISIBLE: u32 = 0x1000_0000;
@@ -138,6 +138,12 @@ unsafe extern "system" {
     fn GetMonitorInfoW(monitor: Hmonitor, info: *mut MonitorInfoExW) -> Bool;
     fn SetThreadDpiAwarenessContext(context: isize) -> isize;
     fn IsWindowArranged(hwnd: Hwnd) -> Bool;
+    fn EnumDisplayMonitors(
+        hdc: Handle,
+        clip: *const Rect,
+        callback: MonitorEnumProc,
+        data: isize,
+    ) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -208,7 +214,10 @@ impl WindowHost {
             let atom = unsafe { RegisterClassW(&class) };
             if atom == 0 {
                 let error = unsafe { GetLastError() };
-                assert_eq!(error, 1410, "RegisterClassW failed with Win32 error {error}");
+                assert_eq!(
+                    error, 1410,
+                    "RegisterClassW failed with Win32 error {error}"
+                );
             }
 
             let mut windows = Vec::new();
@@ -231,7 +240,9 @@ impl WindowHost {
                     )
                 };
                 assert!(!hwnd.is_null(), "CreateWindowExW failed at index {index}");
-                windows.push(LiveWindow { hwnd: hwnd as usize });
+                windows.push(LiveWindow {
+                    hwnd: hwnd as usize,
+                });
             }
             let thread_id = unsafe { GetCurrentThreadId() };
             sender.send((thread_id, windows)).expect("send live HWNDs");
@@ -347,7 +358,10 @@ fn live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation() {
             display.work,
         ),
     ];
-    let titles = specs.iter().map(|spec| spec.title.clone()).collect::<Vec<_>>();
+    let titles = specs
+        .iter()
+        .map(|spec| spec.title.clone())
+        .collect::<Vec<_>>();
     host.prepare(&titles);
     stage_frame(host.windows[0].hwnd(), near_target(normal, display.work))
         .expect("stage foreground floating window");
@@ -382,6 +396,105 @@ fn live_forced_final_pass_does_not_unsnap_after_foreground_reconciliation() {
 
 #[test]
 #[ignore = "interactive Windows shell validation; run only on a desktop self-hosted runner"]
+fn live_restore_portrait_top_bottom_as_one_native_pair() {
+    unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let out_dir = std::env::var_os("SNAP_LIVE_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("context-capsule-portrait-stacked"));
+    fs::create_dir_all(&out_dir).expect("create portrait live output directory");
+
+    let display = portrait_display().expect("this regression requires a real portrait monitor");
+    let host = WindowHost::start(2);
+    let executable = std::env::current_exe().expect("current test executable");
+    let top_target = snap_rect(display.work, SnapSlot::TopHalf);
+    let bottom_target = snap_rect(display.work, SnapSlot::BottomHalf);
+    let specs = vec![
+        stock_spec(
+            "Portrait Top Half",
+            "snapped:top-half",
+            SnapSlot::TopHalf,
+            display.work,
+        ),
+        stock_spec(
+            "Portrait Bottom Half",
+            "snapped:bottom-half",
+            SnapSlot::BottomHalf,
+            display.work,
+        ),
+    ];
+    let titles = specs
+        .iter()
+        .map(|spec| spec.title.clone())
+        .collect::<Vec<_>>();
+    host.prepare(&titles);
+
+    // Reproduce the user's bad starting state: both windows are close to their
+    // saved halves but are ordinary floating windows, not Windows-arranged.
+    stage_frame(
+        host.windows[0].hwnd(),
+        near_target(top_target, display.work),
+    )
+    .expect("stage portrait top window");
+    stage_frame(
+        host.windows[1].hwnd(),
+        near_target(bottom_target, display.work),
+    )
+    .expect("stage portrait bottom window");
+    assert_eq!(unsafe { IsWindowArranged(host.windows[0].hwnd()) }, 0);
+    assert_eq!(unsafe { IsWindowArranged(host.windows[1].hwnd()) }, 0);
+
+    screenshot(&out_dir, "portrait-stacked-before.png");
+    let snapshot = snapshot_for(&display, &executable, &specs);
+    let report = restore_snapshot(&snapshot, RestoreOptions { dry_run: false });
+    fs::write(
+        out_dir.join("portrait-stacked-report.txt"),
+        format!("{report:#?}"),
+    )
+    .expect("write portrait restore report");
+    assert!(
+        report.success(),
+        "portrait stacked restore failed: {report:#?}"
+    );
+
+    // The bug was visible after repeated attempts and final ordering, so verify
+    // only after the restore has fully settled.
+    thread::sleep(Duration::from_millis(1200));
+    let top = frame_bounds(host.windows[0].hwnd()).expect("final top DWM bounds");
+    let bottom = frame_bounds(host.windows[1].hwnd()).expect("final bottom DWM bounds");
+    assert_ne!(
+        unsafe { IsWindowArranged(host.windows[0].hwnd()) },
+        0,
+        "portrait top window is only floating at the target rectangle"
+    );
+    assert_ne!(
+        unsafe { IsWindowArranged(host.windows[1].hwnd()) },
+        0,
+        "portrait bottom window is only floating at the target rectangle"
+    );
+    assert!(
+        rect_close_px(top.into(), top_target, 3),
+        "portrait top geometry missed its strict target: observed={top:?}, target={top_target:?}"
+    );
+    assert!(
+        rect_close_px(bottom.into(), bottom_target, 3),
+        "portrait bottom geometry missed its strict target: observed={bottom:?}, target={bottom_target:?}"
+    );
+    assert!(
+        (top.bottom - bottom.top).abs() <= 3,
+        "portrait pair has a gap or overlap at the divider: top={top:?}, bottom={bottom:?}"
+    );
+    assert!(
+        top.bottom <= bottom.top + 3,
+        "portrait windows overlap instead of halving the monitor: top={top:?}, bottom={bottom:?}"
+    );
+
+    screenshot(&out_dir, "portrait-stacked-after-1200ms.png");
+}
+
+#[test]
+#[ignore = "interactive Windows shell validation; run only on a desktop self-hosted runner"]
 fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -409,7 +522,12 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &executable,
         &out_dir,
         "01-left-half",
-        vec![stock_spec("Live Left Half", "snapped:left-half", SnapSlot::LeftHalf, display.work)],
+        vec![stock_spec(
+            "Live Left Half",
+            "snapped:left-half",
+            SnapSlot::LeftHalf,
+            display.work,
+        )],
         &mut log,
     );
 
@@ -420,10 +538,30 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "02-four-quarters",
         vec![
-            stock_spec("Live Top Left", "snapped:top-left-quarter", SnapSlot::TopLeftQuarter, display.work),
-            stock_spec("Live Top Right", "snapped:top-right-quarter", SnapSlot::TopRightQuarter, display.work),
-            stock_spec("Live Bottom Left", "snapped:bottom-left-quarter", SnapSlot::BottomLeftQuarter, display.work),
-            stock_spec("Live Bottom Right", "snapped:bottom-right-quarter", SnapSlot::BottomRightQuarter, display.work),
+            stock_spec(
+                "Live Top Left",
+                "snapped:top-left-quarter",
+                SnapSlot::TopLeftQuarter,
+                display.work,
+            ),
+            stock_spec(
+                "Live Top Right",
+                "snapped:top-right-quarter",
+                SnapSlot::TopRightQuarter,
+                display.work,
+            ),
+            stock_spec(
+                "Live Bottom Left",
+                "snapped:bottom-left-quarter",
+                SnapSlot::BottomLeftQuarter,
+                display.work,
+            ),
+            stock_spec(
+                "Live Bottom Right",
+                "snapped:bottom-right-quarter",
+                SnapSlot::BottomRightQuarter,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -435,9 +573,24 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "03-three-thirds",
         vec![
-            stock_spec("Live Left Third", "snapped:left-third", SnapSlot::LeftThird, display.work),
-            stock_spec("Live Center Third", "snapped:center-third", SnapSlot::CenterThird, display.work),
-            stock_spec("Live Right Third", "snapped:right-third", SnapSlot::RightThird, display.work),
+            stock_spec(
+                "Live Left Third",
+                "snapped:left-third",
+                SnapSlot::LeftThird,
+                display.work,
+            ),
+            stock_spec(
+                "Live Center Third",
+                "snapped:center-third",
+                SnapSlot::CenterThird,
+                display.work,
+            ),
+            stock_spec(
+                "Live Right Third",
+                "snapped:right-third",
+                SnapSlot::RightThird,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -449,8 +602,18 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "04-two-thirds-left",
         vec![
-            stock_spec("Live Left Two Thirds", "snapped:left-two-thirds", SnapSlot::LeftTwoThirds, display.work),
-            stock_spec("Live Right Third Pair", "snapped:right-third", SnapSlot::RightThird, display.work),
+            stock_spec(
+                "Live Left Two Thirds",
+                "snapped:left-two-thirds",
+                SnapSlot::LeftTwoThirds,
+                display.work,
+            ),
+            stock_spec(
+                "Live Right Third Pair",
+                "snapped:right-third",
+                SnapSlot::RightThird,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -462,8 +625,18 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "05-two-thirds-right",
         vec![
-            stock_spec("Live Left Third Pair", "snapped:left-third", SnapSlot::LeftThird, display.work),
-            stock_spec("Live Right Two Thirds", "snapped:right-two-thirds", SnapSlot::RightTwoThirds, display.work),
+            stock_spec(
+                "Live Left Third Pair",
+                "snapped:left-third",
+                SnapSlot::LeftThird,
+                display.work,
+            ),
+            stock_spec(
+                "Live Right Two Thirds",
+                "snapped:right-two-thirds",
+                SnapSlot::RightTwoThirds,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -492,7 +665,10 @@ fn run_stock_scenario(
     specs: Vec<SlotSpec>,
     log: &mut String,
 ) {
-    let titles = specs.iter().map(|spec| spec.title.clone()).collect::<Vec<_>>();
+    let titles = specs
+        .iter()
+        .map(|spec| spec.title.clone())
+        .collect::<Vec<_>>();
     host.prepare(&titles);
 
     for (window, spec) in host.windows.iter().copied().zip(specs.iter()) {
@@ -511,13 +687,24 @@ fn run_stock_scenario(
             spec.title,
             spec.target
         );
-        assert_eq!(unsafe { IsWindowArranged(window.hwnd()) }, 0, "{} unexpectedly arranged before restore", spec.title);
+        assert_eq!(
+            unsafe { IsWindowArranged(window.hwnd()) },
+            0,
+            "{} unexpectedly arranged before restore",
+            spec.title
+        );
     }
 
     screenshot(out_dir, &format!("{name}-before-near-floating.png"));
     let snapshot = snapshot_for(display, executable, &specs);
     let report = restore_snapshot(&snapshot, RestoreOptions { dry_run: false });
-    log.push_str(&format!("[{name}] success={} warnings={:?} failures={:?} desktop_failures={:?}\n", report.success(), report.warnings, report.failures, report.desktop.failures));
+    log.push_str(&format!(
+        "[{name}] success={} warnings={:?} failures={:?} desktop_failures={:?}\n",
+        report.success(),
+        report.warnings,
+        report.failures,
+        report.desktop.failures
+    ));
     assert!(report.success(), "{name} restore failed: {report:#?}");
 
     thread::sleep(Duration::from_millis(350));
@@ -528,7 +715,11 @@ fn run_stock_scenario(
             "  {} arranged={} observed={:?} target={:?}\n",
             spec.title, arranged, observed, spec.target
         ));
-        assert!(arranged, "{} has target-like geometry but is not truly Windows-arranged", spec.title);
+        assert!(
+            arranged,
+            "{} has target-like geometry but is not truly Windows-arranged",
+            spec.title
+        );
         assert!(
             rect_close_px(observed.into(), spec.target, 3),
             "{} native Snap geometry is outside strict tolerance: observed={observed:?}, target={:?}",
@@ -553,41 +744,71 @@ fn run_custom_pair_scenario(
         SlotSpec {
             title: "Live Custom 27".to_owned(),
             state: "snapped:custom".to_owned(),
-            target: SavedRect { left: display.work.left, top: display.work.top, right: divider, bottom: display.work.bottom },
+            target: SavedRect {
+                left: display.work.left,
+                top: display.work.top,
+                right: divider,
+                bottom: display.work.bottom,
+            },
             normalized: [0.0, 0.0, 0.27, 1.0],
         },
         SlotSpec {
             title: "Live Custom 73".to_owned(),
             state: "snapped:custom".to_owned(),
-            target: SavedRect { left: divider, top: display.work.top, right: display.work.right, bottom: display.work.bottom },
+            target: SavedRect {
+                left: divider,
+                top: display.work.top,
+                right: display.work.right,
+                bottom: display.work.bottom,
+            },
             normalized: [0.27, 0.0, 0.73, 1.0],
         },
     ];
-    let titles = specs.iter().map(|spec| spec.title.clone()).collect::<Vec<_>>();
+    let titles = specs
+        .iter()
+        .map(|spec| spec.title.clone())
+        .collect::<Vec<_>>();
     host.prepare(&titles);
     for (window, spec) in host.windows.iter().copied().zip(specs.iter()) {
-        stage_frame(window.hwnd(), near_target(spec.target, display.work)).expect("stage custom pair near-floating");
+        stage_frame(window.hwnd(), near_target(spec.target, display.work))
+            .expect("stage custom pair near-floating");
         assert_eq!(unsafe { IsWindowArranged(window.hwnd()) }, 0);
     }
     screenshot(out_dir, "06-custom-27-73-before.png");
     let snapshot = snapshot_for(display, executable, &specs);
     let report = restore_snapshot(&snapshot, RestoreOptions { dry_run: false });
-    log.push_str(&format!("[06-custom-27-73] success={} warnings={:?} failures={:?} desktop_failures={:?}\n", report.success(), report.warnings, report.failures, report.desktop.failures));
+    log.push_str(&format!(
+        "[06-custom-27-73] success={} warnings={:?} failures={:?} desktop_failures={:?}\n",
+        report.success(),
+        report.warnings,
+        report.failures,
+        report.desktop.failures
+    ));
     assert!(report.success(), "custom 27/73 restore failed: {report:#?}");
     thread::sleep(Duration::from_millis(400));
     for (window, spec) in host.windows.iter().copied().zip(specs.iter()) {
         let observed = frame_bounds(window.hwnd()).expect("custom final DWM bounds");
         let arranged = unsafe { IsWindowArranged(window.hwnd()) } != 0;
-        log.push_str(&format!("  {} arranged={} observed={:?} target={:?}\n", spec.title, arranged, observed, spec.target));
+        log.push_str(&format!(
+            "  {} arranged={} observed={:?} target={:?}\n",
+            spec.title, arranged, observed, spec.target
+        ));
         assert!(arranged, "{} custom pair is not arranged", spec.title);
-        assert!(rect_close_px(observed.into(), spec.target, 24), "{} custom pair geometry missed divider target", spec.title);
+        assert!(
+            rect_close_px(observed.into(), spec.target, 24),
+            "{} custom pair geometry missed divider target",
+            spec.title
+        );
     }
     screenshot(out_dir, "06-custom-27-73-after-native.png");
 }
 
 fn snapshot_for(display: &DisplayInfo, executable: &Path, specs: &[SlotSpec]) -> Value {
     let exe = executable.to_string_lossy().to_string();
-    let name = executable.file_stem().and_then(|value| value.to_str()).unwrap_or("windows_snap_live");
+    let name = executable
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("windows_snap_live");
     let windows = specs
         .iter()
         .enumerate()
@@ -663,6 +884,10 @@ fn normalized_for_slot(slot: SnapSlot) -> [f64; 4] {
 
 fn display_for(hwnd: Hwnd) -> Option<DisplayInfo> {
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    display_from_monitor(monitor)
+}
+
+fn display_from_monitor(monitor: Hmonitor) -> Option<DisplayInfo> {
     if monitor.is_null() {
         return None;
     }
@@ -676,7 +901,11 @@ fn display_for(hwnd: Hwnd) -> Option<DisplayInfo> {
     if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
         return None;
     }
-    let length = info.device.iter().position(|unit| *unit == 0).unwrap_or(info.device.len());
+    let length = info
+        .device
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(info.device.len());
     Some(DisplayInfo {
         device: String::from_utf16_lossy(&info.device[..length]),
         bounds: info.monitor.into(),
@@ -685,9 +914,46 @@ fn display_for(hwnd: Hwnd) -> Option<DisplayInfo> {
     })
 }
 
+unsafe extern "system" fn collect_monitor(
+    monitor: Hmonitor,
+    _hdc: Handle,
+    _rect: *mut Rect,
+    data: isize,
+) -> Bool {
+    let displays = unsafe { &mut *(data as *mut Vec<DisplayInfo>) };
+    if let Some(display) = display_from_monitor(monitor) {
+        displays.push(display);
+    }
+    1
+}
+
+fn portrait_display() -> Option<DisplayInfo> {
+    let mut displays: Vec<DisplayInfo> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            ptr::null_mut(),
+            ptr::null(),
+            Some(collect_monitor),
+            (&mut displays as *mut Vec<DisplayInfo>) as isize,
+        )
+    };
+    assert_ne!(ok, 0, "EnumDisplayMonitors failed");
+    displays
+        .into_iter()
+        .find(|display| display.work.height() > display.work.width())
+}
+
 fn near_target(target: SavedRect, work: SavedRect) -> SavedRect {
-    let dx = if target.right >= work.right - 1 { -6 } else { 6 };
-    let dy = if target.bottom >= work.bottom - 1 { -6 } else { 6 };
+    let dx = if target.right >= work.right - 1 {
+        -6
+    } else {
+        6
+    };
+    let dy = if target.bottom >= work.bottom - 1 {
+        -6
+    } else {
+        6
+    };
     SavedRect {
         left: target.left + dx,
         top: target.top + dy,
@@ -769,7 +1035,11 @@ fn screenshot(out_dir: &Path, file_name: &str) {
         .args(["-NoProfile", "-Command", &script])
         .status()
         .expect("start screenshot PowerShell");
-    assert!(status.success(), "screenshot command failed for {}", path.display());
+    assert!(
+        status.success(),
+        "screenshot command failed for {}",
+        path.display()
+    );
 }
 
 fn wide(value: &str) -> Vec<u16> {
