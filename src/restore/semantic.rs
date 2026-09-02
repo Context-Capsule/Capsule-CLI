@@ -68,6 +68,11 @@ fn restore_firefox(snapshot: &Value, dry_run: bool, report: &mut SemanticRestore
         return;
     }
 
+    if !optional_browser_adapter_connected("Firefox", crate::browser::extension_connected(), report)
+    {
+        return;
+    }
+
     run_bus_adapter("firefox", "Firefox", saved, FIREFOX_ADAPTER_TIMEOUT, report);
 }
 
@@ -85,6 +90,10 @@ fn restore_chrome(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreR
             "Chrome semantic restore: would reconcile saved tabs, tab groups and browser windows"
                 .to_owned(),
         );
+        return;
+    }
+
+    if !optional_browser_adapter_connected("Chrome", crate::chrome::extension_connected(), report) {
         return;
     }
 
@@ -137,6 +146,28 @@ fn restore_vscode(snapshot: &Value, dry_run: bool, report: &mut SemanticRestoreR
     );
 }
 
+fn optional_browser_adapter_connected(
+    label: &str,
+    connected: Result<bool, crate::browser::BrowserError>,
+    report: &mut SemanticRestoreReport,
+) -> bool {
+    match connected {
+        Ok(true) => true,
+        Ok(false) => {
+            report.warnings.push(format!(
+                "{label} semantic restore skipped: Context Capsule browser extension/native host is not connected"
+            ));
+            false
+        }
+        Err(error) => {
+            report.warnings.push(format!(
+                "{label} semantic restore skipped: browser adapter availability could not be determined ({error})"
+            ));
+            false
+        }
+    }
+}
+
 fn run_bus_adapter(
     adapter: &str,
     label: &str,
@@ -176,8 +207,12 @@ fn run_bus_adapter(
         Ok(None) => {
             let _ = restore_bus::cancel_request(adapter, &request.request_id);
             let diagnostic_hint = match adapter {
-                "firefox" => "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore",
-                "chrome" => "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore",
+                "firefox" => {
+                    "; inspect the persistent firefox.log to distinguish an adapter startup failure from an in-progress browser restore"
+                }
+                "chrome" => {
+                    "; inspect the persistent chrome.log to distinguish an adapter startup failure from an in-progress browser restore"
+                }
                 _ => "",
             };
             report.failures.push(format!(
@@ -477,11 +512,7 @@ fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
     // Explicitly target the most recently used existing Windows Terminal
     // window. Without -w, Windows Terminal's windowingBehavior setting controls
     // whether wt.exe creates a new window or a tab; its default is useNew.
-    let mut args = vec![
-        "-w".to_owned(),
-        "0".to_owned(),
-        "new-tab".to_owned(),
-    ];
+    let mut args = vec!["-w".to_owned(), "0".to_owned(), "new-tab".to_owned()];
     if let Some(profile) = saved
         .profile
         .as_deref()
@@ -499,7 +530,11 @@ fn safe_restart_plan(saved: &TerminalSession) -> Option<RestartPlan> {
         args.push(directory.to_owned());
     }
 
-    if saved.profile.as_deref().is_none_or(|profile| profile.trim().is_empty()) {
+    if saved
+        .profile
+        .as_deref()
+        .is_none_or(|profile| profile.trim().is_empty())
+    {
         let executable = saved
             .shell_executable
             .as_deref()
@@ -561,10 +596,7 @@ fn terminal_session_matches(saved: &TerminalSession, current: &TerminalSession) 
 /// the authoritative CWD action, so verification only needs to observe a new
 /// session with the expected host/environment/shell/profile. Re-running the UI
 /// CWD probe here would type PowerShell commands repeatedly while polling.
-fn terminal_launch_observation_matches(
-    saved: &TerminalSession,
-    current: &TerminalSession,
-) -> bool {
+fn terminal_launch_observation_matches(saved: &TerminalSession, current: &TerminalSession) -> bool {
     if saved.host != TerminalHost::WindowsTerminal {
         return terminal_session_matches(saved, current);
     }
@@ -694,7 +726,8 @@ fn wait_for_terminal_launch(
 
 #[cfg(windows)]
 fn launch_restart_plan(session: &TerminalSession, plan: &RestartPlan) -> Result<u32, String> {
-    if session.host == TerminalHost::WindowsTerminal && !windows_terminal_launcher(&plan.executable) {
+    if session.host == TerminalHost::WindowsTerminal && !windows_terminal_launcher(&plan.executable)
+    {
         return Err(format!(
             "refusing unsafe Windows Terminal restart plan '{}'; Windows Terminal sessions must be launched through wt.exe",
             plan.executable
@@ -899,8 +932,10 @@ mod tests {
 
     #[test]
     fn windows_terminal_direct_powershell_plan_is_rewritten_through_wt() {
-        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
-        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        let mut saved =
+            terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable =
+            Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
         saved.profile = Some("Windows PowerShell".to_owned());
         saved.working_directory = Some(r"D:\projects\capsule".to_owned());
         saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
@@ -930,11 +965,14 @@ mod tests {
 
     #[test]
     fn windows_terminal_without_profile_uses_only_safe_shell_executable() {
-        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
-        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        let mut saved =
+            terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable =
+            Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
         saved.working_directory = Some(r"D:\projects\capsule".to_owned());
         saved.working_directory_source = WorkingDirectorySource::WindowsTerminalState;
-        saved.startup_command = Some("powershell.exe -NoExit -Command dangerous-user-history".to_owned());
+        saved.startup_command =
+            Some("powershell.exe -NoExit -Command dangerous-user-history".to_owned());
         saved.restart = Some(RestartPlan {
             executable: saved.shell_executable.clone().unwrap(),
             args: Vec::new(),
@@ -955,13 +993,20 @@ mod tests {
                 r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
             ]
         );
-        assert!(!plan.args.iter().any(|arg| arg.contains("dangerous-user-history")));
+        assert!(
+            !plan
+                .args
+                .iter()
+                .any(|arg| arg.contains("dangerous-user-history"))
+        );
     }
 
     #[test]
     fn windows_terminal_powershell_ignores_untrusted_process_directory() {
-        let mut saved = terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
-        saved.shell_executable = Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
+        let mut saved =
+            terminal_session(TerminalHost::WindowsTerminal, ShellKind::WindowsPowerShell);
+        saved.shell_executable =
+            Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned());
         saved.profile = Some("Windows PowerShell".to_owned());
         saved.working_directory = Some(r"C:\Users\monji".to_owned());
         saved.working_directory_source = WorkingDirectorySource::Unknown;
@@ -1032,6 +1077,34 @@ mod tests {
         let mut wrong = current;
         wrong.working_directory = Some(r"C:\Other".to_owned());
         assert!(!launched_session_matches(&saved, &wrong));
+    }
+
+    #[test]
+    fn disconnected_browser_adapter_is_a_warning_not_a_failure() {
+        let mut report = SemanticRestoreReport::default();
+        assert!(!optional_browser_adapter_connected(
+            "Firefox",
+            Ok(false),
+            &mut report,
+        ));
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("not connected"));
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn browser_adapter_probe_error_is_also_isolated() {
+        let mut report = SemanticRestoreReport::default();
+        assert!(!optional_browser_adapter_connected(
+            "Chrome",
+            Err(crate::browser::BrowserError::Invalid(
+                "probe failed".to_owned()
+            )),
+            &mut report,
+        ));
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("availability could not be determined"));
+        assert!(report.failures.is_empty());
     }
 
     #[test]

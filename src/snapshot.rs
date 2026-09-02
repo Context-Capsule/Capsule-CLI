@@ -111,16 +111,13 @@ pub fn capture_snapshot_with_options(
     } else {
         serde_json::to_value(explorer::discover())?
     };
-    let firefox_ignored = ignored.iter().any(|application| is_firefox_family(application));
-    let firefox_running = discovery
-        .desktop
-        .as_ref()
-        .ok()
-        .is_some_and(|desktop| desktop.applications.iter().any(is_firefox_family));
+    let firefox_ignored = ignored
+        .iter()
+        .any(|application| is_firefox_family(application));
     let firefox = if firefox_ignored {
         None
     } else {
-        firefox_state_for_capture(browser::load_recent_firefox_state(), firefox_running)?
+        firefox_state_for_capture(browser::load_recent_firefox_state())?
     };
     let chrome = if ignored.iter().any(|application| is_chrome(application)) {
         None
@@ -191,10 +188,13 @@ pub fn capture_snapshot_with_options(
     // Keep the default payload shape identical to pre-exclusion capsules. The
     // additive metadata exists only when the user explicitly chose exclusions.
     if !ignored_names.is_empty() {
-        snapshot.as_object_mut().expect("snapshot is an object").insert(
-            "capture_options".to_owned(),
-            json!({ "ignored_applications": ignored_names }),
-        );
+        snapshot
+            .as_object_mut()
+            .expect("snapshot is an object")
+            .insert(
+                "capture_options".to_owned(),
+                json!({ "ignored_applications": ignored_names }),
+            );
     }
 
     Ok(StoredCapsuleSnapshot::new(snapshot))
@@ -202,21 +202,12 @@ pub fn capture_snapshot_with_options(
 
 fn firefox_state_for_capture(
     state: Result<Option<browser::FirefoxSnapshot>, browser::BrowserError>,
-    firefox_running: bool,
 ) -> Result<Option<Value>, PersistenceError> {
     match state {
         Ok(Some(snapshot)) => serde_json::to_value(snapshot)
             .map(Some)
             .map_err(PersistenceError::Json),
-        Ok(None) if firefox_running => Err(PersistenceError::InvalidPayload(
-            "Zen/Firefox is running, but no fresh semantic browser state is available. Context Capsule refused to save an incomplete capsule because it would not be able to restore missing browser tabs. Ensure the Context Capsule browser extension is installed and connected to the native host, then save again (or explicitly --ignore-app Zen/Firefox)."
-                .to_owned(),
-        )),
-        Ok(None) => Ok(None),
-        Err(error) if firefox_running => Err(PersistenceError::InvalidPayload(format!(
-            "Zen/Firefox is running, but its semantic browser state could not be captured: {error}. Context Capsule refused to save an incomplete capsule."
-        ))),
-        Err(_) => Ok(None),
+        Ok(None) | Err(_) => Ok(None),
     }
 }
 
@@ -225,18 +216,20 @@ fn filtered_terminal_snapshot(
     ignored: &[&ApplicationInfo],
 ) -> TerminalSnapshot {
     let mut filtered = original.clone();
-    let suppress_windows_terminal = ignored.iter().any(|application| is_windows_terminal(application));
+    let suppress_windows_terminal = ignored
+        .iter()
+        .any(|application| is_windows_terminal(application));
     let suppress_vscode = ignored.iter().any(|application| is_vscode(application));
     let suppress_cursor = ignored.iter().any(|application| is_cursor(application));
     let suppress_wezterm = ignored.iter().any(|application| {
         is_named_or_executable(application, &["wezterm", "wezterm-gui.exe", "wezterm.exe"])
     });
-    let suppress_alacritty = ignored.iter().any(|application| {
-        is_named_or_executable(application, &["alacritty", "alacritty.exe"])
-    });
-    let suppress_mintty = ignored.iter().any(|application| {
-        is_named_or_executable(application, &["mintty", "mintty.exe"])
-    });
+    let suppress_alacritty = ignored
+        .iter()
+        .any(|application| is_named_or_executable(application, &["alacritty", "alacritty.exe"]));
+    let suppress_mintty = ignored
+        .iter()
+        .any(|application| is_named_or_executable(application, &["mintty", "mintty.exe"]));
 
     filtered.sessions.retain(|session| match &session.host {
         TerminalHost::WindowsTerminal => !suppress_windows_terminal,
@@ -285,14 +278,15 @@ fn normalized(value: &str) -> String {
 }
 
 fn executable_basename(value: &str) -> Option<&str> {
-    value
-        .rsplit(['\\', '/'])
-        .find(|part| !part.is_empty())
+    value.rsplit(['\\', '/']).find(|part| !part.is_empty())
 }
 
 fn executable_stem(value: &str) -> Option<&str> {
     let basename = executable_basename(value)?;
-    basename.rsplit_once('.').map(|(stem, _)| stem).or(Some(basename))
+    basename
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .or(Some(basename))
 }
 
 fn application_matches_selector(application: &ApplicationInfo, selector: &str) -> bool {
@@ -316,10 +310,8 @@ fn application_matches_selector(application: &ApplicationInfo, selector: &str) -
         if normalized(identity) == selector {
             return true;
         }
-        executable_basename(identity)
-            .is_some_and(|name| normalized(name) == selector)
-            || executable_stem(identity)
-                .is_some_and(|name| normalized(name) == selector)
+        executable_basename(identity).is_some_and(|name| normalized(name) == selector)
+            || executable_stem(identity).is_some_and(|name| normalized(name) == selector)
     })
 }
 
@@ -327,29 +319,39 @@ fn app_executable_name(application: &ApplicationInfo) -> Option<&str> {
     application
         .executable_path
         .as_deref()
-        .or_else(|| application.launch.as_ref().map(|launch| launch.target.as_str()))
+        .or_else(|| {
+            application
+                .launch
+                .as_ref()
+                .map(|launch| launch.target.as_str())
+        })
         .and_then(executable_basename)
 }
 
 fn is_named_or_executable(application: &ApplicationInfo, values: &[&str]) -> bool {
-    values.iter().any(|value| application.name.eq_ignore_ascii_case(value))
-        || app_executable_name(application).is_some_and(|name| {
-            values.iter().any(|value| name.eq_ignore_ascii_case(value))
-        })
+    values
+        .iter()
+        .any(|value| application.name.eq_ignore_ascii_case(value))
+        || app_executable_name(application)
+            .is_some_and(|name| values.iter().any(|value| name.eq_ignore_ascii_case(value)))
 }
 
 fn is_firefox_family(application: &ApplicationInfo) -> bool {
     is_named_or_executable(
         application,
-        &["zen", "Zen Browser", "zen.exe", "firefox", "Mozilla Firefox", "firefox.exe"],
+        &[
+            "zen",
+            "Zen Browser",
+            "zen.exe",
+            "firefox",
+            "Mozilla Firefox",
+            "firefox.exe",
+        ],
     )
 }
 
 fn is_chrome(application: &ApplicationInfo) -> bool {
-    is_named_or_executable(
-        application,
-        &["chrome", "Google Chrome", "chrome.exe"],
-    )
+    is_named_or_executable(application, &["chrome", "Google Chrome", "chrome.exe"])
 }
 
 fn is_vscode(application: &ApplicationInfo) -> bool {
@@ -375,10 +377,7 @@ fn is_windows_terminal(application: &ApplicationInfo) -> bool {
 }
 
 fn is_explorer(application: &ApplicationInfo) -> bool {
-    is_named_or_executable(
-        application,
-        &["Explorer", "File Explorer", "explorer.exe"],
-    )
+    is_named_or_executable(application, &["Explorer", "File Explorer", "explorer.exe"])
 }
 
 fn display_value(display: &DisplayInfo) -> Value {
@@ -468,7 +467,10 @@ mod tests {
         }
     }
 
-    fn base_discovery(applications: Vec<ApplicationInfo>, terminals: TerminalSnapshot) -> DiscoverySnapshot {
+    fn base_discovery(
+        applications: Vec<ApplicationInfo>,
+        terminals: TerminalSnapshot,
+    ) -> DiscoverySnapshot {
         DiscoverySnapshot {
             current_directory: PathBuf::from("/workspace"),
             system: SystemInfo {
@@ -513,20 +515,20 @@ mod tests {
     }
 
     #[test]
-    fn running_firefox_family_rejects_missing_semantic_state() {
-        let error = firefox_state_for_capture(Ok(None), true)
-            .expect_err("running Zen/Firefox must not silently produce a null browser slot");
-        assert!(matches!(
-            error,
-            PersistenceError::InvalidPayload(message)
-                if message.contains("no fresh semantic browser state")
-        ));
+    fn missing_firefox_extension_state_is_optional() {
+        assert_eq!(
+            firefox_state_for_capture(Ok(None)).expect("missing browser adapter must be optional"),
+            None
+        );
     }
 
     #[test]
-    fn stopped_firefox_family_allows_missing_semantic_state() {
+    fn broken_firefox_extension_state_is_optional() {
         assert_eq!(
-            firefox_state_for_capture(Ok(None), false).expect("missing inactive browser state"),
+            firefox_state_for_capture(Err(browser::BrowserError::Invalid(
+                "test adapter failure".to_owned(),
+            )))
+            .expect("broken browser adapter must be isolated"),
             None
         );
     }
@@ -537,20 +539,29 @@ mod tests {
         assert!(application_matches_selector(&app, "Visual Studio Code"));
         assert!(application_matches_selector(&app, "Code.exe"));
         assert!(application_matches_selector(&app, "code"));
-        assert!(application_matches_selector(&app, r"C:\Users\test\Code.exe"));
+        assert!(application_matches_selector(
+            &app,
+            r"C:\Users\test\Code.exe"
+        ));
         assert!(!application_matches_selector(&app, "Visual Studio"));
     }
 
     #[test]
     fn chrome_identity_is_detected_without_affecting_firefox_family() {
-        let chrome = test_application("Google Chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        let chrome = test_application(
+            "Google Chrome",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        );
         assert!(is_chrome(&chrome));
         assert!(!is_firefox_family(&chrome));
     }
 
     #[test]
     fn ignored_application_is_removed_from_desktop_and_owned_terminal_state() {
-        let vscode = test_application("Visual Studio Code", r"C:\Program Files\Microsoft VS Code\Code.exe");
+        let vscode = test_application(
+            "Visual Studio Code",
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+        );
         let terminals = TerminalSnapshot {
             status: TerminalStatus::Available,
             message: None,
@@ -604,7 +615,9 @@ mod tests {
             Some(0)
         );
         assert_eq!(
-            stored.snapshot.pointer("/capture_options/ignored_applications/0"),
+            stored
+                .snapshot
+                .pointer("/capture_options/ignored_applications/0"),
             Some(&Value::String("Visual Studio Code".to_owned()))
         );
         assert!(
@@ -626,7 +639,13 @@ mod tests {
             },
         )
         .expect("capture filtered snapshot");
-        assert_eq!(stored.snapshot.pointer("/explorer/status").and_then(Value::as_str), Some("unavailable"));
+        assert_eq!(
+            stored
+                .snapshot
+                .pointer("/explorer/status")
+                .and_then(Value::as_str),
+            Some("unavailable")
+        );
         assert_eq!(
             stored
                 .snapshot
