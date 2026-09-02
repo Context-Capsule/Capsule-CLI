@@ -1,8 +1,6 @@
 #![cfg(windows)]
 
-use context_capsule::restore::{
-    RestoreOptions, SavedRect, SnapSlot, restore_snapshot, snap_rect,
-};
+use context_capsule::restore::{RestoreOptions, SavedRect, SnapSlot, restore_snapshot, snap_rect};
 use serde_json::{Value, json};
 use std::{
     ffi::c_void,
@@ -208,7 +206,10 @@ impl WindowHost {
             let atom = unsafe { RegisterClassW(&class) };
             if atom == 0 {
                 let error = unsafe { GetLastError() };
-                assert_eq!(error, 1410, "RegisterClassW failed with Win32 error {error}");
+                assert_eq!(
+                    error, 1410,
+                    "RegisterClassW failed with Win32 error {error}"
+                );
             }
 
             let mut windows = Vec::new();
@@ -231,7 +232,9 @@ impl WindowHost {
                     )
                 };
                 assert!(!hwnd.is_null(), "CreateWindowExW failed at index {index}");
-                windows.push(LiveWindow { hwnd: hwnd as usize });
+                windows.push(LiveWindow {
+                    hwnd: hwnd as usize,
+                });
             }
             let thread_id = unsafe { GetCurrentThreadId() };
             sender.send((thread_id, windows)).expect("send live HWNDs");
@@ -336,7 +339,27 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &executable,
         &out_dir,
         "01-left-half",
-        vec![stock_spec("Live Left Half", "snapped:left-half", SnapSlot::LeftHalf, display.work)],
+        vec![stock_spec(
+            "Live Left Half",
+            "snapped:left-half",
+            SnapSlot::LeftHalf,
+            display.work,
+        )],
+        &mut log,
+    );
+
+    run_stock_scenario(
+        &host,
+        &display,
+        &executable,
+        &out_dir,
+        "07-top-half-foreground-stability",
+        vec![stock_spec(
+            "Live Top Half Foreground",
+            "snapped:top-half",
+            SnapSlot::TopHalf,
+            display.work,
+        )],
         &mut log,
     );
 
@@ -347,10 +370,30 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "02-four-quarters",
         vec![
-            stock_spec("Live Top Left", "snapped:top-left-quarter", SnapSlot::TopLeftQuarter, display.work),
-            stock_spec("Live Top Right", "snapped:top-right-quarter", SnapSlot::TopRightQuarter, display.work),
-            stock_spec("Live Bottom Left", "snapped:bottom-left-quarter", SnapSlot::BottomLeftQuarter, display.work),
-            stock_spec("Live Bottom Right", "snapped:bottom-right-quarter", SnapSlot::BottomRightQuarter, display.work),
+            stock_spec(
+                "Live Top Left",
+                "snapped:top-left-quarter",
+                SnapSlot::TopLeftQuarter,
+                display.work,
+            ),
+            stock_spec(
+                "Live Top Right",
+                "snapped:top-right-quarter",
+                SnapSlot::TopRightQuarter,
+                display.work,
+            ),
+            stock_spec(
+                "Live Bottom Left",
+                "snapped:bottom-left-quarter",
+                SnapSlot::BottomLeftQuarter,
+                display.work,
+            ),
+            stock_spec(
+                "Live Bottom Right",
+                "snapped:bottom-right-quarter",
+                SnapSlot::BottomRightQuarter,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -362,9 +405,24 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "03-three-thirds",
         vec![
-            stock_spec("Live Left Third", "snapped:left-third", SnapSlot::LeftThird, display.work),
-            stock_spec("Live Center Third", "snapped:center-third", SnapSlot::CenterThird, display.work),
-            stock_spec("Live Right Third", "snapped:right-third", SnapSlot::RightThird, display.work),
+            stock_spec(
+                "Live Left Third",
+                "snapped:left-third",
+                SnapSlot::LeftThird,
+                display.work,
+            ),
+            stock_spec(
+                "Live Center Third",
+                "snapped:center-third",
+                SnapSlot::CenterThird,
+                display.work,
+            ),
+            stock_spec(
+                "Live Right Third",
+                "snapped:right-third",
+                SnapSlot::RightThird,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -376,8 +434,18 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "04-two-thirds-left",
         vec![
-            stock_spec("Live Left Two Thirds", "snapped:left-two-thirds", SnapSlot::LeftTwoThirds, display.work),
-            stock_spec("Live Right Third Pair", "snapped:right-third", SnapSlot::RightThird, display.work),
+            stock_spec(
+                "Live Left Two Thirds",
+                "snapped:left-two-thirds",
+                SnapSlot::LeftTwoThirds,
+                display.work,
+            ),
+            stock_spec(
+                "Live Right Third Pair",
+                "snapped:right-third",
+                SnapSlot::RightThird,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -389,8 +457,18 @@ fn live_restore_rejects_near_floating_windows_and_restores_real_snap() {
         &out_dir,
         "05-two-thirds-right",
         vec![
-            stock_spec("Live Left Third Pair", "snapped:left-third", SnapSlot::LeftThird, display.work),
-            stock_spec("Live Right Two Thirds", "snapped:right-two-thirds", SnapSlot::RightTwoThirds, display.work),
+            stock_spec(
+                "Live Left Third Pair",
+                "snapped:left-third",
+                SnapSlot::LeftThird,
+                display.work,
+            ),
+            stock_spec(
+                "Live Right Two Thirds",
+                "snapped:right-two-thirds",
+                SnapSlot::RightTwoThirds,
+                display.work,
+            ),
         ],
         &mut log,
     );
@@ -419,7 +497,10 @@ fn run_stock_scenario(
     specs: Vec<SlotSpec>,
     log: &mut String,
 ) {
-    let titles = specs.iter().map(|spec| spec.title.clone()).collect::<Vec<_>>();
+    let titles = specs
+        .iter()
+        .map(|spec| spec.title.clone())
+        .collect::<Vec<_>>();
     host.prepare(&titles);
 
     for (window, spec) in host.windows.iter().copied().zip(specs.iter()) {
@@ -438,13 +519,24 @@ fn run_stock_scenario(
             spec.title,
             spec.target
         );
-        assert_eq!(unsafe { IsWindowArranged(window.hwnd()) }, 0, "{} unexpectedly arranged before restore", spec.title);
+        assert_eq!(
+            unsafe { IsWindowArranged(window.hwnd()) },
+            0,
+            "{} unexpectedly arranged before restore",
+            spec.title
+        );
     }
 
     screenshot(out_dir, &format!("{name}-before-near-floating.png"));
     let snapshot = snapshot_for(display, executable, &specs);
     let report = restore_snapshot(&snapshot, RestoreOptions { dry_run: false });
-    log.push_str(&format!("[{name}] success={} warnings={:?} failures={:?} desktop_failures={:?}\n", report.success(), report.warnings, report.failures, report.desktop.failures));
+    log.push_str(&format!(
+        "[{name}] success={} warnings={:?} failures={:?} desktop_failures={:?}\n",
+        report.success(),
+        report.warnings,
+        report.failures,
+        report.desktop.failures
+    ));
     assert!(report.success(), "{name} restore failed: {report:#?}");
 
     thread::sleep(Duration::from_millis(350));
@@ -455,7 +547,11 @@ fn run_stock_scenario(
             "  {} arranged={} observed={:?} target={:?}\n",
             spec.title, arranged, observed, spec.target
         ));
-        assert!(arranged, "{} has target-like geometry but is not truly Windows-arranged", spec.title);
+        assert!(
+            arranged,
+            "{} has target-like geometry but is not truly Windows-arranged",
+            spec.title
+        );
         assert!(
             rect_close_px(observed.into(), spec.target, 3),
             "{} native Snap geometry is outside strict tolerance: observed={observed:?}, target={:?}",
@@ -480,41 +576,71 @@ fn run_custom_pair_scenario(
         SlotSpec {
             title: "Live Custom 27".to_owned(),
             state: "snapped:custom".to_owned(),
-            target: SavedRect { left: display.work.left, top: display.work.top, right: divider, bottom: display.work.bottom },
+            target: SavedRect {
+                left: display.work.left,
+                top: display.work.top,
+                right: divider,
+                bottom: display.work.bottom,
+            },
             normalized: [0.0, 0.0, 0.27, 1.0],
         },
         SlotSpec {
             title: "Live Custom 73".to_owned(),
             state: "snapped:custom".to_owned(),
-            target: SavedRect { left: divider, top: display.work.top, right: display.work.right, bottom: display.work.bottom },
+            target: SavedRect {
+                left: divider,
+                top: display.work.top,
+                right: display.work.right,
+                bottom: display.work.bottom,
+            },
             normalized: [0.27, 0.0, 0.73, 1.0],
         },
     ];
-    let titles = specs.iter().map(|spec| spec.title.clone()).collect::<Vec<_>>();
+    let titles = specs
+        .iter()
+        .map(|spec| spec.title.clone())
+        .collect::<Vec<_>>();
     host.prepare(&titles);
     for (window, spec) in host.windows.iter().copied().zip(specs.iter()) {
-        stage_frame(window.hwnd(), near_target(spec.target, display.work)).expect("stage custom pair near-floating");
+        stage_frame(window.hwnd(), near_target(spec.target, display.work))
+            .expect("stage custom pair near-floating");
         assert_eq!(unsafe { IsWindowArranged(window.hwnd()) }, 0);
     }
     screenshot(out_dir, "06-custom-27-73-before.png");
     let snapshot = snapshot_for(display, executable, &specs);
     let report = restore_snapshot(&snapshot, RestoreOptions { dry_run: false });
-    log.push_str(&format!("[06-custom-27-73] success={} warnings={:?} failures={:?} desktop_failures={:?}\n", report.success(), report.warnings, report.failures, report.desktop.failures));
+    log.push_str(&format!(
+        "[06-custom-27-73] success={} warnings={:?} failures={:?} desktop_failures={:?}\n",
+        report.success(),
+        report.warnings,
+        report.failures,
+        report.desktop.failures
+    ));
     assert!(report.success(), "custom 27/73 restore failed: {report:#?}");
     thread::sleep(Duration::from_millis(400));
     for (window, spec) in host.windows.iter().copied().zip(specs.iter()) {
         let observed = frame_bounds(window.hwnd()).expect("custom final DWM bounds");
         let arranged = unsafe { IsWindowArranged(window.hwnd()) } != 0;
-        log.push_str(&format!("  {} arranged={} observed={:?} target={:?}\n", spec.title, arranged, observed, spec.target));
+        log.push_str(&format!(
+            "  {} arranged={} observed={:?} target={:?}\n",
+            spec.title, arranged, observed, spec.target
+        ));
         assert!(arranged, "{} custom pair is not arranged", spec.title);
-        assert!(rect_close_px(observed.into(), spec.target, 24), "{} custom pair geometry missed divider target", spec.title);
+        assert!(
+            rect_close_px(observed.into(), spec.target, 24),
+            "{} custom pair geometry missed divider target",
+            spec.title
+        );
     }
     screenshot(out_dir, "06-custom-27-73-after-native.png");
 }
 
 fn snapshot_for(display: &DisplayInfo, executable: &Path, specs: &[SlotSpec]) -> Value {
     let exe = executable.to_string_lossy().to_string();
-    let name = executable.file_stem().and_then(|value| value.to_str()).unwrap_or("windows_snap_live");
+    let name = executable
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("windows_snap_live");
     let windows = specs
         .iter()
         .enumerate()
@@ -603,7 +729,11 @@ fn display_for(hwnd: Hwnd) -> Option<DisplayInfo> {
     if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
         return None;
     }
-    let length = info.device.iter().position(|unit| *unit == 0).unwrap_or(info.device.len());
+    let length = info
+        .device
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(info.device.len());
     Some(DisplayInfo {
         device: String::from_utf16_lossy(&info.device[..length]),
         bounds: info.monitor.into(),
@@ -613,8 +743,16 @@ fn display_for(hwnd: Hwnd) -> Option<DisplayInfo> {
 }
 
 fn near_target(target: SavedRect, work: SavedRect) -> SavedRect {
-    let dx = if target.right >= work.right - 1 { -6 } else { 6 };
-    let dy = if target.bottom >= work.bottom - 1 { -6 } else { 6 };
+    let dx = if target.right >= work.right - 1 {
+        -6
+    } else {
+        6
+    };
+    let dy = if target.bottom >= work.bottom - 1 {
+        -6
+    } else {
+        6
+    };
     SavedRect {
         left: target.left + dx,
         top: target.top + dy,
@@ -687,7 +825,7 @@ fn rect_close_px(actual: SavedRect, expected: SavedRect, tolerance: i32) -> bool
 
 fn screenshot(out_dir: &Path, file_name: &str) {
     let path = out_dir.join(file_name);
-    let escaped = path.to_string_lossy().replace(''', "''");
+    let escaped = path.to_string_lossy().replace('\'', "''");
     let script = format!(
         "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $v=[System.Windows.Forms.SystemInformation]::VirtualScreen; $b=New-Object System.Drawing.Bitmap($v.Width,$v.Height); $g=[System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen($v.Left,$v.Top,0,0,$b.Size); $g.Dispose(); $b.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()",
         escaped
@@ -696,7 +834,11 @@ fn screenshot(out_dir: &Path, file_name: &str) {
         .args(["-NoProfile", "-Command", &script])
         .status()
         .expect("start screenshot PowerShell");
-    assert!(status.success(), "screenshot command failed for {}", path.display());
+    assert!(
+        status.success(),
+        "screenshot command failed for {}",
+        path.display()
+    );
 }
 
 fn wide(value: &str) -> Vec<u16> {
