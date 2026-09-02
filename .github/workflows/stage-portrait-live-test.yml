@@ -1,0 +1,32 @@
+name: Stage Portrait Live Test
+on:
+  push:
+    branches: [fix/portrait-stacked-snap-20260902]
+permissions:
+  contents: write
+jobs:
+  stage-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/portrait-stacked-snap-20260902
+          fetch-depth: 0
+      - name: Apply focused live test
+        shell: pwsh
+        run: python .github/scripts/add_portrait_live_test.py
+      - name: Format only focused test
+        shell: pwsh
+        run: rustfmt --edition 2024 tests/windows_snap_live.rs
+      - name: Compile live test
+        shell: pwsh
+        run: cargo test --test windows_snap_live --no-run
+      - name: Commit focused test
+        shell: pwsh
+        run: |
+          git add tests/windows_snap_live.rs
+          if (git diff --cached --quiet) { exit 0 }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test: cover portrait stacked snap restore'
+          git push origin HEAD:fix/portrait-stacked-snap-20260902
