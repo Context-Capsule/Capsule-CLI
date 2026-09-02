@@ -1,1 +1,1 @@
-trigger-live-test-2
+trigger-safe-wrapper
