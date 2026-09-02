@@ -39,14 +39,19 @@ def patch_windows() -> None:
 def patch_live_test() -> None:
     path = Path("tests/windows_snap_live.rs")
     text = path.read_text(encoding="utf-8")
-    if "07-top-half-foreground-stability" in text:
-        return
 
-    anchor = """    run_stock_scenario(\n        &host,\n        &display,\n        &executable,\n        &out_dir,\n        \"02-four-quarters\",\n"""
-    addition = """    run_stock_scenario(\n        &host,\n        &display,\n        &executable,\n        &out_dir,\n        \"07-top-half-foreground-stability\",\n        vec![stock_spec(\n            \"Live Top Half Foreground\",\n            \"snapped:top-half\",\n            SnapSlot::TopHalf,\n            display.work,\n        )],\n        &mut log,\n    );\n\n"""
-    if anchor not in text:
-        raise RuntimeError("live regression insertion point not found")
-    path.write_text(text.replace(anchor, addition + anchor, 1), encoding="utf-8")
+    # Existing main test helper has an unescaped apostrophe character literal.
+    # Fix the test-only typo so the live validation target can compile.
+    text = text.replace("replace(''', \"''\")", "replace('\\'', \"''\")")
+
+    if "07-top-half-foreground-stability" not in text:
+        anchor = """    run_stock_scenario(\n        &host,\n        &display,\n        &executable,\n        &out_dir,\n        \"02-four-quarters\",\n"""
+        addition = """    run_stock_scenario(\n        &host,\n        &display,\n        &executable,\n        &out_dir,\n        \"07-top-half-foreground-stability\",\n        vec![stock_spec(\n            \"Live Top Half Foreground\",\n            \"snapped:top-half\",\n            SnapSlot::TopHalf,\n            display.work,\n        )],\n        &mut log,\n    );\n\n"""
+        if anchor not in text:
+            raise RuntimeError("live regression insertion point not found")
+        text = text.replace(anchor, addition + anchor, 1)
+
+    path.write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":
