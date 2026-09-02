@@ -127,7 +127,9 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             #[cfg(windows)]
             {
                 let dpi_guard = dpi::DpiAwarenessGuard::per_monitor_v2();
-                report.desktop = windows::restore_desktop(&prerequisite, options.dry_run);
+                let prerequisite_placement =
+                    custom_snap::geometry_only_portrait_stacked_pairs(&prerequisite);
+                report.desktop = windows::restore_desktop(&prerequisite_placement, options.dry_run);
                 report.desktop.applications_total = full_application_count;
                 if zen_bootstrap.already_running {
                     report.desktop.applications_already_running += 1;
@@ -248,7 +250,8 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // captured before foreground/focus work already looked correct. The
             // saved geometry and window state are deliberately replayed after all
             // semantic tab/terminal work has finished.
-            let mut final_desktop = windows::restore_desktop_forced(desktop, false);
+            let final_placement = custom_snap::geometry_only_portrait_stacked_pairs(desktop);
+            let mut final_desktop = windows::restore_desktop_forced(&final_placement, false);
             final_desktop.applications_total = full_application_count;
             final_desktop.applications_launched += initial_launched;
             final_desktop.applications_already_running = initial_already_running;
@@ -268,18 +271,21 @@ pub fn restore_snapshot(snapshot: &Value, options: RestoreOptions) -> RestoreRep
             // blank so both this pass and custom-Snap attribution use the geometry
             // established by the semantic adapter rather than volatile active-tab
             // titles.
+            let portrait_stock = custom_snap::restore_portrait_stacked_pairs(desktop);
+            final_desktop.warnings.extend(portrait_stock.warnings);
+            final_desktop.failures.extend(portrait_stock.failures);
+
             let custom = custom_snap::restore(desktop);
             final_desktop.warnings.extend(custom.warnings);
             final_desktop.failures.extend(custom.failures);
 
-// Native Snap reconstruction and foreground acquisition can alter
-// stacking after the generic Windows pass has already reconciled it.
-// Make Z-order the final authoritative operation, using a fresh live
-// inventory and no geometry/state changes.
-let final_order = windows::restore_order_and_foreground_only(desktop);
-final_desktop.warnings.extend(final_order.warnings);
-final_desktop.failures.extend(final_order.failures);
-
+            // Native Snap reconstruction and foreground acquisition can alter
+            // stacking after the generic Windows pass has already reconciled it.
+            // Make Z-order the final authoritative operation, using a fresh live
+            // inventory and no geometry/state changes.
+            let final_order = windows::restore_order_and_foreground_only(desktop);
+            final_desktop.warnings.extend(final_order.warnings);
+            final_desktop.failures.extend(final_order.failures);
 
             report.desktop = final_desktop;
         }
@@ -668,19 +674,41 @@ mod tests {
             applications: vec![
                 application(
                     "Windows Terminal",
-                    Some(r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"),
+                    Some(
+                        r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe",
+                    ),
                 ),
                 application("Notepad", Some(r"C:\Windows\System32\notepad.exe")),
             ],
         };
 
         let prerequisite = desktop_without_semantic_owned_hosts(&desktop, true, false, false);
-        assert!(!prerequisite.applications.iter().any(is_windows_terminal_application));
-        assert!(prerequisite.applications.iter().any(|app| app.name == "Notepad"));
+        assert!(
+            !prerequisite
+                .applications
+                .iter()
+                .any(is_windows_terminal_application)
+        );
+        assert!(
+            prerequisite
+                .applications
+                .iter()
+                .any(|app| app.name == "Notepad")
+        );
 
         let final_placement = desktop_without_semantic_owned_hosts(&desktop, false, false, false);
-        assert!(final_placement.applications.iter().any(is_windows_terminal_application));
-        assert!(final_placement.applications.iter().any(|app| app.name == "Notepad"));
+        assert!(
+            final_placement
+                .applications
+                .iter()
+                .any(is_windows_terminal_application)
+        );
+        assert!(
+            final_placement
+                .applications
+                .iter()
+                .any(|app| app.name == "Notepad")
+        );
     }
 
     #[test]
