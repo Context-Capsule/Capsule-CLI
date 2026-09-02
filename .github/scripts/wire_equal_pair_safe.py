@@ -8,6 +8,7 @@ def run(*args: str) -> None:
 # Reuse the already-reviewed final patch script. This staging workflow checks out
 # the latest branch ref, so this validates exactly what will be committed.
 run("python", ".github/scripts/finalize_portrait_pair_restore.py")
+run("python", ".github/scripts/restore_portrait_live_entrypoint.py")
 
 # Format only files touched by the final patch; do not churn unrelated legacy
 # Rust files.
@@ -57,5 +58,5 @@ run(
 
 cached = subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode
 if cached != 0:
-    run("git", "commit", "-m", "fix: make portrait pair restore one-shot with exact fallback")
+    run("git", "commit", "-m", "test: retain portrait live regression entrypoint")
     run("git", "push", "origin", "HEAD:fix/portrait-stacked-snap-20260902")
