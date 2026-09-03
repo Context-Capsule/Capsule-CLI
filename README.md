@@ -1,55 +1,318 @@
 # Context Capsule CLI
 
-Context Capsule captures the **working state around a project** and restores it semantically: Git context, developer tools, terminals, VS Code, Zen/Firefox, Chrome, Docker resources, desktop applications/windows, Explorer folders, and display placement where supported.
+Context Capsule captures the **working state around a project** and restores it semantically: Git context, developer tools, terminals, VS Code, Firefox/Zen, Chrome, Docker resources, desktop applications/windows, Explorer folders, and display placement where supported.
 
-The CLI is local-first. Capsule data is stored in SQLite on the machine; browser and editor adapters synchronize their semantic state through local runtime files/native messaging rather than a hosted service.
+This repository is the **core engine** of the Context Capsule ecosystem. It owns the public CLI, Local Agent/worker boundary, persistence/revisions, operating-system discovery and restore behavior, browser native hosts, and the machine-readable API used by the desktop app.
 
-## Core workflow
+Context Capsule is local-first: capsule data is stored on the machine in SQLite, while browser/editor adapters synchronize semantic state through local runtime files, native messaging, and restore-bus channels rather than a hosted service.
+
+For deeper detail on the internal Local Agent extraction and IPC invariants, also read [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+
+## Context Capsule ecosystem
+
+Context Capsule is split across four cooperating repositories:
+
+```text
+                               users / automation
+                                      |
+                        +-------------+-------------+
+                        |                           |
+                        v                           v
+              +------------------+        +----------------------+
+              | Desktop App      |        | capsule CLI client   |
+              | Tauri + Svelte   |        | this repository      |
+              +--------+---------+        +----------+-----------+
+                       | bundled/allowed             |
+                       | CLI operations              | authenticated loopback IPC
+                       +-----------------------------+
+                                                     v
+                                           +--------------------+
+                                           | Local Agent        |
+                                           | this repository    |
+                                           +---------+----------+
+                                                     |
+                                                     v
+                                           +--------------------+
+                                           | agent worker +     |
+                                           | capture/restore    |
+                                           | persistence        |
+                                           +--+-------------+---+
+                                              |             |
+                     runtime state/restore bus|             |native messaging
+                                              |             |
+                      +-----------------------+             +----------------------+
+                      |                                                            |
+                      v                                                            v
+           +------------------------+                                 +------------------------+
+           | VS Code Extension      |                                 | Browser Extension      |
+           | semantic editor state  |                                 | Firefox/Zen + Chrome   |
+           +------------------------+                                 +------------------------+
+```
+
+### Repository responsibilities
+
+| Repository | Owns | Typical integration contract |
+| --- | --- | --- |
+| **Capsule-CLI** | Public CLI, Local Agent/worker, SQLite/revisions, generic capture/restore, Windows desktop state, terminals, Docker, browser native hosts, desktop machine API | CLI args/output, local runtime schemas, native-message protocols, semantic snapshot schemas |
+| [Capsule-Desktop-App](https://github.com/Context-Capsule/Capsule-Desktop-App) | Tray/full-app UX, Tauri allow-list, packaging the CLI runtime | `capsule desktop ...` JSON API + allowed mutations |
+| [Capsule-Browser-Extension](https://github.com/Context-Capsule/Capsule-Browser-Extension) | Firefox/Zen + Chrome browser semantic capture/restore | native messaging + browser-specific runtime state/restore channels |
+| [Capsule-VSCode-Extension](https://github.com/Context-Capsule/Capsule-VSCode-Extension) | VS Code workspace/editor/integrated-terminal semantic capture/restore | live runtime snapshot + VS Code restore bus |
+
+## Where should a feature be implemented?
+
+Start here when the feature changes **Context Capsule domain behavior** rather than only one client UI.
+
+| Feature/change | Primary repository / area |
+| --- | --- |
+| New CLI command/flag/output | This repo: public command routing + `src/commands*` |
+| New capsule field, schema, revision/history behavior | This repo: persistence/model/command layer; coordinate adapters that produce the field |
+| Generic save/inspect/update behavior | This repo: capture/command engine |
+| Generic restore/selective restore/replace cleanup | This repo: restore/cleanup engine |
+| Windows applications, windows, Explorer, monitor placement | This repo: `src/desktop/`, related capture/restore modules |
+| Standalone terminals or Docker/Compose | This repo: `src/adapters/terminal.rs`, `src/adapters/docker.rs` |
+| Firefox/Zen or Chrome tab/window/group algorithm | `Capsule-Browser-Extension` first; this repo only for persistence/native host/routing contracts |
+| Browser native-host executable, installation, doctor, registry/manifest behavior | This repo: `src/bin/firefox_host.rs`, `src/bin/chrome_host.rs` and browser runtime modules |
+| VS Code tabs/workspace/selections/integrated-terminal semantics | `Capsule-VSCode-Extension`; this repo stores/routes its semantic snapshot |
+| Desktop/tray UI | `Capsule-Desktop-App`; add/extend `capsule desktop` API here only if new engine data is required |
+| Machine-readable desktop read model | This repo: `src/desktop_api.rs`, then update Desktop types/bridge/UI |
+| A feature affecting all clients | Define behavior/contracts here first, then make adapters/UIs thin consumers |
+
+A useful rule: **if a feature must work from the command line with no desktop app, browser popup, or VS Code command open, its domain behavior belongs here.**
+
+## Internal architecture
+
+The public CLI is deliberately separated from the stateful engine by a local process boundary:
+
+```text
+capsule.exe
+public CLI client
+     |
+     | authenticated newline-delimited JSON
+     | over dynamically allocated 127.0.0.1 port
+     v
++----------------------------+
+| Local Agent                |
+| - lifecycle/state file     |
+| - request validation       |
+| - serial routing           |
+| - caller CWD/environment   |
++-------------+--------------+
+              |
+              v
++----------------------------+
+| capsule-agent-worker       |
+| compatibility boundary     |
+| mature command/capture/    |
+| restore implementation     |
++------+------+--------------+
+       |      |
+       |      +----------------------+-------------------+
+       |                             |                   |
+       v                             v                   v
+ SQLite/revisions             OS/tool adapters     browser/editor bridges
+```
+
+The worker is an internal compatibility boundary, not a second public CLI. Keeping mature behavior behind the Local Agent allows the architecture to evolve without rewriting working capture/restore behavior at the same time.
+
+Important invariants include:
+
+- agent listener binds to loopback only;
+- every request uses the per-agent authentication token;
+- protocol/request IDs and size limits are enforced;
+- the caller's working directory/environment are forwarded so Git, WSL, PATH and custom configuration resolve as if the command ran directly;
+- worker stdout/stderr/exit code are preserved for CLI compatibility;
+- normal requests are serialized to avoid introducing capture/restore/SQLite races;
+- replacing the installed executable causes stale-agent detection/restart rather than silently running old engine code.
+
+See [`ARCHITECTURE.md`](./ARCHITECTURE.md) before changing the agent/worker/IPC boundary.
+
+## Source map for developers
+
+The repository is intentionally organized around a Rust core plus adapter/native-host entry points. High-value locations include:
+
+```text
+Capsule-CLI/
+├─ src/
+│  ├─ capsule_main.rs            public `capsule` binary entry point
+│  ├─ agent_worker_main.rs       internal compatibility worker entry point
+│  ├─ commands.rs / commands/    command parsing/routing and command-specific behavior
+│  ├─ desktop_api.rs             versioned machine-readable API for Desktop App
+│  ├─ diagnostics.rs             logging/diagnostic infrastructure
+│  ├─ cleanup.rs                 replace-mode cleanup/safety behavior
+│  ├─ desktop/
+│  │  ├─ model.rs                desktop/window model
+│  │  ├─ classify.rs             application/window classification
+│  │  ├─ windows.rs              Windows-native discovery/operations
+│  │  └─ dpi.rs                  DPI-related helpers
+│  ├─ adapters/
+│  │  ├─ terminal.rs             generic terminal capture/restore
+│  │  └─ docker.rs               Docker/Compose adapter
+│  ├─ browser.rs                 Firefox/Zen state/native integration support
+│  ├─ browser_live.rs            live Firefox/Zen runtime state/restore-bus support
+│  ├─ chrome.rs                  Chrome state/native integration support
+│  └─ bin/
+│     ├─ firefox_host.rs          `capsule-firefox-host`
+│     └─ chrome_host.rs           `capsule-chrome-host`
+├─ tests/                        integration/regression tests
+├─ Cargo.toml                    binaries and dependencies
+├─ ARCHITECTURE.md               Local Agent/worker/IPC architecture
+└─ scripts/                      targeted diagnostics/maintenance helpers
+```
+
+When a source area grows, prefer focused modules over adding unrelated behavior to the public entry points.
+
+## Binaries
+
+`Cargo.toml` defines four binaries:
+
+```text
+capsule                 public CLI + Local Agent mode
+capsule-agent-worker    internal worker used by the agent
+capsule-firefox-host    Firefox/Zen native messaging host
+capsule-chrome-host     Chrome native messaging host
+```
+
+Release/desktop packaging must keep the worker and required native hosts alongside the main CLI binary. The Desktop App deliberately packages these as a runtime set rather than treating `capsule.exe` as a standalone executable.
+
+## Build from source
+
+### Requirements
+
+- Rust stable toolchain with Cargo
+- Windows 10/11 for the complete Windows-native capture/restore feature set
+- Git for Git-context features
+- optional: Docker for Docker/Compose features
+- optional: the browser/VS Code adapters for their semantic integrations
+
+### Debug build
 
 ```powershell
-# Inspect what Context Capsule currently sees
+cargo build --bins
+```
+
+### Release build
+
+```powershell
+cargo build --release --bins
+```
+
+Release outputs are under:
+
+```text
+target\release\
+```
+
+### Validation
+
+Run the Rust regression suite:
+
+```powershell
+cargo test
+```
+
+Compile all targets without running them:
+
+```powershell
+cargo check --all-targets
+```
+
+For a cross-repo protocol/schema feature, also run the affected adapter repository's test/check command and perform a real end-to-end save/restore cycle.
+
+## Running during development
+
+Use `cargo run --` in place of an installed `capsule` binary:
+
+```powershell
+# Inspect the current working state
 cargo run -- inspect --verbose
 
 # Save the first revision
 cargo run -- save work
 
-# Capture the current state as a new immutable revision
+# Save a new immutable revision
 cargo run -- update work
 
-# See retained revisions
+# Show revision history
 cargo run -- history work
 
-# Compare two points in time
+# Compare revisions
 cargo run -- diff work@1 work@2
 
-# Preview an older revision without changing the machine
+# Preview a restore without changing the machine
 cargo run -- restore work@1 --dry-run
 
 # Restore it
 cargo run -- restore work@1
 
-# Diagnose the local installation/adapters
+# Diagnose local integrations
 cargo run -- doctor --verbose
 ```
 
-After installing the binary, replace `cargo run --` with `capsule`.
+After installing/building and placing the runtime directory on `PATH`, replace `cargo run --` with `capsule`.
 
-## Browser adapters
+## Core user workflow
 
-Firefox/Zen and Chrome use separate native host registrations and separate live-state/restore-bus channels. A capsule can contain either browser or both:
-
-```json
-{
-  "browsers": {
-    "firefox": { "browser": "firefox" },
-    "chrome": { "browser": "chrome" }
-  }
-}
+```powershell
+capsule inspect --verbose
+capsule save work
+capsule update work
+capsule history work
+capsule show work
+capsule diff work@1 work@2
+capsule restore work --dry-run
+capsule restore work
+capsule doctor --verbose
 ```
 
-`browsers.chrome` is added only when a recent Chrome adapter state exists, so Firefox-only installations keep the historical capsule payload shape.
+A capsule name resolves to its latest revision. Historical revisions remain addressable as `name@revision`.
 
-### Firefox / Zen native host
+## Local Agent lifecycle
+
+The Local Agent starts lazily on the first normal command. Management commands are available for development and diagnostics:
+
+```powershell
+capsule agent start
+capsule agent status
+capsule agent stop
+capsule agent restart
+```
+
+The CLI validates agent protocol version, authentication, responding PID and executable build identity before sending normal work. Stale/crashed runtime state is recovered on subsequent invocations.
+
+## Desktop App contract
+
+The Desktop App is a thin UI over this engine. Machine-readable reads are exposed under the `desktop` command namespace, including:
+
+```text
+capsule desktop contract
+capsule desktop overview
+capsule desktop capsule <name[@revision]>
+capsule desktop history <name>
+capsule desktop diff <before> <after>
+capsule desktop live
+capsule desktop health
+capsule desktop services <name[@revision]>
+capsule desktop log-paths
+```
+
+Responses use a versioned JSON envelope with `api_version`, `ok`, and either `data` or `error`.
+
+When adding a GUI-visible engine feature:
+
+1. implement/test the domain behavior here;
+2. extend the machine-readable desktop contract here if necessary;
+3. update Desktop `src/lib/types.ts` and `src/lib/bridge.ts`;
+4. add the Svelte UI last.
+
+Do not make the Desktop App parse human CLI output when a stable structured API is appropriate.
+
+## Browser integration
+
+Firefox/Zen and Chrome use separate native hosts and runtime channels.
+
+### Firefox / Zen
+
+Build/install/check the host:
 
 ```powershell
 cargo build --bin capsule-firefox-host
@@ -63,11 +326,9 @@ Host name:
 com.contextcapsule.host
 ```
 
-The Firefox/Zen extension uses this host for local semantic-state synchronization, CLI restore requests, the safe Zen blank-window fallback, and persistent Firefox diagnostics.
+The WebExtension implementation lives in [Capsule-Browser-Extension](https://github.com/Context-Capsule/Capsule-Browser-Extension). This repository owns the native executable/installation, runtime channel, persistence and restore routing.
 
-### Chrome native host
-
-Build/install the additive Chrome host:
+### Chrome
 
 ```powershell
 cargo build --bin capsule-chrome-host
@@ -81,19 +342,29 @@ Host name:
 com.contextcapsule.chrome
 ```
 
-The Chrome development extension has the deterministic ID:
+The Chrome development extension uses deterministic ID:
 
 ```text
 gmffhdppfaeonombpbbgnldagfeabiof
 ```
 
-On Windows the installer registers `com.contextcapsule.chrome` under Google Chrome's `NativeMessagingHosts` registry path and authorizes only that extension origin. Firefox's Mozilla registration is not modified.
+Chrome uses its own runtime state/channel/log rather than modifying the Firefox integration. Normal `capsule restore` can restore both browser snapshots independently when both are present.
 
-The Chrome host uses its own runtime state (`chrome.json`), restore-bus adapter (`chrome`) and log (`chrome.log`). Normal `capsule restore` restores Firefox and Chrome independently when both snapshots exist.
+### Browser protocol development rule
+
+If the extension's `src/native/protocol.ts` changes, update the matching Rust host/runtime code in this repository in the same coordinated feature and validate both sides together. Never silently change one side of the native-message contract.
+
+## VS Code integration
+
+The VS Code semantic adapter is maintained in [Capsule-VSCode-Extension](https://github.com/Context-Capsule/Capsule-VSCode-Extension).
+
+The extension continuously writes an atomic live snapshot under the Context Capsule runtime directory. Save/update consumes recent semantic state; restore publishes a request to the matching extension-host restore bus. A closed matching Extension Development Host can be relaunched before the restore request is consumed when safely identifiable.
+
+VS Code-integrated terminal semantics belong to the VS Code extension. Generic standalone terminal behavior belongs to this repository. Keep that ownership boundary to avoid duplicate terminal capture/restart.
 
 ## Save-time application exclusions
 
-Applications can be excluded from a capsule with repeatable `--ignore-app` options:
+Applications can be excluded with repeatable `--ignore-app` selectors:
 
 ```powershell
 capsule save work --ignore-app Zen
@@ -102,77 +373,37 @@ capsule save work --ignore-app "Visual Studio Code" --ignore-app WindowsTerminal
 capsule save work --ignore-app=Code.exe
 ```
 
-Selectors are case-insensitive and can match an application name, executable name, executable path, AppUserModelID, or saved launch target. Context Capsule rejects a selector that matches no currently discovered application rather than silently accepting a typo. Use `capsule apps` or `capsule inspect --apps` to see the application names Context Capsule currently detects.
+Selectors are case-insensitive and can match application name, executable name/path, AppUserModelID, or saved launch target. A selector that matches no currently discovered application is rejected rather than silently stored as a typo.
 
-Exclusions are also applied to application-owned semantic state so an ignored app cannot silently reappear through another adapter:
+Use:
 
-- ignoring Zen/Firefox suppresses the Firefox/Zen semantic snapshot;
-- ignoring Google Chrome suppresses the Chrome semantic snapshot;
-- ignoring VS Code suppresses its editor semantic snapshot and VS Code-hosted terminal sessions;
-- ignoring Windows Terminal suppresses its terminal sessions and stored Windows Terminal layouts;
-- ignoring File Explorer suppresses folder-window restore state;
-- Docker/Compose resources remain independent of Docker Desktop, so ignoring Docker Desktop does not delete container/Compose state from the capsule.
-
-Resolved ignored application names are stored under `capture_options.ignored_applications` and are shown by `capsule show`. `capsule update <name>` inherits those exclusions into the next revision.
-
-## Terminal ownership and working directories
-
-The shell process hosting the active `capsule save` or `capsule update` command is capture infrastructure, not workspace state. On Windows, Context Capsule walks the current command's process ancestry and removes that hosting shell from the generic terminal snapshot before it is stored. This applies even when the shell is exposed through an intermediate console/PTTY host.
-
-VS Code integrated terminals are owned by the VS Code semantic adapter. When a recent VS Code semantic snapshot is available, generic process-derived VS Code terminal entries are not stored as independent restart plans; the editor snapshot retains the integrated terminal name, shell, arguments, active state and CWD. This prevents the terminal used to invoke Context Capsule from reappearing as a second standalone console during restore.
-
-For standalone Windows shells such as `cmd.exe`, PowerShell and `pwsh`, Context Capsule attempts a bounded read of the live process current directory. If Windows permits the query, the path is stored both as the terminal's `working_directory` and as `restart.working_directory`. Restore already launches direct shell restart plans with `Command::current_dir`, so the shell is recreated in the saved directory rather than the platform default directory.
-
-The process-CWD probe is fail-open: permission, bitness or process-lifetime failures leave the CWD unknown instead of failing the capsule save. Restore-time terminal matching uses the same CWD enrichment, so an already-open shell in the correct directory is reused while a same-type shell in a different directory does not incorrectly satisfy the saved session.
-
-Capsules saved before this behavior cannot retroactively recover a standalone shell CWD that was never stored; save or update the capsule with a current build to capture it.
-
-## Saved display setup
-
-Every new save/update now stores a versioned `display_setup` snapshot in addition to the existing per-window/per-display desktop placement metadata. It records:
-
-- display count and primary display;
-- each display's pixel bounds and work area;
-- scale percentage and orientation;
-- relation to the primary display;
-- the union/virtual desktop bounds;
-- a geometry-oriented topology signature that is stable across discovery ordering;
-- a device-and-geometry signature for stricter future comparisons.
-
-Example shape:
-
-```json
-{
-  "display_setup": {
-    "schema_version": 1,
-    "status": "available",
-    "display_count": 2,
-    "primary_device": "DISPLAY1",
-    "virtual_bounds": {
-      "left": -1920,
-      "top": 0,
-      "right": 2560,
-      "bottom": 1440
-    },
-    "topology_signature": "...",
-    "device_signature": "...",
-    "displays": []
-  }
-}
+```powershell
+capsule apps
+capsule inspect --apps
 ```
 
-Restore does not yet reject or remap a capsule based on these signatures. The metadata is intentionally captured now so a later restoreability phase can compare the current monitor topology with the saved topology and decide when exact window placement is impossible or needs a fallback mapping.
+to inspect discoverable names.
 
-## Restore modes: append vs replace
+Exclusions also suppress semantic adapter state for the ignored application. For example, ignoring VS Code suppresses its editor snapshot and VS Code-owned terminals; ignoring a supported browser suppresses that browser's semantic snapshot.
 
-Restore remains backward compatible: **append mode is the default**. It preserves unrelated running applications and applies the capsule on top of the current desktop, just as Context Capsule did before replace mode existed.
+## Terminal ownership
+
+The shell hosting the active `capsule save`/`update` command is capture infrastructure, not workspace state, and is excluded from the generic terminal snapshot.
+
+VS Code integrated terminals are owned by the VS Code semantic adapter when a recent adapter snapshot exists. Standalone terminal discovery/restart belongs to `src/adapters/terminal.rs`.
+
+For supported standalone Windows shells, Context Capsule attempts a bounded process-CWD read and uses the resulting directory to improve both saved restart metadata and restore-time matching. Failure to read a CWD is fail-open rather than a reason to fail the entire capsule save.
+
+## Restore modes
+
+Append mode is the default and preserves unrelated current applications:
 
 ```powershell
 capsule restore work
 capsule restore work --append
 ```
 
-Use `--replace` when the current desktop should be cleaned before restoration:
+Replace mode explicitly cleans unrelated application state before restoration:
 
 ```powershell
 capsule restore work --replace
@@ -180,37 +411,24 @@ capsule restore work --replace
 
 `--close-unrelated` is an alias for `--replace`.
 
-Replace mode first discovers the current user applications using the same desktop classifier used for capture. Applications whose strong identity belongs to the capsule are preserved. Unrelated applications receive a normal Windows close request first; Context Capsule then re-discovers the desktop and force-terminates unrelated non-shell applications that are still alive. The final desktop is verified before the normal restore engine is allowed to start.
-
-Explorer is handled specially because File Explorer folder windows share the same `explorer.exe` process as the Windows desktop shell. Replace mode sends `WM_CLOSE` directly to unrelated Explorer folder windows while explicitly leaving the `Program Manager` shell window and `explorer.exe` process alive.
-
-Packaged/UWP applications whose user-facing window is owned by `ApplicationFrameHost.exe` are also included in replace cleanup. Context Capsule compares those visible surfaces with the capsule's saved ignored-window inventory, closes newly introduced surfaces with `WM_CLOSE`, and never kills the shared Application Frame Host process itself.
-
-Replace cleanup is intentionally strict:
-
-- the terminal/editor process chain hosting the active `capsule` command is always protected;
-- Docker Desktop is preserved when the capsule contains Docker/Compose resources;
-- `explorer.exe` itself is never terminated as a cleanup side effect;
-- unrelated normal applications that ignore graceful shutdown are force-terminated because `--replace` explicitly requests a clean application set;
-- if an unrelated application or packaged-app window is still present after cleanup, replace mode fails and restoration does not continue as an accidental append;
-- if Context Capsule cannot establish or verify the cleanup inventory, restoration does not start.
-
-`--replace` can therefore discard unsaved work in an unrelated application if that application refuses the initial graceful close. Use the dry run first when the current desktop may contain work you want to keep:
+Preview replace cleanup before applying it:
 
 ```powershell
 capsule restore work --replace --dry-run
 ```
 
-After cleanup, replace mode invokes the same restore engine as append mode. Window placement, native Snap restoration, Firefox/Zen and Chrome semantic restoration, VS Code restoration, terminal restoration, Explorer restoration, and Docker behavior are not forked into a second restore implementation.
+Replace mode uses the same underlying restore engine after cleanup; it does not maintain a second independent implementation for window placement, browser/VS Code semantics, terminals, Explorer, or Docker.
+
+Because replace mode may force-close an unrelated application after a graceful-close attempt, it can discard unsaved work in that unrelated application. Keep its preflight/verification safety rules strict.
 
 ## Immutable revisions
 
-A capsule name points to its latest state, while each update remains addressable as `name@revision`.
+A capsule name points to the latest revision, while historical revisions remain immutable and addressable:
 
 ```text
 work        latest revision
-work@1      original captured state
-work@2      second captured state
+work@1      first saved state
+work@2      second saved state
 ```
 
 Both of these create a new revision when `work` already exists:
@@ -220,24 +438,22 @@ capsule update work
 capsule save work --force
 ```
 
-Existing databases are migrated in place. A capsule created before revision support is retained as revision `1`; Context Capsule cannot reconstruct versions that were overwritten by older builds before revision history existed.
-
-Deleting a capsule deletes the capsule and all of its revisions. Individual historical revisions are intentionally immutable.
+Deleting a capsule deletes the capsule and its revision history. Individual historical revisions are not edited in place.
 
 ## Semantic diff
 
-`capsule diff` compares meaning rather than raw JSON ordering.
+Compare revisions with:
 
 ```powershell
 capsule diff work@2 work@5
 capsule diff work@2 work@5 --json
 ```
 
-Current diff sections include workspace/system context, Git, Firefox/Zen tabs and named groups, VS Code workspace/tabs/integrated terminals, external terminal sessions, Docker resources, desktop applications, and developer tool versions. Chrome capture/restore is supported independently; Chrome-specific semantic diff output can be generalized in a later diff-format change without affecting restore.
+Diff is intended to compare semantic meaning rather than raw JSON ordering. Current areas include project/system context, Git, browser/editor state, terminals, Docker resources, desktop applications, and developer-tool versions where supported.
 
-Duplicate browser/editor tabs are treated as a multiset, so adding or removing one copy is represented once instead of collapsing duplicates accidentally.
+## Doctor and diagnostics
 
-## Doctor
+Run:
 
 ```powershell
 capsule doctor
@@ -245,19 +461,16 @@ capsule doctor --verbose
 capsule doctor --json
 ```
 
-The general doctor checks SQLite, the existing Firefox/Zen native integration, VS Code, Git, Docker and logging. Chrome's independent native registration has its own exact doctor:
+Browser-native registration also has exact host-specific doctor commands:
 
 ```powershell
+capsule-firefox-host --doctor
 capsule-chrome-host --doctor
 ```
 
-Missing optional/live integrations are warnings where Context Capsule can still operate partially. Corrupt local state or an invalid native-host installation is reported as an error.
+Missing optional integrations should remain warnings when Context Capsule can operate partially; corrupt local state or invalid required integration should be surfaced as errors.
 
-## Diagnostics and logs
-
-Persistent component logs are bounded and rotated instead of growing forever. Each component keeps its current log plus one previous file and normalizes control characters so one event cannot forge extra log records.
-
-On Windows, logs live under:
+On Windows, Context Capsule logs live under:
 
 ```text
 %LOCALAPPDATA%\ContextCapsule\logs\
@@ -273,20 +486,39 @@ vscode-host-<pid>.log
 vscode-host-<pid>.log.1
 ```
 
-The browser adapters deliberately log lifecycle/outcome metadata such as window/tab counts and restore results rather than persisting captured tab URLs as diagnostics.
+Component logs are bounded/rotated and normalize control characters. Browser diagnostics intentionally record lifecycle/outcome metadata rather than captured tab URLs.
 
-The default per-log bound is 1 MiB and an individual diagnostic message is capped at 4096 characters.
+## Developing a cross-repo feature
+
+Use this sequence to keep ownership clear:
+
+1. **Define the domain behavior here** if the feature changes what a capsule means, stores, captures, restores, diagnoses, or exposes.
+2. Add/update Rust tests and CLI behavior.
+3. Define any structured contract change explicitly: desktop API, browser native messages/runtime schema, or VS Code runtime/restore-bus schema.
+4. Update the producing/consuming adapter repository.
+5. Update Desktop only if a GUI surface is needed.
+6. Build/test each affected repository.
+7. Run an end-to-end scenario from real capture through persistence to restore.
+
+Examples:
+
+- New Chrome tab semantic -> browser extension model/capture/restore + CLI persistence/protocol only if needed.
+- New VS Code semantic -> VS Code adapter + CLI storage/routing only if needed.
+- New Windows window-placement rule -> CLI only, then Desktop merely displays/configures it if desired.
+- New GUI-only layout -> Desktop only; do not change the engine.
 
 ## Safety model
 
-Context Capsule restore is intentionally conservative by default:
+Context Capsule restore is conservative by default:
 
 - append mode reuses already-satisfied state instead of duplicating it;
-- browser adapters use semantic tab/window topology instead of relying only on volatile active-tab window titles;
-- do not guess ambiguous legacy terminal ownership;
-- preserve old capsule revisions instead of destructively overwriting them;
-- keep browser private/incognito windows out of capture;
-- avoid replaying shell history as commands;
-- prefer partial restore plus warnings to arbitrary reconstruction.
+- browser/editor adapters restore semantic state instead of relying only on volatile process/window titles;
+- ambiguous terminal ownership is not guessed;
+- private/incognito browser windows stay out of capture;
+- shell history is not replayed as commands;
+- old capsule revisions are preserved rather than destructively overwritten;
+- partial safe restore plus warnings is preferred to arbitrary reconstruction.
 
-Replace mode is the explicit exception: its purpose is to remove unrelated applications before restoring the capsule, and it may force-close an unrelated app after a graceful close attempt. Use `--replace --dry-run` before restoration when you want to inspect that cleanup plan first.
+Replace mode is the explicit destructive exception and must remain opt-in, preflightable with `--dry-run`, and strict about protecting the active Context Capsule command chain and Windows shell-critical state.
+
+These boundaries are architecture, not just implementation details. Preserve them when adding features.
