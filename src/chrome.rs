@@ -10,6 +10,8 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{self, Sender},
+    thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,7 +20,71 @@ pub const NATIVE_HOST_NAME: &str = "com.contextcapsule.chrome";
 pub const NATIVE_PROTOCOL_VERSION: u32 = 1;
 const MAX_NATIVE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const LIVE_STATE_MAX_AGE: Duration = Duration::from_secs(90);
+const NATIVE_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const NATIVE_SESSION_MAX_AGE: Duration = Duration::from_secs(15);
+const NATIVE_SESSION_PREFIX: &str = "chrome-native-session-";
 const ADAPTER: &str = "chrome";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NativeSessionHeartbeat {
+    pid: u32,
+    started_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
+
+struct NativeSessionLease {
+    path: PathBuf,
+    stop: Option<Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl NativeSessionLease {
+    fn start() -> Result<Self, BrowserError> {
+        let pid = std::process::id();
+        let path = native_session_path(pid)?;
+        let started_at_unix_ms = now_unix_ms();
+        write_native_session_heartbeat(&path, pid, started_at_unix_ms, started_at_unix_ms)?;
+
+        let worker_path = path.clone();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("context-capsule-chrome-liveness".to_owned())
+            .spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(NATIVE_SESSION_HEARTBEAT_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let _ = write_native_session_heartbeat(
+                                &worker_path,
+                                pid,
+                                started_at_unix_ms,
+                                now_unix_ms(),
+                            );
+                        }
+                    }
+                }
+            })
+            .map_err(BrowserError::Io)?;
+
+        Ok(Self {
+            path,
+            stop: Some(stop_tx),
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for NativeSessionLease {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RuntimeStateEnvelope {
@@ -73,9 +139,24 @@ struct NativeResponse {
 
 pub fn run_native_host() -> Result<(), BrowserError> {
     logging::info(ADAPTER, "native messaging host session started");
+    let lease = if is_native_messaging_invocation() {
+        match NativeSessionLease::start() {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                logging::warn(
+                    ADAPTER,
+                    format!("native session liveness lease is unavailable: {error}"),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let stdin = io::stdin();
     let stdout = io::stdout();
     let result = run_native_host_io(stdin.lock(), stdout.lock());
+    drop(lease);
     match &result {
         Ok(()) => logging::info(ADAPTER, "native messaging host session ended"),
         Err(_) => logging::error(ADAPTER, "native messaging host session failed"),
@@ -321,6 +402,99 @@ fn write_native_message<W: Write>(writer: &mut W, payload: &[u8]) -> Result<(), 
     writer.write_all(payload)?;
     writer.flush()?;
     Ok(())
+}
+
+pub fn extension_connected() -> Result<bool, BrowserError> {
+    let state_path = runtime_state_path()?;
+    Ok(newest_live_native_session_for_state(&state_path, now_unix_ms())?.is_some())
+}
+
+fn is_native_messaging_invocation() -> bool {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    is_native_messaging_arguments(&arguments)
+}
+
+fn is_native_messaging_arguments(arguments: &[String]) -> bool {
+    let expected_origin = format!("chrome-extension://{CHROME_EXTENSION_ID}/");
+    arguments
+        .first()
+        .is_some_and(|origin| origin.eq_ignore_ascii_case(&expected_origin))
+}
+
+fn native_session_path(pid: u32) -> Result<PathBuf, BrowserError> {
+    let state_path = runtime_state_path()?;
+    let directory = state_path.parent().ok_or_else(|| {
+        BrowserError::Invalid("Chrome runtime state path has no parent directory".to_owned())
+    })?;
+    Ok(directory.join(format!("{NATIVE_SESSION_PREFIX}{pid}.json")))
+}
+
+fn write_native_session_heartbeat(
+    path: &Path,
+    pid: u32,
+    started_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+) -> Result<(), BrowserError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let heartbeat = NativeSessionHeartbeat {
+        pid,
+        started_at_unix_ms,
+        updated_at_unix_ms,
+    };
+    let bytes = serde_json::to_vec(&heartbeat)?;
+    let temporary = path.with_extension(format!("json.{pid}.tmp"));
+    fs::write(&temporary, bytes)?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn newest_live_native_session_for_state(
+    state_path: &Path,
+    now_ms: i64,
+) -> Result<Option<i64>, BrowserError> {
+    let Some(directory) = state_path.parent() else {
+        return Ok(None);
+    };
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(BrowserError::Io(error)),
+    };
+
+    let max_age_ms = NATIVE_SESSION_MAX_AGE.as_millis() as i64;
+    let mut newest_started_at = None::<i64>;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(NATIVE_SESSION_PREFIX) || !name.ends_with(".json") {
+            continue;
+        }
+        let heartbeat = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<NativeSessionHeartbeat>(&bytes).ok());
+        let Some(heartbeat) = heartbeat else {
+            let _ = fs::remove_file(path);
+            continue;
+        };
+        let age_ms = now_ms.saturating_sub(heartbeat.updated_at_unix_ms);
+        if age_ms <= max_age_ms {
+            newest_started_at = Some(
+                newest_started_at
+                    .map(|value| value.max(heartbeat.started_at_unix_ms))
+                    .unwrap_or(heartbeat.started_at_unix_ms),
+            );
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(newest_started_at)
 }
 
 pub fn load_recent_chrome_state() -> Result<Option<FirefoxSnapshot>, BrowserError> {
@@ -572,6 +746,17 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chrome_native_arguments_require_our_extension_origin() {
+        assert!(is_native_messaging_arguments(&[format!(
+            "chrome-extension://{CHROME_EXTENSION_ID}/"
+        )]));
+        assert!(!is_native_messaging_arguments(&[]));
+        assert!(!is_native_messaging_arguments(&[
+            "chrome-extension://wrong-extension/".to_owned(),
+        ]));
+    }
+
     use crate::browser::{BrowserTabSnapshot, BrowserWindowSnapshot};
     use std::io::Cursor;
 

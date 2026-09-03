@@ -11,8 +11,7 @@ pub use base::{
 use crate::logging;
 use serde::{Deserialize, Serialize};
 use std::{
-    env, fs,
-    io,
+    env, fs, io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
@@ -49,27 +48,24 @@ impl NativeSessionLease {
         let pid = std::process::id();
         let path = native_session_path(pid)?;
         let started_at_unix_ms = now_unix_ms();
-        write_native_session_heartbeat(
-            &path,
-            pid,
-            started_at_unix_ms,
-            started_at_unix_ms,
-        )?;
+        write_native_session_heartbeat(&path, pid, started_at_unix_ms, started_at_unix_ms)?;
 
         let worker_path = path.clone();
         let (stop_tx, stop_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("context-capsule-firefox-liveness".to_owned())
-            .spawn(move || loop {
-                match stop_rx.recv_timeout(NATIVE_SESSION_HEARTBEAT_INTERVAL) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = write_native_session_heartbeat(
-                            &worker_path,
-                            pid,
-                            started_at_unix_ms,
-                            now_unix_ms(),
-                        );
+            .spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(NATIVE_SESSION_HEARTBEAT_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let _ = write_native_session_heartbeat(
+                                &worker_path,
+                                pid,
+                                started_at_unix_ms,
+                                now_unix_ms(),
+                            );
+                        }
                     }
                 }
             })
@@ -127,6 +123,12 @@ pub fn run_native_host() -> Result<(), BrowserError> {
     result
 }
 
+/// Returns whether a current Firefox/Zen native-messaging session is live.
+pub fn extension_connected() -> Result<bool, BrowserError> {
+    let state_path = runtime_state_path()?;
+    Ok(newest_live_native_session_for_state(&state_path, now_unix_ms())?.is_some())
+}
+
 /// Returns the latest validated Firefox/Zen semantic snapshot.
 ///
 /// The historical 90-second snapshot age rule remains the compatibility
@@ -138,7 +140,8 @@ pub fn run_native_host() -> Result<(), BrowserError> {
 pub fn load_recent_firefox_state() -> Result<Option<FirefoxSnapshot>, BrowserError> {
     let state_path = runtime_state_path()?;
     let now_ms = now_unix_ms();
-    let Some(session_started_at) = newest_live_native_session_for_state(&state_path, now_ms)? else {
+    let Some(session_started_at) = newest_live_native_session_for_state(&state_path, now_ms)?
+    else {
         return base::load_recent_firefox_state();
     };
 
@@ -152,9 +155,7 @@ pub fn load_recent_firefox_state() -> Result<Option<FirefoxSnapshot>, BrowserErr
             Some(envelope) if envelope.updated_at_unix_ms >= session_started_at => {
                 return Ok(Some(envelope.snapshot));
             }
-            Some(_) | None if Instant::now() < deadline => {
-                thread::sleep(NATIVE_SESSION_SYNC_POLL)
-            }
+            Some(_) | None if Instant::now() < deadline => thread::sleep(NATIVE_SESSION_SYNC_POLL),
             Some(_) | None => return Ok(None),
         }
     }
@@ -172,9 +173,7 @@ fn is_native_messaging_arguments(arguments: &[String]) -> bool {
     Path::new(&arguments[0])
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.eq_ignore_ascii_case(&format!("{NATIVE_HOST_NAME}.json"))
-        })
+        .is_some_and(|name| name.eq_ignore_ascii_case(&format!("{NATIVE_HOST_NAME}.json")))
 }
 
 fn native_session_path(pid: u32) -> Result<PathBuf, BrowserError> {
